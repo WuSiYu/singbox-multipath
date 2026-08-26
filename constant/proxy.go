@@ -6,6 +6,7 @@ const (
 	TypeTProxy             = "tproxy"
 	TypeDirect             = "direct"
 	TypeBridge             = "bridge"
+	TypeMultipath          = "multipath"
 	TypeBlock              = "block"
 	TypeDNS                = "dns"
 	TypeSOCKS              = "socks"
@@ -62,6 +63,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Direct"
 	case TypeBridge:
 		return "Bridge"
+	case TypeMultipath:
+		return "Multipath"
 	case TypeBlock:
 		return "Block"
 	case TypeDNS:
