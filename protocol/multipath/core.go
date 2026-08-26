@@ -133,6 +133,7 @@ func (c *logicalConn) SetWriteDeadline(deadline time.Time) error {
 type mpLeg struct {
 	id           uint8
 	conn         net.Conn
+	readPreamble func(net.Conn) error
 	send         chan wireFrame
 	control      chan wireFrame
 	onClose      func(error)
@@ -382,6 +383,10 @@ func (c *mpCore) cancelLegReservation(id uint8) {
 }
 
 func (c *mpCore) commitLeg(id uint8, conn net.Conn, onClose func(error)) (*mpLeg, error) {
+	return c.commitLegWithReadPreamble(id, conn, onClose, nil)
+}
+
+func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func(error), readPreamble func(net.Conn) error) (*mpLeg, error) {
 	c.legsMu.Lock()
 	if !c.reserved[id] {
 		c.legsMu.Unlock()
@@ -397,13 +402,14 @@ func (c *mpCore) commitLeg(id uint8, conn net.Conn, onClose func(error)) (*mpLeg
 		return nil, errors.New("duplicate multipath leg")
 	}
 	leg := &mpLeg{
-		id:         id,
-		conn:       conn,
-		send:       make(chan wireFrame, c.cfg.QueueFrames),
-		control:    make(chan wireFrame, 32),
-		onClose:    onClose,
-		done:       make(chan struct{}),
-		writerDone: make(chan struct{}),
+		id:           id,
+		conn:         conn,
+		readPreamble: readPreamble,
+		send:         make(chan wireFrame, c.cfg.QueueFrames),
+		control:      make(chan wireFrame, 32),
+		onClose:      onClose,
+		done:         make(chan struct{}),
+		writerDone:   make(chan struct{}),
 	}
 	c.legs[id] = leg
 	c.legsMu.Unlock()
@@ -413,10 +419,14 @@ func (c *mpCore) commitLeg(id uint8, conn net.Conn, onClose func(error)) (*mpLeg
 }
 
 func (c *mpCore) addLeg(id uint8, conn net.Conn, onClose func(error)) (*mpLeg, error) {
+	return c.addLegWithReadPreamble(id, conn, onClose, nil)
+}
+
+func (c *mpCore) addLegWithReadPreamble(id uint8, conn net.Conn, onClose func(error), readPreamble func(net.Conn) error) (*mpLeg, error) {
 	if err := c.reserveLeg(id); err != nil {
 		return nil, err
 	}
-	leg, err := c.commitLeg(id, conn, onClose)
+	leg, err := c.commitLegWithReadPreamble(id, conn, onClose, readPreamble)
 	if err != nil {
 		c.cancelLegReservation(id)
 	}
@@ -689,6 +699,14 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 }
 
 func (c *mpCore) legReadLoop(leg *mpLeg) {
+	if leg.readPreamble != nil {
+		if err := leg.readPreamble(leg.conn); err != nil {
+			if !c.isDone() {
+				c.legFailed(leg, err)
+			}
+			return
+		}
+	}
 	for {
 		frame, err := readWireFrame(leg.conn, c)
 		if err != nil {

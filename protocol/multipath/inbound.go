@@ -214,11 +214,14 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		i.rejectHello(conn, onClose, E.New("multipath control leg must create the session"))
 		return
 	}
+	if int(hello.ChunkSize) > i.cfg.ChunkSize {
+		i.access.Unlock()
+		i.rejectHello(conn, onClose, E.New("multipath requested chunk size exceeds server limit: ", hello.ChunkSize, " > ", i.cfg.ChunkSize))
+		return
+	}
 
 	cfg := i.cfg
-	if int(hello.ChunkSize) < cfg.ChunkSize {
-		cfg.ChunkSize = int(hello.ChunkSize)
-	}
+	cfg.ChunkSize = int(hello.ChunkSize)
 	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
 	cfg.OnActivate = func() {
 		i.logger.InfoContext(ctx, "multipath server booster activated for ", destination)
@@ -231,7 +234,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		core:        core,
 		appConn:     appConn,
 	}
-	if _, err = core.addLeg(hello.LegID, conn, onClose); err != nil {
+	if err = core.reserveLeg(hello.LegID); err != nil {
 		i.access.Unlock()
 		appConn.Close()
 		i.rejectHello(conn, onClose, err)
@@ -240,12 +243,19 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	i.sessions[hello.Session] = session
 	i.access.Unlock()
 	if err = writeHelloResponse(conn, helloResponse{Status: helloStatusOK, ChunkSize: session.chunkSize}); err != nil {
+		core.cancelLegReservation(hello.LegID)
 		core.fail(err)
 		i.removeSession(hello.Session, session)
-		i.logger.ErrorContext(ctx, E.Cause(err, "write multipath hello response"))
+		N.CloseOnHandshakeFailure(conn, onClose, E.Cause(err, "write multipath hello response"))
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
+	if _, err = core.commitLeg(hello.LegID, conn, onClose); err != nil {
+		core.fail(err)
+		i.removeSession(hello.Session, session)
+		N.CloseOnHandshakeFailure(conn, onClose, E.Cause(err, "commit multipath control leg"))
+		return
+	}
 
 	metadata.Inbound = i.Tag()
 	metadata.InboundType = i.Type()

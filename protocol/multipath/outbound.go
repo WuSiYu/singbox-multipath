@@ -191,7 +191,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	if err != nil {
 		return nil, E.Cause(err, "dial multipath preferred leg ", o.tags[0])
 	}
-	response, err := o.clientHandshake(ctx, primaryConn, helloMessage{
+	readResponse, err := o.beginClientHandshake(ctx, primaryConn, helloMessage{
 		Session:     sessionID,
 		LegID:       0,
 		ChunkSize:   uint32(o.cfg.ChunkSize),
@@ -199,16 +199,14 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	})
 	if err != nil {
 		primaryConn.Close()
-		return nil, E.Cause(err, "multipath preferred handshake")
+		return nil, E.Cause(err, "start multipath preferred handshake")
 	}
 	cfg := o.cfg
-	cfg.ChunkSize = int(response.ChunkSize)
-	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
 	cfg.OnActivate = func() {
 		o.logger.InfoContext(ctx, "multipath booster activated for ", destination)
 	}
 	core, appConn := newCore(ctx, cfg)
-	if _, err = core.addLeg(0, primaryConn, nil); err != nil {
+	if _, err = core.addLegWithReadPreamble(0, primaryConn, nil, readResponse); err != nil {
 		appConn.Close()
 		primaryConn.Close()
 		return nil, err
@@ -218,19 +216,35 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	return appConn, nil
 }
 
-func (o *Outbound) clientHandshake(ctx context.Context, conn net.Conn, message helloMessage) (helloResponse, error) {
+func (o *Outbound) beginClientHandshake(ctx context.Context, conn net.Conn, message helloMessage) (func(net.Conn) error, error) {
 	deadline := time.Now().Add(o.handshakeTimeout)
 	if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}
 	if err := conn.SetDeadline(deadline); err != nil {
-		return helloResponse{}, err
+		return nil, err
 	}
-	defer conn.SetDeadline(time.Time{})
 	if err := writeHello(conn, message); err != nil {
-		return helloResponse{}, err
+		return nil, err
 	}
-	return readHelloResponse(conn)
+	return func(conn net.Conn) error {
+		response, err := readHelloResponse(conn)
+		if err != nil {
+			return err
+		}
+		if response.ChunkSize != message.ChunkSize {
+			return E.New("multipath server changed accepted chunk size from ", message.ChunkSize, " to ", response.ChunkSize)
+		}
+		return conn.SetDeadline(time.Time{})
+	}, nil
+}
+
+func (o *Outbound) clientHandshake(ctx context.Context, conn net.Conn, message helloMessage) error {
+	readResponse, err := o.beginClientHandshake(ctx, conn, message)
+	if err != nil {
+		return err
+	}
+	return readResponse(conn)
 }
 
 func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uint32, destination string) {
@@ -244,7 +258,7 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 		attemptCtx, cancel := context.WithTimeout(ctx, o.handshakeTimeout)
 		conn, err := o.children[1].DialContext(attemptCtx, N.NetworkTCP, o.aggregation)
 		if err == nil {
-			_, err = o.clientHandshake(attemptCtx, conn, helloMessage{
+			err = o.clientHandshake(attemptCtx, conn, helloMessage{
 				Session:     sessionID,
 				LegID:       1,
 				ChunkSize:   chunkSize,

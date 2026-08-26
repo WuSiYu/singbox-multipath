@@ -9,12 +9,12 @@ import (
 )
 
 var (
-	helloMagic    = [4]byte{'S', 'M', 'P', '2'}
+	helloMagic    = [4]byte{'S', 'M', 'P', '3'}
 	responseMagic = [4]byte{'S', 'M', 'P', 'R'}
 )
 
 const (
-	helloVersion byte = 2
+	helloVersion byte = 3
 
 	helloStatusOK       byte = 0
 	helloStatusRejected byte = 1

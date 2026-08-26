@@ -3,6 +3,7 @@ package multipath
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -170,6 +171,133 @@ func TestCoreBidirectionalHalfClose(t *testing.T) {
 	}
 }
 
+func TestCorePrimaryFastOpenSendsDataBeforeHelloResponse(t *testing.T) {
+	cfg := testCoreConfig()
+	cfg.ActivationAfterBytes = 1 << 20
+	clientCore, clientApp := newCore(context.Background(), cfg)
+	serverCore, serverApp := newCore(context.Background(), cfg)
+	defer clientCore.Close()
+	defer serverCore.Close()
+
+	clientWire, serverWire := net.Pipe()
+	dataReceived := make(chan struct{})
+	responseGate := make(chan struct{})
+	serverResult := make(chan error, 1)
+	hello := helloMessage{LegID: 0, ChunkSize: uint32(cfg.ChunkSize), Destination: "example.com:443"}
+	go func() {
+		received, err := readHello(serverWire)
+		if err == nil && received != hello {
+			err = errors.New("fast-open hello mismatch")
+		}
+		if err == nil {
+			err = serverCore.reserveLeg(0)
+		}
+		if err == nil {
+			for {
+				var earlyFrame wireFrame
+				earlyFrame, err = readWireFrame(serverWire, serverCore)
+				if err != nil {
+					break
+				}
+				serverCore.incoming <- earlyFrame
+				if earlyFrame.typ == frameTypeData {
+					close(dataReceived)
+					break
+				}
+			}
+		}
+		if err == nil {
+			<-responseGate
+			err = writeHelloResponse(serverWire, helloResponse{Status: helloStatusOK, ChunkSize: uint32(cfg.ChunkSize)})
+		}
+		if err == nil {
+			_, err = serverCore.commitLeg(0, serverWire, nil)
+		}
+		serverResult <- err
+	}()
+
+	outbound := &Outbound{handshakeTimeout: 5 * time.Second}
+	readResponse, err := outbound.beginClientHandshake(context.Background(), clientWire, hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = clientCore.addLegWithReadPreamble(0, clientWire, nil, readResponse); err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("fast-open-data"), 1024)
+	writeResult := make(chan error, 1)
+	go func() {
+		_, writeErr := clientApp.Write(payload)
+		if writeErr == nil {
+			writeErr = clientApp.(closeWriter).CloseWrite()
+		}
+		writeResult <- writeErr
+	}()
+
+	select {
+	case <-dataReceived:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive application data before the hello response")
+	}
+	close(responseGate)
+	if err = <-serverResult; err != nil {
+		t.Fatal(err)
+	}
+	_ = serverApp.SetReadDeadline(time.Now().Add(5 * time.Second))
+	received, err := io.ReadAll(serverApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = <-writeResult; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("fast-open payload mismatch: received %d of %d bytes", len(received), len(payload))
+	}
+}
+
+func TestCorePrimaryFastOpenRejectClosesLogicalConnection(t *testing.T) {
+	cfg := testCoreConfig()
+	core, appConn := newCore(context.Background(), cfg)
+	defer core.Close()
+	clientWire, serverWire := net.Pipe()
+	hello := helloMessage{LegID: 0, ChunkSize: uint32(cfg.ChunkSize), Destination: "example.com:443"}
+	serverResult := make(chan error, 1)
+	go func() {
+		_, err := readHello(serverWire)
+		if err == nil {
+			err = writeHelloResponse(serverWire, helloResponse{Status: helloStatusRejected})
+		}
+		serverResult <- err
+	}()
+	outbound := &Outbound{handshakeTimeout: 5 * time.Second}
+	readResponse, err := outbound.beginClientHandshake(context.Background(), clientWire, hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = core.addLegWithReadPreamble(0, clientWire, nil, readResponse); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-core.Done():
+	case <-time.After(time.Second):
+		t.Fatal("rejected fast-open handshake did not close the logical connection")
+	}
+	if err = <-serverResult; err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err = appConn.Write([]byte("must fail")); err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writes kept succeeding after rejected handshake")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestCoreSmallFlowUsesOnlyLeg0(t *testing.T) {
 	cfg := testCoreConfig()
 	cfg.ActivationAfterBytes = 1 << 20
@@ -180,7 +308,8 @@ func TestCoreSmallFlowUsesOnlyLeg0(t *testing.T) {
 	leg0Left, leg0Right := net.Pipe()
 	connectTestLeg(t, left, right, 0, leg0Left, leg0Right)
 	boosterLeft, boosterRight := net.Pipe()
-	countedBooster := &countingConn{Conn: boosterLeft}
+	stalledBooster := newStallingConn(boosterLeft)
+	countedBooster := &countingConn{Conn: stalledBooster}
 	connectTestLeg(t, left, right, 1, countedBooster, boosterRight)
 
 	payload := bytes.Repeat([]byte("small-flow"), 16*1024)
@@ -205,6 +334,11 @@ func TestCoreSmallFlowUsesOnlyLeg0(t *testing.T) {
 	}
 	if written := countedBooster.written.Load(); written != 0 {
 		t.Fatalf("small flow wrote %d bytes to booster leg", written)
+	}
+	select {
+	case <-stalledBooster.started:
+		t.Fatal("small flow attempted to use the stalled booster leg")
+	default:
 	}
 }
 

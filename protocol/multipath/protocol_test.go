@@ -1,11 +1,13 @@
 package multipath
 
 import (
+	"context"
 	"net"
 	"testing"
+	"time"
 )
 
-func TestHelloNegotiatesChunkSize(t *testing.T) {
+func TestHelloResponseCarriesChunkSize(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -36,6 +38,28 @@ func TestHelloNegotiatesChunkSize(t *testing.T) {
 		t.Fatalf("unexpected negotiated chunk size: %d", response.ChunkSize)
 	}
 	if err = <-serverResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientHandshakeRejectsChunkSizeChange(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	message := helloMessage{LegID: 1, ChunkSize: 64 * 1024, Destination: "example.com:443"}
+	serverResult := make(chan error, 1)
+	go func() {
+		_, err := readHello(server)
+		if err == nil {
+			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, ChunkSize: 32 * 1024})
+		}
+		serverResult <- err
+	}()
+	outbound := &Outbound{handshakeTimeout: time.Second}
+	if err := outbound.clientHandshake(context.Background(), client, message); err == nil {
+		t.Fatal("expected changed chunk size to be rejected")
+	}
+	if err := <-serverResult; err != nil {
 		t.Fatal(err)
 	}
 }
