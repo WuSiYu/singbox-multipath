@@ -45,6 +45,7 @@ type coreConfig struct {
 	ReplayBytes          int64
 	ReplayTimeout        time.Duration
 	OnLeg1Active         func(activationInfo, bool)
+	OnLegFailure         func(uint8, error)
 }
 
 type activationReason string
@@ -113,6 +114,13 @@ type replayEntry struct {
 	sentAt         time.Time
 	fallbackQueued bool
 	acked          bool
+}
+
+type mpLegCounters struct {
+	txBytes  atomic.Uint64
+	rxBytes  atomic.Uint64
+	txFrames atomic.Uint64
+	rxFrames atomic.Uint64
 }
 
 // logicalConn uses one net.Pipe per direction. Unlike a single net.Pipe, this
@@ -280,11 +288,14 @@ type mpCore struct {
 	closeOne     sync.Once
 	txSeq        atomic.Uint64
 	ingressBytes atomic.Uint64
+	egressBytes  atomic.Uint64
+	legCounters  [2]mpLegCounters
 	active       atomic.Bool
 	activeCh     chan struct{}
 	activateOnce sync.Once
 	activationMu sync.Mutex
 	activation   activationInfo
+	activationAt time.Time
 	notifiedLeg1 *mpLeg
 	leg1Joins    uint64
 	localFIN     atomic.Bool
@@ -295,6 +306,11 @@ type mpCore struct {
 	replayMu     sync.Mutex
 	replay       map[uint64]*replayEntry
 	replayBytes  int64
+	reorderBytes atomic.Int64
+	reorderCount atomic.Int64
+	failureMu    sync.Mutex
+	failure      string
+	failureAt    time.Time
 	bufferPool   sync.Pool
 }
 
@@ -389,6 +405,10 @@ func (c *mpCore) fail(err error) {
 		err = errCoreClosed
 	}
 	c.closeOne.Do(func() {
+		c.failureMu.Lock()
+		c.failure = err.Error()
+		c.failureAt = time.Now()
+		c.failureMu.Unlock()
 		c.cancel()
 		close(c.done)
 		_ = c.txPipe.Close()
@@ -656,6 +676,7 @@ func (c *mpCore) activate(info activationInfo) {
 	c.activateOnce.Do(func() {
 		c.activationMu.Lock()
 		c.activation = info
+		c.activationAt = time.Now()
 		c.activationMu.Unlock()
 		c.active.Store(true)
 		close(c.activeCh)
@@ -793,6 +814,8 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 				c.legFailed(leg, err)
 				return
 			}
+			c.legCounters[leg.id].txBytes.Add(uint64(length))
+			c.legCounters[leg.id].txFrames.Add(1)
 			if leg.id == 0 {
 				if frame.replay {
 					c.completeFallback(frame.seq)
@@ -832,6 +855,10 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 			c.fail(errors.New("multipath peer reset"))
 			return
 		case frameTypeData, frameTypeFIN:
+			if frame.typ == frameTypeData {
+				c.legCounters[leg.id].rxBytes.Add(uint64(len(frame.data)))
+				c.legCounters[leg.id].rxFrames.Add(1)
+			}
 			select {
 			case c.incoming <- frame:
 			case <-c.done:
@@ -857,6 +884,9 @@ func (c *mpCore) legFailed(leg *mpLeg, err error) {
 	delete(c.legs, leg.id)
 	c.legsMu.Unlock()
 	leg.close(err)
+	if c.cfg.OnLegFailure != nil {
+		c.cfg.OnLegFailure(leg.id, err)
+	}
 	if leg.id == 0 {
 		c.fail(err)
 		return
@@ -878,6 +908,8 @@ func (c *mpCore) rxLoop() {
 		for _, frame := range pending {
 			c.putBuffer(frame.data)
 		}
+		c.reorderBytes.Store(0)
+		c.reorderCount.Store(0)
 	}
 	defer cleanup()
 	for {
@@ -933,6 +965,8 @@ func (c *mpCore) rxLoop() {
 					}
 					pending[frame.seq] = frame
 					pendingBytes += int64(len(frame.data))
+					c.reorderBytes.Add(int64(len(frame.data)))
+					c.reorderCount.Add(1)
 					continue
 				}
 				for {
@@ -943,6 +977,7 @@ func (c *mpCore) rxLoop() {
 						}
 						return
 					}
+					c.egressBytes.Add(uint64(len(frame.data)))
 					c.putBuffer(frame.data)
 					expected++
 					c.requestACK(expected)
@@ -952,6 +987,8 @@ func (c *mpCore) rxLoop() {
 					}
 					delete(pending, expected)
 					pendingBytes -= int64(len(next.data))
+					c.reorderBytes.Add(-int64(len(next.data)))
+					c.reorderCount.Add(-1)
 					frame = next
 				}
 			}

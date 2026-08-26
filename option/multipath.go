@@ -22,6 +22,7 @@ type MultipathOutboundOptions struct {
 	Leg1ReplayBytes         uint64             `json:"leg1_replay_bytes,omitempty"`
 	Leg1ReplayTimeout       badoption.Duration `json:"leg1_replay_timeout,omitempty"`
 	HandshakeTimeout        badoption.Duration `json:"handshake_timeout,omitempty"`
+	StatusFile              string             `json:"status_file,omitempty"`
 }
 
 type MultipathInboundOptions struct {

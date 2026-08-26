@@ -34,6 +34,8 @@ type Outbound struct {
 	tcpFastOpen      bool
 	cfg              coreConfig
 	handshakeTimeout time.Duration
+	statusFile       string
+	status           *outboundStatus
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathOutboundOptions) (adapter.Outbound, error) {
@@ -134,6 +136,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		aggregation:      M.ParseSocksaddrHostPort(options.Server, options.ServerPort),
 		tcpFastOpen:      options.TCPFastOpen,
 		handshakeTimeout: handshakeTimeout,
+		statusFile:       options.StatusFile,
 		cfg: coreConfig{
 			ChunkSize:            chunkSize,
 			QueueFrames:          queueFrames,
@@ -170,7 +173,30 @@ func (o *Outbound) Start() error {
 		return E.New("multipath UDP outbound does not support UDP: ", o.udpTag)
 	}
 	o.udpOutbound = udpOutbound
+	if o.statusFile != "" {
+		var legTypes [2]string
+		for index, child := range o.children {
+			legTypes[index] = child.Type()
+		}
+		o.status = newOutboundStatus(o.statusFile, outboundStatusConfig{
+			tag:              o.Tag(),
+			aggregation:      o.aggregation.String(),
+			udpOutbound:      o.udpTag,
+			tcpFastOpen:      o.tcpFastOpen,
+			handshakeTimeout: o.handshakeTimeout,
+			legTags:          [2]string{o.tags[0], o.tags[1]},
+			legTypes:         legTypes,
+			cfg:              o.cfg,
+		})
+		o.status.start(o.ctx, func(err error) {
+			o.logger.Warn("write multipath status: ", err)
+		})
+	}
 	return nil
+}
+
+func (o *Outbound) Close() error {
+	return o.status.close()
 }
 
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -213,8 +239,9 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		primaryConn.Close()
 		return nil, err
 	}
+	statusSession := o.registerStatusSession(sessionID, destinationString, core, leg1PhaseConnecting)
 	o.logger.InfoContext(ctx, "multipath connection to ", destination, " via preferred ", o.tags[0])
-	go o.joinSecondary(core, sessionID, uint32(cfg.ChunkSize), destinationString)
+	go o.joinSecondary(core, sessionID, uint32(cfg.ChunkSize), destinationString, statusSession)
 	return appConn, nil
 }
 
@@ -259,10 +286,13 @@ func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr)
 		fastOpenConn.Close()
 		return nil, err
 	}
+	statusSession := o.registerStatusSession(sessionID, destinationString, core, leg1PhaseWaiting)
 	o.logger.InfoContext(ctx, "multipath fast-open connection to ", destination, " via preferred ", o.tags[0])
 	go func() {
 		if startErr := fastOpenConn.waitStarted(); startErr == nil {
-			o.joinSecondary(core, sessionID, uint32(cfg.ChunkSize), destinationString)
+			o.joinSecondary(core, sessionID, uint32(cfg.ChunkSize), destinationString, statusSession)
+		} else if statusSession != nil {
+			statusSession.setLeg1Error(startErr)
 		}
 	}()
 	return &earlyLogicalConn{
@@ -283,7 +313,19 @@ func (o *Outbound) connectionCoreConfig(ctx context.Context, destination M.Socks
 			" ", info.String(),
 		)
 	}
+	cfg.OnLegFailure = func(legID uint8, err error) {
+		if o.status != nil {
+			o.status.recordLegError(legID, err, time.Now())
+		}
+	}
 	return cfg
+}
+
+func (o *Outbound) registerStatusSession(sessionID [16]byte, destination string, core *mpCore, phase int32) *statusSession {
+	if o.status == nil {
+		return nil
+	}
+	return o.status.addSession(sessionID, destination, core, phase)
 }
 
 func (o *Outbound) beginClientHandshake(ctx context.Context, conn net.Conn, message helloMessage) (func(net.Conn) error, error) {
@@ -322,7 +364,7 @@ func (o *Outbound) clientHandshake(ctx context.Context, conn net.Conn, message h
 	return readResponse(conn)
 }
 
-func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uint32, destination string) {
+func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uint32, destination string, statusSession *statusSession) {
 	ctx := core.Context()
 	for {
 		select {
@@ -330,6 +372,7 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 			return
 		default:
 		}
+		statusSession.beginLeg1Attempt()
 		attemptCtx, cancel := context.WithTimeout(ctx, o.handshakeTimeout)
 		conn, err := o.children[1].DialContext(attemptCtx, N.NetworkTCP, o.aggregation)
 		if err == nil {
@@ -346,11 +389,13 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 		}
 		cancel()
 		if err == nil {
+			statusSession.setLeg1Phase(leg1PhaseReady)
 			o.logger.InfoContext(ctx, "multipath secondary leg ready via ", o.tags[1])
 			select {
 			case <-core.Done():
 				return
 			case <-leg.Done():
+				statusSession.setLeg1Phase(leg1PhaseRetrying)
 				o.logger.WarnContext(ctx, "multipath secondary leg lost; retrying via ", o.tags[1])
 			}
 			continue
@@ -358,6 +403,8 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 		if conn != nil {
 			conn.Close()
 		}
+		statusSession.setLeg1Phase(leg1PhaseRetrying)
+		statusSession.setLeg1Error(err)
 		o.logger.WarnContext(ctx, "multipath secondary leg failed: ", err)
 		retryTimer := time.NewTimer(2 * time.Second)
 		select {
