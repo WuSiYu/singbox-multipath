@@ -12,18 +12,28 @@ type MultipathOutboundOptions struct {
 	Server                  string             `json:"server"`
 	ServerPort              uint16             `json:"server_port"`
 	ActivationThresholdMbps uint32             `json:"activation_threshold_mbps,omitempty"`
+	ActivationAfterBytes    uint64             `json:"activation_after_bytes,omitempty"`
 	ActivationWindow        badoption.Duration `json:"activation_window,omitempty"`
 	ChunkSize               uint32             `json:"chunk_size,omitempty"`
 	QueueFrames             uint32             `json:"queue_frames,omitempty"`
 	BandwidthMbps           []uint32           `json:"bandwidth_mbps,omitempty"`
+	MaxReorderBytes         uint64             `json:"max_reorder_bytes,omitempty"`
+	Leg1ReplayBytes         uint64             `json:"leg1_replay_bytes,omitempty"`
+	Leg1ReplayTimeout       badoption.Duration `json:"leg1_replay_timeout,omitempty"`
+	HandshakeTimeout        badoption.Duration `json:"handshake_timeout,omitempty"`
 }
 
 type MultipathInboundOptions struct {
 	ListenOptions
 	ActivationThresholdMbps uint32             `json:"activation_threshold_mbps,omitempty"`
+	ActivationAfterBytes    uint64             `json:"activation_after_bytes,omitempty"`
 	ActivationWindow        badoption.Duration `json:"activation_window,omitempty"`
 	ChunkSize               uint32             `json:"chunk_size,omitempty"`
 	QueueFrames             uint32             `json:"queue_frames,omitempty"`
 	BandwidthMbps           []uint32           `json:"bandwidth_mbps,omitempty"`
 	MaxReorderFrames        uint32             `json:"max_reorder_frames,omitempty"`
+	MaxReorderBytes         uint64             `json:"max_reorder_bytes,omitempty"`
+	Leg1ReplayBytes         uint64             `json:"leg1_replay_bytes,omitempty"`
+	Leg1ReplayTimeout       badoption.Duration `json:"leg1_replay_timeout,omitempty"`
+	HandshakeTimeout        badoption.Duration `json:"handshake_timeout,omitempty"`
 }
