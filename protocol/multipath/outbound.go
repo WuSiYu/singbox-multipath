@@ -31,6 +31,7 @@ type Outbound struct {
 	udpTag           string
 	udpOutbound      adapter.Outbound
 	aggregation      M.Socksaddr
+	tcpFastOpen      bool
 	cfg              coreConfig
 	handshakeTimeout time.Duration
 }
@@ -131,6 +132,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		tags:             tags,
 		udpTag:           udpTag,
 		aggregation:      M.ParseSocksaddrHostPort(options.Server, options.ServerPort),
+		tcpFastOpen:      options.TCPFastOpen,
 		handshakeTimeout: handshakeTimeout,
 		cfg: coreConfig{
 			ChunkSize:            chunkSize,
@@ -182,6 +184,9 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	if len(o.children) != 2 {
 		return nil, E.New("multipath outbound is not started")
 	}
+	if o.tcpFastOpen {
+		return o.dialTCPFastOpen(ctx, destination)
+	}
 	sessionID, err := newSessionID()
 	if err != nil {
 		return nil, E.Cause(err, "generate multipath session id")
@@ -201,10 +206,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		primaryConn.Close()
 		return nil, E.Cause(err, "start multipath preferred handshake")
 	}
-	cfg := o.cfg
-	cfg.OnActivate = func() {
-		o.logger.InfoContext(ctx, "multipath booster activated for ", destination)
-	}
+	cfg := o.connectionCoreConfig(ctx, destination)
 	core, appConn := newCore(ctx, cfg)
 	if _, err = core.addLegWithReadPreamble(0, primaryConn, nil, readResponse); err != nil {
 		appConn.Close()
@@ -216,11 +218,76 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	return appConn, nil
 }
 
-func (o *Outbound) beginClientHandshake(ctx context.Context, conn net.Conn, message helloMessage) (func(net.Conn) error, error) {
-	deadline := time.Now().Add(o.handshakeTimeout)
-	if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
-		deadline = contextDeadline
+func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	sessionID, err := newSessionID()
+	if err != nil {
+		return nil, E.Cause(err, "generate multipath session id")
 	}
+	destinationString := destination.String()
+	primaryConn, err := o.children[0].DialContext(ctx, N.NetworkTCP, o.aggregation)
+	if err != nil {
+		return nil, E.Cause(err, "dial multipath preferred leg ", o.tags[0])
+	}
+	message := helloMessage{
+		Session:     sessionID,
+		LegID:       0,
+		ChunkSize:   uint32(o.cfg.ChunkSize),
+		Destination: destinationString,
+	}
+	fastOpenConn, err := newClientFastOpenConn(primaryConn, message, o.clientHandshakeDeadline(ctx))
+	if err != nil {
+		primaryConn.Close()
+		return nil, E.Cause(err, "prepare multipath preferred fast open")
+	}
+	cfg := o.connectionCoreConfig(ctx, destination)
+	core, appConn := newCore(ctx, cfg)
+	readResponse := func(conn net.Conn) error {
+		if waitErr := fastOpenConn.waitStarted(); waitErr != nil {
+			return waitErr
+		}
+		response, responseErr := readHelloResponse(conn)
+		if responseErr != nil {
+			return responseErr
+		}
+		if response.ChunkSize != message.ChunkSize {
+			return E.New("multipath server changed accepted chunk size from ", message.ChunkSize, " to ", response.ChunkSize)
+		}
+		return conn.SetDeadline(time.Time{})
+	}
+	if _, err = core.addLegWithReadPreamble(0, fastOpenConn, nil, readResponse); err != nil {
+		appConn.Close()
+		fastOpenConn.Close()
+		return nil, err
+	}
+	o.logger.InfoContext(ctx, "multipath fast-open connection to ", destination, " via preferred ", o.tags[0])
+	go func() {
+		if startErr := fastOpenConn.waitStarted(); startErr == nil {
+			o.joinSecondary(core, sessionID, uint32(cfg.ChunkSize), destinationString)
+		}
+	}()
+	return &earlyLogicalConn{
+		Conn:    appConn,
+		core:    core,
+		primary: fastOpenConn,
+	}, nil
+}
+
+func (o *Outbound) connectionCoreConfig(ctx context.Context, destination M.Socksaddr) coreConfig {
+	cfg := o.cfg
+	cfg.OnLeg1Active = func(info activationInfo, reconnect bool) {
+		o.logger.InfoContext(
+			ctx,
+			"multipath leg1 joined data path: side=client destination=", destination,
+			" outbound=", o.tags[1],
+			" reconnect=", reconnect,
+			" ", info.String(),
+		)
+	}
+	return cfg
+}
+
+func (o *Outbound) beginClientHandshake(ctx context.Context, conn net.Conn, message helloMessage) (func(net.Conn) error, error) {
+	deadline := o.clientHandshakeDeadline(ctx)
 	if err := conn.SetDeadline(deadline); err != nil {
 		return nil, err
 	}
@@ -237,6 +304,14 @@ func (o *Outbound) beginClientHandshake(ctx context.Context, conn net.Conn, mess
 		}
 		return conn.SetDeadline(time.Time{})
 	}, nil
+}
+
+func (o *Outbound) clientHandshakeDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(o.handshakeTimeout)
+	if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	return deadline
 }
 
 func (o *Outbound) clientHandshake(ctx context.Context, conn net.Conn, message helloMessage) error {

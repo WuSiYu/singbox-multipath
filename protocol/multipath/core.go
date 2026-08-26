@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sort"
@@ -43,7 +44,61 @@ type coreConfig struct {
 	MaxReorderBytes      int64
 	ReplayBytes          int64
 	ReplayTimeout        time.Duration
-	OnActivate           func()
+	OnLeg1Active         func(activationInfo, bool)
+}
+
+type activationReason string
+
+const (
+	activationReasonImmediate  activationReason = "immediate"
+	activationReasonBytes      activationReason = "bytes"
+	activationReasonThroughput activationReason = "throughput"
+	activationReasonLeg0Queue  activationReason = "leg0_queue"
+)
+
+type activationInfo struct {
+	Reason           activationReason
+	CurrentBytes     uint64
+	ThresholdBytes   uint64
+	WindowBytes      uint64
+	RateBytesPS      uint64
+	ThresholdBytesPS uint64
+	Elapsed          time.Duration
+	BacklogBytes     int64
+	QueueBytes       int64
+	RequiredDuration time.Duration
+}
+
+func (i activationInfo) String() string {
+	switch i.Reason {
+	case activationReasonBytes:
+		return fmt.Sprintf("reason=%s current_bytes=%d threshold_bytes=%d", i.Reason, i.CurrentBytes, i.ThresholdBytes)
+	case activationReasonThroughput:
+		return fmt.Sprintf(
+			"reason=%s measured_mbps=%.2f threshold_mbps=%.2f window=%s window_bytes=%d",
+			i.Reason,
+			float64(i.RateBytesPS)*8/1_000_000,
+			float64(i.ThresholdBytesPS)*8/1_000_000,
+			i.Elapsed.Round(time.Millisecond),
+			i.WindowBytes,
+		)
+	case activationReasonLeg0Queue:
+		ratio := float64(0)
+		if i.QueueBytes > 0 {
+			ratio = float64(i.BacklogBytes) * 100 / float64(i.QueueBytes)
+		}
+		return fmt.Sprintf(
+			"reason=%s backlog_bytes=%d queue_bytes=%d ratio=%.1f%% duration=%s required_duration=%s",
+			i.Reason,
+			i.BacklogBytes,
+			i.QueueBytes,
+			ratio,
+			i.Elapsed.Round(time.Millisecond),
+			i.RequiredDuration,
+		)
+	default:
+		return fmt.Sprintf("reason=%s", i.Reason)
+	}
 }
 
 type wireFrame struct {
@@ -228,6 +283,10 @@ type mpCore struct {
 	active       atomic.Bool
 	activeCh     chan struct{}
 	activateOnce sync.Once
+	activationMu sync.Mutex
+	activation   activationInfo
+	notifiedLeg1 *mpLeg
+	leg1Joins    uint64
 	localFIN     atomic.Bool
 	remoteFIN    atomic.Bool
 	ackNext      atomic.Uint64
@@ -289,7 +348,7 @@ func newCore(parent context.Context, cfg coreConfig) (*mpCore, net.Conn) {
 		return make([]byte, cfg.ChunkSize)
 	}
 	if cfg.ThresholdBytesPS == 0 && cfg.ActivationAfterBytes == 0 {
-		c.activate()
+		c.activate(activationInfo{Reason: activationReasonImmediate})
 	}
 	go c.txLoop()
 	go c.rxLoop()
@@ -415,6 +474,9 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 	c.legsMu.Unlock()
 	go c.legWriteLoop(leg)
 	go c.legReadLoop(leg)
+	if id == 1 {
+		c.notifyLeg1Active()
+	}
 	return leg, nil
 }
 
@@ -538,14 +600,28 @@ func (c *mpCore) activationLoop() {
 			}
 			bytesNow := c.ingressBytes.Load()
 			if c.cfg.ActivationAfterBytes > 0 && bytesNow >= c.cfg.ActivationAfterBytes {
-				c.activate()
+				c.activate(activationInfo{
+					Reason:         activationReasonBytes,
+					CurrentBytes:   bytesNow,
+					ThresholdBytes: c.cfg.ActivationAfterBytes,
+				})
 				return
 			}
 			if c.cfg.ThresholdBytesPS > 0 && now.Sub(windowStart) >= c.cfg.ActivationWindow {
 				delta := bytesNow - windowBase
 				elapsed := now.Sub(windowStart)
-				if elapsed > 0 && uint64(float64(delta)/elapsed.Seconds()) >= c.cfg.ThresholdBytesPS {
-					c.activate()
+				rate := uint64(0)
+				if elapsed > 0 {
+					rate = uint64(float64(delta) / elapsed.Seconds())
+				}
+				if rate >= c.cfg.ThresholdBytesPS {
+					c.activate(activationInfo{
+						Reason:           activationReasonThroughput,
+						WindowBytes:      delta,
+						RateBytesPS:      rate,
+						ThresholdBytesPS: c.cfg.ThresholdBytesPS,
+						Elapsed:          elapsed,
+					})
 					return
 				}
 				windowStart = now
@@ -555,11 +631,18 @@ func (c *mpCore) activationLoop() {
 			if primary == nil {
 				continue
 			}
-			if primary.backlogBytes()*5 >= c.cfg.QueueBytes*4 {
+			backlogBytes := primary.backlogBytes()
+			if backlogBytes*5 >= c.cfg.QueueBytes*4 {
 				if queueHighSince.IsZero() {
 					queueHighSince = now
 				} else if now.Sub(queueHighSince) >= c.cfg.ActivationWindow {
-					c.activate()
+					c.activate(activationInfo{
+						Reason:           activationReasonLeg0Queue,
+						BacklogBytes:     backlogBytes,
+						QueueBytes:       c.cfg.QueueBytes,
+						Elapsed:          now.Sub(queueHighSince),
+						RequiredDuration: c.cfg.ActivationWindow,
+					})
 					return
 				}
 			} else {
@@ -569,14 +652,37 @@ func (c *mpCore) activationLoop() {
 	}
 }
 
-func (c *mpCore) activate() {
+func (c *mpCore) activate(info activationInfo) {
 	c.activateOnce.Do(func() {
+		c.activationMu.Lock()
+		c.activation = info
+		c.activationMu.Unlock()
 		c.active.Store(true)
 		close(c.activeCh)
-		if c.cfg.OnActivate != nil {
-			c.cfg.OnActivate()
-		}
+		c.notifyLeg1Active()
 	})
+}
+
+func (c *mpCore) notifyLeg1Active() {
+	if !c.active.Load() || c.cfg.OnLeg1Active == nil {
+		return
+	}
+	leg := c.getLeg(1)
+	if leg == nil {
+		return
+	}
+	c.activationMu.Lock()
+	if c.notifiedLeg1 == leg {
+		c.activationMu.Unlock()
+		return
+	}
+	info := c.activation
+	reconnect := c.leg1Joins > 0
+	c.notifiedLeg1 = leg
+	c.leg1Joins++
+	callback := c.cfg.OnLeg1Active
+	c.activationMu.Unlock()
+	callback(info, reconnect)
 }
 
 func (c *mpCore) weightFor(id uint8) uint32 {
@@ -1059,6 +1165,12 @@ func (c *mpCore) reinjectLeg1() {
 }
 
 func writeWireFrame(conn net.Conn, frame wireFrame) error {
+	if writer, isInitialWriter := conn.(initialFrameWriter); isInitialWriter {
+		handled, err := writer.writeInitialFrame(frame)
+		if handled {
+			return err
+		}
+	}
 	switch frame.typ {
 	case frameTypeData:
 		if len(frame.data) == 0 || len(frame.data) > maxFramePayload {

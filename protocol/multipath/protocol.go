@@ -41,22 +41,41 @@ func newSessionID() ([16]byte, error) {
 	return id, err
 }
 
-func writeHello(conn net.Conn, message helloMessage) error {
+func encodeHelloHeader(message helloMessage) ([helloHeaderSize]byte, error) {
+	var header [helloHeaderSize]byte
 	if len(message.Destination) == 0 || len(message.Destination) > 65535 {
-		return errors.New("invalid multipath destination")
+		return header, errors.New("invalid multipath destination")
 	}
 	if message.ChunkSize == 0 || message.ChunkSize > maxFramePayload {
-		return errors.New("invalid multipath chunk size")
+		return header, errors.New("invalid multipath chunk size")
 	}
-	var header [helloHeaderSize]byte
 	copy(header[0:4], helloMagic[:])
 	header[4] = helloVersion
 	header[5] = message.LegID
 	copy(header[6:22], message.Session[:])
 	binary.BigEndian.PutUint32(header[22:26], message.ChunkSize)
 	binary.BigEndian.PutUint16(header[26:28], uint16(len(message.Destination)))
+	return header, nil
+}
+
+func encodeHello(message helloMessage) ([]byte, error) {
+	header, err := encodeHelloHeader(message)
+	if err != nil {
+		return nil, err
+	}
+	encoded := make([]byte, 0, helloHeaderSize+len(message.Destination))
+	encoded = append(encoded, header[:]...)
+	encoded = append(encoded, message.Destination...)
+	return encoded, nil
+}
+
+func writeHello(conn net.Conn, message helloMessage) error {
+	header, err := encodeHelloHeader(message)
+	if err != nil {
+		return err
+	}
 	buffers := net.Buffers{header[:], []byte(message.Destination)}
-	_, err := buffers.WriteTo(conn)
+	_, err = buffers.WriteTo(conn)
 	return err
 }
 

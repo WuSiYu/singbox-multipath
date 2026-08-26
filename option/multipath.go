@@ -11,6 +11,7 @@ type MultipathOutboundOptions struct {
 	UDPOutbound             string             `json:"udp_outbound,omitempty" reference:"outbound"`
 	Server                  string             `json:"server"`
 	ServerPort              uint16             `json:"server_port"`
+	TCPFastOpen             bool               `json:"tcp_fast_open,omitempty"`
 	ActivationThresholdMbps uint32             `json:"activation_threshold_mbps,omitempty"`
 	ActivationAfterBytes    uint64             `json:"activation_after_bytes,omitempty"`
 	ActivationWindow        badoption.Duration `json:"activation_window,omitempty"`

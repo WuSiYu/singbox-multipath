@@ -97,6 +97,143 @@ func closeTestWrite(t *testing.T, conn net.Conn) {
 	}
 }
 
+type leg1ActiveEvent struct {
+	info      activationInfo
+	reconnect bool
+}
+
+func TestCoreLeg1ActiveNotification(t *testing.T) {
+	cfg := testCoreConfig()
+	cfg.ActivationAfterBytes = 1
+	events := make(chan leg1ActiveEvent, 3)
+	cfg.OnLeg1Active = func(info activationInfo, reconnect bool) {
+		events <- leg1ActiveEvent{info: info, reconnect: reconnect}
+	}
+	core, _ := newCore(context.Background(), cfg)
+	defer core.Close()
+
+	firstCoreConn, firstPeerConn := net.Pipe()
+	firstLeg, err := core.addLeg(1, firstCoreConn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstPeerConn.Close()
+	select {
+	case <-events:
+		t.Fatal("leg1 was reported before activation")
+	default:
+	}
+
+	trigger := activationInfo{
+		Reason:           activationReasonThroughput,
+		WindowBytes:      16 << 20,
+		RateBytesPS:      20_000_000,
+		ThresholdBytesPS: 15_000_000,
+		Elapsed:          time.Second,
+	}
+	core.activate(trigger)
+	firstEvent := <-events
+	if firstEvent.info != trigger || firstEvent.reconnect {
+		t.Fatalf("unexpected first leg1 event: %+v", firstEvent)
+	}
+	core.notifyLeg1Active()
+	select {
+	case event := <-events:
+		t.Fatalf("duplicate leg1 notification: %+v", event)
+	default:
+	}
+
+	core.legFailed(firstLeg, net.ErrClosed)
+	secondCoreConn, secondPeerConn := net.Pipe()
+	defer secondPeerConn.Close()
+	if _, err = core.addLeg(1, secondCoreConn, nil); err != nil {
+		t.Fatal(err)
+	}
+	secondEvent := <-events
+	if secondEvent.info != trigger || !secondEvent.reconnect {
+		t.Fatalf("unexpected reconnected leg1 event: %+v", secondEvent)
+	}
+}
+
+func TestCoreLeg1ActiveNotificationWaitsForLeg(t *testing.T) {
+	cfg := testCoreConfig()
+	cfg.ActivationAfterBytes = 1
+	events := make(chan leg1ActiveEvent, 1)
+	cfg.OnLeg1Active = func(info activationInfo, reconnect bool) {
+		events <- leg1ActiveEvent{info: info, reconnect: reconnect}
+	}
+	core, _ := newCore(context.Background(), cfg)
+	defer core.Close()
+	trigger := activationInfo{
+		Reason:         activationReasonBytes,
+		CurrentBytes:   4096,
+		ThresholdBytes: 1024,
+	}
+	core.activate(trigger)
+	select {
+	case <-events:
+		t.Fatal("leg1 was reported before it joined")
+	default:
+	}
+
+	coreConn, peerConn := net.Pipe()
+	defer peerConn.Close()
+	if _, err := core.addLeg(1, coreConn, nil); err != nil {
+		t.Fatal(err)
+	}
+	event := <-events
+	if event.info != trigger || event.reconnect {
+		t.Fatalf("unexpected delayed leg1 event: %+v", event)
+	}
+}
+
+func TestActivationInfoString(t *testing.T) {
+	tests := []struct {
+		name     string
+		info     activationInfo
+		expected string
+	}{
+		{
+			name: "bytes",
+			info: activationInfo{
+				Reason:         activationReasonBytes,
+				CurrentBytes:   2048,
+				ThresholdBytes: 1024,
+			},
+			expected: "reason=bytes current_bytes=2048 threshold_bytes=1024",
+		},
+		{
+			name: "throughput",
+			info: activationInfo{
+				Reason:           activationReasonThroughput,
+				WindowBytes:      16 << 20,
+				RateBytesPS:      17_100_000,
+				ThresholdBytesPS: 15_000_000,
+				Elapsed:          time.Second,
+			},
+			expected: "reason=throughput measured_mbps=136.80 threshold_mbps=120.00 window=1s window_bytes=16777216",
+		},
+		{
+			name: "leg0 queue",
+			info: activationInfo{
+				Reason:           activationReasonLeg0Queue,
+				BacklogBytes:     13 << 20,
+				QueueBytes:       16 << 20,
+				Elapsed:          time.Second,
+				RequiredDuration: time.Second,
+			},
+			expected: "reason=leg0_queue backlog_bytes=13631488 queue_bytes=16777216 ratio=81.2% duration=1s required_duration=1s",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if actual := test.info.String(); actual != test.expected {
+				t.Fatalf("unexpected activation info: %q", actual)
+			}
+		})
+	}
+}
+
 func TestCoreHalfClosePreservesTail(t *testing.T) {
 	left, leftApp := newCore(context.Background(), testCoreConfig())
 	right, rightApp := newCore(context.Background(), testCoreConfig())

@@ -223,8 +223,13 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	cfg := i.cfg
 	cfg.ChunkSize = int(hello.ChunkSize)
 	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
-	cfg.OnActivate = func() {
-		i.logger.InfoContext(ctx, "multipath server booster activated for ", destination)
+	cfg.OnLeg1Active = func(info activationInfo, reconnect bool) {
+		i.logger.InfoContext(
+			ctx,
+			"multipath leg1 joined data path: side=server destination=", destination,
+			" reconnect=", reconnect,
+			" ", info.String(),
+		)
 	}
 	core, appConn := newCore(i.ctx, cfg)
 	session = &serverSession{
