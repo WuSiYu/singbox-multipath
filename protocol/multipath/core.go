@@ -14,17 +14,19 @@ import (
 )
 
 const (
-	frameTypeData  byte = 1
-	frameTypeACK   byte = 2
-	frameTypeFIN   byte = 3
-	frameTypeReset byte = 4
+	frameTypeData         byte = 1
+	frameTypeACK          byte = 2
+	frameTypeFIN          byte = 3
+	frameTypeReset        byte = 4
+	frameTypeSessionClose byte = 5
 
-	dataFrameHeaderSize    = 13 // type(1) + seq(8) + len(4)
-	controlFrameHeaderSize = 9  // type(1) + seq(8)
-	maxFramePayload        = 1 << 20
-	maxQueueBytes          = 64 << 20
-	maxReorderBytes        = 512 << 20
-	maxReplayBytes         = 512 << 20
+	dataFrameHeaderSize      = 13 // type(1) + seq(8) + len(4)
+	controlFrameHeaderSize   = 9  // type(1) + seq(8)
+	maxFramePayload          = 1 << 20
+	maxQueueBytes            = 64 << 20
+	maxReorderBytes          = 512 << 20
+	maxReplayBytes           = 512 << 20
+	sessionCloseDrainTimeout = time.Second // Logical shutdown does not wait for this drain.
 )
 
 var (
@@ -133,6 +135,11 @@ type mpLegCounters struct {
 	rxFrames atomic.Uint64
 }
 
+type legShutdownRequest struct {
+	err       error
+	frameType byte
+}
+
 // logicalConn uses one net.Pipe per direction. Unlike a single net.Pipe, this
 // lets sing-box half-close one direction without tearing down queued data in
 // the other direction.
@@ -209,6 +216,7 @@ type mpLeg struct {
 	readPreamble func(net.Conn) error
 	send         chan wireFrame
 	control      chan wireFrame
+	shutdown     chan legShutdownRequest
 	onClose      func(error)
 	done         chan struct{}
 	writerDone   chan struct{}
@@ -229,6 +237,15 @@ func (l *mpLeg) close(err error) {
 			l.onClose(err)
 		}
 	})
+}
+
+func (l *mpLeg) requestShutdown(err error, frameType byte) {
+	select {
+	case <-l.done:
+	case l.shutdown <- legShutdownRequest{err: err, frameType: frameType}:
+	default:
+		l.close(err)
+	}
 }
 
 func (l *mpLeg) backlogBytes() int64 {
@@ -272,14 +289,6 @@ func (l *mpLeg) queueControl(coreDone <-chan struct{}, frame wireFrame) error {
 		return errCoreClosed
 	case l.control <- frame:
 		return nil
-	}
-}
-
-func (l *mpLeg) tryControl(frame wireFrame) {
-	select {
-	case <-l.done:
-	case l.control <- frame:
-	default:
 	}
 }
 
@@ -411,6 +420,14 @@ func (c *mpCore) isDone() bool {
 }
 
 func (c *mpCore) fail(err error) {
+	c.terminate(err, frameTypeSessionClose)
+}
+
+func (c *mpCore) peerSessionClosed(err error) {
+	c.terminate(err, 0)
+}
+
+func (c *mpCore) terminate(err error, terminalFrameType byte) {
 	if err == nil {
 		err = errCoreClosed
 	}
@@ -419,11 +436,6 @@ func (c *mpCore) fail(err error) {
 		c.failure = err.Error()
 		c.failureAt = time.Now()
 		c.failureMu.Unlock()
-		c.cancel()
-		close(c.done)
-		_ = c.txPipe.Close()
-		_ = c.rxPipe.Close()
-		_, _ = c.appConn.closeInternal()
 		c.legsMu.RLock()
 		legs := make([]*mpLeg, 0, len(c.legs))
 		for _, leg := range c.legs {
@@ -431,8 +443,14 @@ func (c *mpCore) fail(err error) {
 		}
 		c.legsMu.RUnlock()
 		for _, leg := range legs {
-			leg.close(err)
+			leg.requestShutdown(err, terminalFrameType)
 		}
+		c.cancel()
+		close(c.done)
+		_ = c.txPipe.Close()
+		_ = c.rxPipe.Close()
+		_, _ = c.appConn.closeInternal()
+		go closeLegsAfterDrain(legs, err)
 		// Buffers possibly referenced by blocked writers are deliberately left to
 		// the garbage collector instead of being returned to the pool here.
 		c.replayMu.Lock()
@@ -443,10 +461,25 @@ func (c *mpCore) fail(err error) {
 }
 
 func (c *mpCore) protocolFail(err error) {
-	if leg := c.getLeg(0); leg != nil {
-		leg.tryControl(wireFrame{typ: frameTypeReset})
+	c.terminate(err, frameTypeReset)
+}
+
+func closeLegsAfterDrain(legs []*mpLeg, err error) {
+	timer := time.NewTimer(sessionCloseDrainTimeout)
+	defer timer.Stop()
+	for _, leg := range legs {
+		select {
+		case <-leg.writerDone:
+		case <-timer.C:
+			for _, pendingLeg := range legs {
+				pendingLeg.close(err)
+			}
+			return
+		}
 	}
-	c.fail(err)
+	for _, leg := range legs {
+		leg.close(err)
+	}
 }
 
 func (c *mpCore) reserveLeg(id uint8) error {
@@ -496,6 +529,7 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 		readPreamble: readPreamble,
 		send:         make(chan wireFrame, c.cfg.QueueFrames),
 		control:      make(chan wireFrame, 32),
+		shutdown:     make(chan legShutdownRequest, 1),
 		onClose:      onClose,
 		done:         make(chan struct{}),
 		writerDone:   make(chan struct{}),
@@ -793,6 +827,12 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 	defer close(leg.writerDone)
 	for {
 		select {
+		case request := <-leg.shutdown:
+			c.finishLegShutdown(leg, request)
+			return
+		default:
+		}
+		select {
 		case control := <-leg.control:
 			if err := writeWireFrame(leg.conn, control); err != nil {
 				c.legFailed(leg, legFailureWriteControl, err)
@@ -802,7 +842,16 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 		default:
 		}
 		select {
+		case request := <-leg.shutdown:
+			c.finishLegShutdown(leg, request)
+			return
 		case <-c.done:
+			select {
+			case request := <-leg.shutdown:
+				c.finishLegShutdown(leg, request)
+			default:
+				leg.close(errCoreClosed)
+			}
 			return
 		case <-leg.done:
 			return
@@ -837,6 +886,13 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 	}
 }
 
+func (c *mpCore) finishLegShutdown(leg *mpLeg, request legShutdownRequest) {
+	if request.frameType != 0 {
+		_ = writeWireFrame(leg.conn, wireFrame{typ: request.frameType})
+	}
+	leg.close(request.err)
+}
+
 func (c *mpCore) legReadLoop(leg *mpLeg) {
 	if leg.readPreamble != nil {
 		if err := leg.readPreamble(leg.conn); err != nil {
@@ -862,7 +918,10 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 			}
 			c.handleACK(frame.seq)
 		case frameTypeReset:
-			c.fail(errors.New("multipath peer reset"))
+			c.peerSessionClosed(errors.New("multipath peer reset"))
+			return
+		case frameTypeSessionClose:
+			c.peerSessionClosed(io.EOF)
 			return
 		case frameTypeData, frameTypeFIN:
 			if frame.typ == frameTypeData {
@@ -1235,8 +1294,8 @@ func writeWireFrame(conn net.Conn, frame wireFrame) error {
 		header[0] = frame.typ
 		binary.BigEndian.PutUint64(header[1:9], frame.seq)
 		return writeAll(conn, header[:])
-	case frameTypeReset:
-		return writeAll(conn, []byte{frameTypeReset})
+	case frameTypeReset, frameTypeSessionClose:
+		return writeAll(conn, []byte{frame.typ})
 	default:
 		return errors.New("unknown multipath frame type")
 	}
@@ -1274,7 +1333,7 @@ func readWireFrame(conn net.Conn, core *mpCore) (wireFrame, error) {
 		}
 		frame.seq = binary.BigEndian.Uint64(sequence[:])
 		return frame, nil
-	case frameTypeReset:
+	case frameTypeReset, frameTypeSessionClose:
 		return frame, nil
 	default:
 		return wireFrame{}, errors.New("unknown multipath frame type")

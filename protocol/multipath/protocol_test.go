@@ -192,12 +192,28 @@ func TestHelloRejectsBoosterStatus(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 	go func() {
-		_ = writeHelloResponse(server, helloResponse{Status: helloStatusRejected, RejectReason: helloRejectSessionNotFound})
+		_ = writeHelloResponse(server, helloResponse{Status: helloStatusRejected, RejectReason: helloRejectSessionUnavailable})
 	}()
 	if _, err := readHelloResponse(client); err == nil {
 		t.Fatal("expected rejected hello response")
-	} else if !strings.Contains(err.Error(), "session no longer exists") {
+	} else if !strings.Contains(err.Error(), "not established yet or is already closed") {
 		t.Fatalf("rejection reason missing from error: %v", err)
+	} else if reason, loaded := helloRejectReasonFromError(err); !loaded || reason != helloRejectSessionUnavailable {
+		t.Fatalf("structured rejection reason missing from error: %v", err)
+	}
+}
+
+func TestProtocolVersionFourHello(t *testing.T) {
+	encoded, err := encodeHello(helloMessage{
+		LegID:       0,
+		ChunkSize:   64 * 1024,
+		Destination: "example.com:443",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded[:4]) != "SMP4" || encoded[4] != 4 {
+		t.Fatalf("unexpected multipath protocol header: %q version=%d", encoded[:4], encoded[4])
 	}
 }
 

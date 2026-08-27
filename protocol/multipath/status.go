@@ -245,9 +245,12 @@ func classifyStatusError(err error) (category string, transient bool, harmless b
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return "peer_closed", true, false
 	}
-	if strings.Contains(message, "multipath hello rejected") {
-		harmless = strings.Contains(message, "session no longer exists") || strings.Contains(message, "leg already attached")
+	if reason, rejected := helloRejectReasonFromError(err); rejected {
+		harmless = reason == helloRejectSessionUnavailable || reason == helloRejectLegUnavailable
 		return "hello_rejected", harmless, harmless
+	}
+	if strings.Contains(message, "multipath hello rejected") {
+		return "hello_rejected", false, false
 	}
 	if errors.Is(err, errLeg1Stalled) {
 		return "replay_timeout", true, false

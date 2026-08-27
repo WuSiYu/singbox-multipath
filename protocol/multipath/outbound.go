@@ -424,6 +424,11 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 			case <-core.Done():
 				return
 			case <-leg.Done():
+				select {
+				case <-core.Done():
+					return
+				default:
+				}
 				statusSession.setLeg1Phase(leg1PhaseRetrying)
 				o.logger.WarnContext(ctx, "multipath secondary leg lost; retrying via ", o.tags[1])
 			}
@@ -432,9 +437,19 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 		if conn != nil {
 			conn.Close()
 		}
+		select {
+		case <-core.Done():
+			return
+		default:
+		}
 		statusSession.setLeg1Phase(leg1PhaseRetrying)
-		statusSession.recordLegError(1, stage, err)
-		o.logger.WarnContext(ctx, "multipath secondary leg failed: ", err)
+		reason, rejected := helloRejectReasonFromError(err)
+		if rejected && (reason == helloRejectSessionUnavailable || reason == helloRejectLegUnavailable) {
+			o.logger.DebugContext(ctx, "multipath secondary leg deferred: ", err)
+		} else {
+			statusSession.recordLegError(1, stage, err)
+			o.logger.WarnContext(ctx, "multipath secondary leg failed: ", err)
+		}
 		retryTimer := time.NewTimer(2 * time.Second)
 		select {
 		case <-core.Done():

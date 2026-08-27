@@ -9,12 +9,12 @@ import (
 )
 
 var (
-	helloMagic    = [4]byte{'S', 'M', 'P', '3'}
+	helloMagic    = [4]byte{'S', 'M', 'P', '4'}
 	responseMagic = [4]byte{'S', 'M', 'P', 'R'}
 )
 
 const (
-	helloVersion byte = 3
+	helloVersion byte = 4
 
 	helloStatusOK       byte = 0
 	helloStatusRejected byte = 1
@@ -38,6 +38,22 @@ type helloResponse struct {
 
 type helloRejectReason uint32
 
+type helloRejectedError struct {
+	reason helloRejectReason
+}
+
+func (e *helloRejectedError) Error() string {
+	return "multipath hello rejected: " + e.reason.String()
+}
+
+func helloRejectReasonFromError(err error) (helloRejectReason, bool) {
+	var rejection *helloRejectedError
+	if !errors.As(err, &rejection) {
+		return helloRejectUnknown, false
+	}
+	return rejection.reason, true
+}
+
 const (
 	helloRejectUnknown helloRejectReason = iota
 	helloRejectInvalidLegID
@@ -45,7 +61,7 @@ const (
 	helloRejectSessionMismatch
 	helloRejectDuplicateControl
 	helloRejectLegUnavailable
-	helloRejectSessionNotFound
+	helloRejectSessionUnavailable
 	helloRejectChunkSizeLimit
 )
 
@@ -61,8 +77,8 @@ func (r helloRejectReason) String() string {
 		return "session already has a control leg"
 	case helloRejectLegUnavailable:
 		return "leg already attached or joining"
-	case helloRejectSessionNotFound:
-		return "session no longer exists; control leg already closed"
+	case helloRejectSessionUnavailable:
+		return "control session is not established yet or is already closed"
 	case helloRejectChunkSizeLimit:
 		return "requested chunk size exceeds server limit"
 	default:
@@ -171,7 +187,7 @@ func readHelloResponse(conn net.Conn) (helloResponse, error) {
 	if response.Status != helloStatusOK {
 		response.RejectReason = helloRejectReason(response.ChunkSize)
 		response.ChunkSize = 0
-		return response, errors.New("multipath hello rejected: " + response.RejectReason.String())
+		return response, &helloRejectedError{reason: response.RejectReason}
 	}
 	if response.ChunkSize == 0 || response.ChunkSize > maxFramePayload {
 		return response, errors.New("invalid multipath accepted chunk size")

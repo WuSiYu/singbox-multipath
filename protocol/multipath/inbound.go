@@ -211,7 +211,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 	if hello.LegID != 0 {
 		i.access.Unlock()
-		i.rejectHello(conn, onClose, helloRejectSessionNotFound, E.New("multipath control leg must create the session"))
+		i.rejectHello(conn, onClose, helloRejectSessionUnavailable, E.New("multipath control leg must create the session"))
 		return
 	}
 	if int(hello.ChunkSize) > i.cfg.ChunkSize {

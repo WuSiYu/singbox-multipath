@@ -151,8 +151,8 @@ func encodeWireFrame(frame wireFrame) ([]byte, error) {
 		encoded[0] = frame.typ
 		binary.BigEndian.PutUint64(encoded[1:9], frame.seq)
 		return encoded, nil
-	case frameTypeReset:
-		return []byte{frameTypeReset}, nil
+	case frameTypeReset, frameTypeSessionClose:
+		return []byte{frame.typ}, nil
 	default:
 		return nil, errors.New("unknown multipath frame type")
 	}

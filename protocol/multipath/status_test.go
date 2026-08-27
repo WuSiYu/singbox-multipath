@@ -248,7 +248,7 @@ func TestOutboundStatusErrorDetails(t *testing.T) {
 	copy(id[:], []byte{0x12, 0x34, 0x56, 0x78})
 	session := status.addSession(id, "1.1.1.1:443", core, leg1PhaseRetrying)
 	session.leg1Attempts.Store(3)
-	err := errors.New("multipath hello rejected: session no longer exists; control leg already closed")
+	err := &helloRejectedError{reason: helloRejectSessionUnavailable}
 	session.recordLegError(1, "secondary_handshake", err)
 	session.recordLegError(1, "secondary_handshake", err)
 
@@ -281,7 +281,8 @@ func TestClassifyStatusError(t *testing.T) {
 	}{
 		{"eof", io.EOF, "peer_closed", true, true},
 		{"unexpected eof", io.ErrUnexpectedEOF, "peer_closed", true, false},
-		{"late secondary", errors.New("multipath hello rejected: session no longer exists; control leg already closed"), "hello_rejected", true, true},
+		{"unavailable session", &helloRejectedError{reason: helloRejectSessionUnavailable}, "hello_rejected", true, true},
+		{"leg unavailable", &helloRejectedError{reason: helloRejectLegUnavailable}, "hello_rejected", true, true},
 		{"legacy rejection", errors.New("multipath hello rejected: unspecified by server"), "hello_rejected", false, false},
 		{"replay timeout", errLeg1Stalled, "replay_timeout", true, false},
 		{"dial timeout", errors.New("dial tcp: i/o timeout"), "timeout", true, false},
