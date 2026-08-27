@@ -1,43 +1,81 @@
 package main
 
 import (
+	"fmt"
 	"net/netip"
 	"testing"
 	"time"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-shadowsocks/shadowaead"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
-func TestMultipathTFOCombinations(t *testing.T) {
-	testCases := []struct {
-		name              string
-		multipathTFO      bool
-		childAndServerTFO bool
-	}{
-		{name: "multipath_off_child_off"},
-		{name: "multipath_off_child_on", childAndServerTFO: true},
-		{name: "multipath_on_child_off", multipathTFO: true},
-		{name: "multipath_on_child_on", multipathTFO: true, childAndServerTFO: true},
-	}
+const (
+	multipathTestLegDirect = "direct"
+	multipathTestLegProxy  = "shadowsocks"
+)
 
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			startInstance(t, multipathTFOTestOptions(testCase.multipathTFO, testCase.childAndServerTFO))
-			testTCP(t, clientPort, testPort)
-		})
+type multipathTestLeg struct {
+	tag       string
+	kind      string
+	tfo       bool
+	proxyPort uint16
+}
+
+func TestMultipathTFOCombinations(t *testing.T) {
+	method := shadowaead.List[0]
+	password := mkBase64(t, 16)
+	legKinds := []string{multipathTestLegDirect, multipathTestLegProxy}
+
+	for _, leg0Kind := range legKinds {
+		for _, leg1Kind := range legKinds {
+			for _, multipathTFO := range []bool{false, true} {
+				for _, leg0TFO := range []bool{false, true} {
+					for _, leg1TFO := range []bool{false, true} {
+						leg0 := multipathTestLeg{
+							tag:       "leg0",
+							kind:      leg0Kind,
+							tfo:       leg0TFO,
+							proxyPort: otherPort,
+						}
+						leg1 := multipathTestLeg{
+							tag:       "leg1",
+							kind:      leg1Kind,
+							tfo:       leg1TFO,
+							proxyPort: otherClientPort,
+						}
+						name := fmt.Sprintf(
+							"leg0_%s_tfo_%t/leg1_%s_tfo_%t/multipath_tfo_%t",
+							leg0.kind,
+							leg0.tfo,
+							leg1.kind,
+							leg1.tfo,
+							multipathTFO,
+						)
+						t.Run(name, func(t *testing.T) {
+							startInstance(t, multipathTFOTestOptions(multipathTFO, leg0, leg1, method, password))
+							testTCP(t, clientPort, testPort)
+						})
+					}
+				}
+			}
+		}
 	}
 }
 
-func multipathTFOTestOptions(multipathTFO bool, childAndServerTFO bool) option.Options {
+func multipathTFOTestOptions(
+	multipathTFO bool,
+	leg0 multipathTestLeg,
+	leg1 multipathTestLeg,
+	proxyMethod string,
+	proxyPassword string,
+) option.Options {
 	listenAddress := common.Ptr(badoption.Addr(netip.IPv4Unspecified()))
-	childDialerOptions := option.DialerOptions{
-		AbstractDialerOptions: option.AbstractDialerOptions{
-			TCPFastOpen: childAndServerTFO,
-		},
-	}
+	aggregationTFO := leg0.kind == multipathTestLegDirect && leg0.tfo ||
+		leg1.kind == multipathTestLegDirect && leg1.tfo
 	sharedMultipathOptions := struct {
 		activationAfterBytes uint64
 		activationWindow     badoption.Duration
@@ -54,75 +92,107 @@ func multipathTFOTestOptions(multipathTFO bool, childAndServerTFO bool) option.O
 		handshakeTimeout:     badoption.Duration(5 * time.Second),
 	}
 
+	inbounds := []option.Inbound{
+		{
+			Type: C.TypeMixed,
+			Tag:  "mixed-in",
+			Options: &option.HTTPMixedInboundOptions{
+				ListenOptions: option.ListenOptions{
+					Listen:     listenAddress,
+					ListenPort: clientPort,
+				},
+			},
+		},
+		{
+			Type: C.TypeMultipath,
+			Tag:  "multipath-in",
+			Options: &option.MultipathInboundOptions{
+				ListenOptions: option.ListenOptions{
+					Listen:      listenAddress,
+					ListenPort:  serverPort,
+					TCPFastOpen: aggregationTFO,
+				},
+				ActivationAfterBytes: sharedMultipathOptions.activationAfterBytes,
+				ActivationWindow:     sharedMultipathOptions.activationWindow,
+				ChunkSize:            sharedMultipathOptions.chunkSize,
+				QueueFrames:          sharedMultipathOptions.queueFrames,
+				BandwidthMbps:        sharedMultipathOptions.bandwidthMbps,
+				HandshakeTimeout:     sharedMultipathOptions.handshakeTimeout,
+			},
+		},
+	}
+	outbounds := []option.Outbound{
+		{
+			Type:    C.TypeDirect,
+			Tag:     "direct-out",
+			Options: &option.DirectOutboundOptions{},
+		},
+	}
+	for _, leg := range []multipathTestLeg{leg0, leg1} {
+		dialerOptions := option.DialerOptions{
+			AbstractDialerOptions: option.AbstractDialerOptions{
+				TCPFastOpen: leg.tfo,
+			},
+		}
+		if leg.kind == multipathTestLegDirect {
+			outbounds = append(outbounds, option.Outbound{
+				Type: C.TypeDirect,
+				Tag:  leg.tag,
+				Options: &option.DirectOutboundOptions{
+					DialerOptions: dialerOptions,
+				},
+			})
+			continue
+		}
+		inbounds = append(inbounds, option.Inbound{
+			Type: C.TypeShadowsocks,
+			Tag:  leg.tag + "-proxy-in",
+			Options: &option.ShadowsocksInboundOptions{
+				ListenOptions: option.ListenOptions{
+					Listen:      listenAddress,
+					ListenPort:  leg.proxyPort,
+					TCPFastOpen: leg.tfo,
+				},
+				Method:   proxyMethod,
+				Password: proxyPassword,
+			},
+		})
+		outbounds = append(outbounds, option.Outbound{
+			Type: C.TypeShadowsocks,
+			Tag:  leg.tag,
+			Options: &option.ShadowsocksOutboundOptions{
+				ServerOptions: option.ServerOptions{
+					Server:     "127.0.0.1",
+					ServerPort: leg.proxyPort,
+				},
+				DialerOptions: dialerOptions,
+				Method:        proxyMethod,
+				Password:      proxyPassword,
+			},
+		})
+	}
+	outbounds = append(outbounds, option.Outbound{
+		Type: C.TypeMultipath,
+		Tag:  "mp-out",
+		Options: &option.MultipathOutboundOptions{
+			Outbounds:            []string{leg0.tag, leg1.tag},
+			Preferred:            leg0.tag,
+			UDPOutbound:          leg0.tag,
+			Server:               "127.0.0.1",
+			ServerPort:           serverPort,
+			TCPFastOpen:          multipathTFO,
+			ActivationAfterBytes: sharedMultipathOptions.activationAfterBytes,
+			ActivationWindow:     sharedMultipathOptions.activationWindow,
+			ChunkSize:            sharedMultipathOptions.chunkSize,
+			QueueFrames:          sharedMultipathOptions.queueFrames,
+			BandwidthMbps:        sharedMultipathOptions.bandwidthMbps,
+			HandshakeTimeout:     sharedMultipathOptions.handshakeTimeout,
+		},
+	})
+
 	return option.Options{
-		Inbounds: []option.Inbound{
-			{
-				Type: C.TypeMixed,
-				Tag:  "mixed-in",
-				Options: &option.HTTPMixedInboundOptions{
-					ListenOptions: option.ListenOptions{
-						Listen:     listenAddress,
-						ListenPort: clientPort,
-					},
-				},
-			},
-			{
-				Type: C.TypeMultipath,
-				Tag:  "multipath-in",
-				Options: &option.MultipathInboundOptions{
-					ListenOptions: option.ListenOptions{
-						Listen:      listenAddress,
-						ListenPort:  serverPort,
-						TCPFastOpen: childAndServerTFO,
-					},
-					ActivationAfterBytes: sharedMultipathOptions.activationAfterBytes,
-					ActivationWindow:     sharedMultipathOptions.activationWindow,
-					ChunkSize:            sharedMultipathOptions.chunkSize,
-					QueueFrames:          sharedMultipathOptions.queueFrames,
-					BandwidthMbps:        sharedMultipathOptions.bandwidthMbps,
-					HandshakeTimeout:     sharedMultipathOptions.handshakeTimeout,
-				},
-			},
-		},
-		Outbounds: []option.Outbound{
-			{
-				Type:    C.TypeDirect,
-				Tag:     "direct-out",
-				Options: &option.DirectOutboundOptions{},
-			},
-			{
-				Type: C.TypeDirect,
-				Tag:  "leg0",
-				Options: &option.DirectOutboundOptions{
-					DialerOptions: childDialerOptions,
-				},
-			},
-			{
-				Type: C.TypeDirect,
-				Tag:  "leg1",
-				Options: &option.DirectOutboundOptions{
-					DialerOptions: childDialerOptions,
-				},
-			},
-			{
-				Type: C.TypeMultipath,
-				Tag:  "mp-out",
-				Options: &option.MultipathOutboundOptions{
-					Outbounds:            []string{"leg0", "leg1"},
-					Preferred:            "leg0",
-					UDPOutbound:          "leg0",
-					Server:               "127.0.0.1",
-					ServerPort:           serverPort,
-					TCPFastOpen:          multipathTFO,
-					ActivationAfterBytes: sharedMultipathOptions.activationAfterBytes,
-					ActivationWindow:     sharedMultipathOptions.activationWindow,
-					ChunkSize:            sharedMultipathOptions.chunkSize,
-					QueueFrames:          sharedMultipathOptions.queueFrames,
-					BandwidthMbps:        sharedMultipathOptions.bandwidthMbps,
-					HandshakeTimeout:     sharedMultipathOptions.handshakeTimeout,
-				},
-			},
-		},
+		Inbounds:  inbounds,
+		Outbounds: outbounds,
 		Route: &option.RouteOptions{
 			Rules: []option.Rule{
 				{
