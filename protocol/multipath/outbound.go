@@ -13,6 +13,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -373,10 +374,20 @@ func setClientHandshakeDeadline(conn net.Conn, deadline time.Time) (bool, error)
 	if err == nil {
 		return true, nil
 	}
-	if errors.Is(err, os.ErrInvalid) && N.NeedHandshakeForWrite(conn) {
+	if errors.Is(err, os.ErrInvalid) && needsHandshakeForWrite(conn) {
 		return false, nil
 	}
 	return false, err
+}
+
+func needsHandshakeForWrite(conn net.Conn) bool {
+	if N.NeedHandshakeForWrite(conn) {
+		return true
+	}
+	// slowOpenConn still implements the legacy interface. Trackers hide that
+	// method on the outer net.Conn but expose the connection through Upstream.
+	earlyConn, loaded := common.Cast[interface{ NeedHandshake() bool }](conn)
+	return loaded && earlyConn.NeedHandshake()
 }
 
 func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uint32, destination string, statusSession *statusSession) {

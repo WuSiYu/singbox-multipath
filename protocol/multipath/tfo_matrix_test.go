@@ -44,6 +44,14 @@ type tfoMatrixConn struct {
 	deadlines []time.Time
 }
 
+type tfoMatrixTrackedConn struct {
+	net.Conn
+}
+
+func (c *tfoMatrixTrackedConn) Upstream() any {
+	return c.Conn
+}
+
 func newTFOMatrixConn(conn net.Conn, lazy bool) *tfoMatrixConn {
 	return &tfoMatrixConn{Conn: conn, lazy: lazy, pending: lazy}
 }
@@ -98,6 +106,10 @@ func testTFOCombination(t *testing.T, multipathTFO, childTFO bool) {
 	t.Helper()
 	clientWire, serverWire := net.Pipe()
 	clientConn := newTFOMatrixConn(clientWire, childTFO)
+	var childConn net.Conn = clientConn
+	if childTFO {
+		childConn = &tfoMatrixTrackedConn{Conn: clientConn}
+	}
 	payload := []byte("matrix payload")
 	messageResult := make(chan helloMessage, 1)
 	serverResult := make(chan error, 1)
@@ -141,7 +153,7 @@ func testTFOCombination(t *testing.T, multipathTFO, childTFO bool) {
 	primary := &tfoMatrixChild{
 		tag: "primary",
 		dial: func(context.Context) (net.Conn, error) {
-			return clientConn, nil
+			return childConn, nil
 		},
 	}
 	secondary := &tfoMatrixChild{
