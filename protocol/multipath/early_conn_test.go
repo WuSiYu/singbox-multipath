@@ -126,6 +126,34 @@ func TestClientFastOpenCombinesHelloAndFirstFrame(t *testing.T) {
 	}
 }
 
+func TestClientFastOpenSupportsOpaqueLazyChild(t *testing.T) {
+	message := helloMessage{
+		Session:     [16]byte{5, 6, 7, 8},
+		LegID:       0,
+		ChunkSize:   64 * 1024,
+		Destination: "1.1.1.1:443",
+	}
+	spy := new(fastOpenSpyConn)
+	child := struct{ net.Conn }{Conn: spy}
+	if N.NeedHandshakeForWrite(&child) {
+		t.Fatal("opaque child unexpectedly exposes its lazy-connect state")
+	}
+	deadline := time.Now().Add(time.Second)
+	conn, err := newClientFastOpenConn(&child, message, deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writeWireFrame(conn, wireFrame{typ: frameTypeData, data: []byte("payload")}); err != nil {
+		t.Fatal(err)
+	}
+	if writes := spy.snapshotWrites(); len(writes) != 1 {
+		t.Fatalf("expected one physical write, got %d", len(writes))
+	}
+	if len(spy.deadlines) != 1 || !spy.deadlines[0].Equal(deadline) {
+		t.Fatal("handshake deadline was not applied after the opaque child first write")
+	}
+}
+
 func TestWriteHelloLegacyUsesSeparateWrites(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{2, 4, 6, 8},

@@ -68,7 +68,10 @@ func (c *clientFastOpenConn) start(payload []byte) (bool, error) {
 func (c *clientFastOpenConn) writeInitial(payload []byte) error {
 	deadlineSet := true
 	if err := c.Conn.SetDeadline(c.handshakeDeadline); err != nil {
-		if !errors.Is(err, os.ErrInvalid) || !N.NeedHandshakeForWrite(c.Conn) {
+		// Some child wrappers hide their lazy-connect state. EINVAL before the
+		// first write is therefore treated as a deferred deadline; the deadline
+		// is applied again immediately after that write completes.
+		if !errors.Is(err, os.ErrInvalid) {
 			return err
 		}
 		deadlineSet = false
