@@ -154,7 +154,7 @@ func TestClientFastOpenSupportsOpaqueLazyChild(t *testing.T) {
 	}
 }
 
-func TestWriteHelloLegacyUsesSeparateWrites(t *testing.T) {
+func TestWriteHelloWithoutMultipathTFOUsesSeparateWrites(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{2, 4, 6, 8},
 		LegID:       0,
@@ -167,14 +167,14 @@ func TestWriteHelloLegacyUsesSeparateWrites(t *testing.T) {
 	}
 	writes := spy.snapshotWrites()
 	if len(writes) != 2 {
-		t.Fatalf("legacy hello path changed its physical write count: got %d", len(writes))
+		t.Fatalf("non-fast-open hello path changed its physical write count: got %d", len(writes))
 	}
 	hello, err := encodeHello(message)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(bytes.Join(writes, nil), hello) {
-		t.Fatal("legacy hello path changed its wire representation")
+		t.Fatal("non-fast-open hello path changed its wire representation")
 	}
 }
 
@@ -342,7 +342,10 @@ func TestEarlyLogicalConnRejectClosesConnection(t *testing.T) {
 			serverCore.putBuffer(frame.data)
 		}
 		if readErr == nil {
-			readErr = writeHelloResponse(serverWire, helloResponse{Status: helloStatusRejected})
+			readErr = writeHelloResponse(serverWire, helloResponse{
+				Status:       helloStatusRejected,
+				RejectReason: helloRejectInvalidDestination,
+			})
 		}
 		serverResult <- readErr
 	}()

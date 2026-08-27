@@ -2,6 +2,7 @@ package multipath
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"os"
@@ -217,16 +218,78 @@ func TestProtocolVersionFourHello(t *testing.T) {
 	}
 }
 
-func TestHelloRejectWithoutReasonRemainsCompatible(t *testing.T) {
+func TestWriteHelloResponseRejectsInvalidV4Values(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
+	for _, response := range []helloResponse{
+		{Status: helloStatusRejected},
+		{Status: 2, ChunkSize: 64 * 1024},
+	} {
+		if err := writeHelloResponse(client, response); err == nil {
+			t.Fatalf("accepted invalid v4 hello response: %+v", response)
+		}
+	}
+}
+
+func TestReadHelloResponseRejectsInvalidV4Values(t *testing.T) {
+	tests := []struct {
+		name    string
+		version byte
+		status  byte
+		value   uint32
+	}{
+		{"v3 response", 3, helloStatusOK, 64 * 1024},
+		{"unknown status", helloVersion, 2, 64 * 1024},
+		{"missing rejection reason", helloVersion, helloStatusRejected, 0},
+		{"unknown rejection reason", helloVersion, helloStatusRejected, 255},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			var header [responseHeaderSize]byte
+			copy(header[0:4], responseMagic[:])
+			header[4] = test.version
+			header[5] = test.status
+			binary.BigEndian.PutUint32(header[6:10], test.value)
+			writeDone := make(chan error, 1)
+			go func() {
+				writeDone <- writeAll(server, header[:])
+			}()
+			if _, err := readHelloResponse(client); err == nil {
+				t.Fatal("accepted invalid v4 hello response")
+			}
+			if err := <-writeDone; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestReadHelloRejectsProtocolVersionThree(t *testing.T) {
+	header, err := encodeHelloHeader(helloMessage{
+		LegID:       0,
+		ChunkSize:   64 * 1024,
+		Destination: "example.com:443",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(header[0:4], []byte("SMP3"))
+	header[4] = 3
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	writeDone := make(chan error, 1)
 	go func() {
-		_ = writeHelloResponse(server, helloResponse{Status: helloStatusRejected})
+		writeDone <- writeAll(client, header[:])
 	}()
-	if _, err := readHelloResponse(client); err == nil {
-		t.Fatal("expected rejected hello response")
-	} else if !strings.Contains(err.Error(), "unspecified by server") {
-		t.Fatalf("unexpected legacy rejection error: %v", err)
+	if _, err = readHello(server); err == nil {
+		t.Fatal("accepted a v3 multipath hello")
+	}
+	if err = <-writeDone; err != nil {
+		t.Fatal(err)
 	}
 }

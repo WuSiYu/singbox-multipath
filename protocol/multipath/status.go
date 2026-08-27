@@ -249,9 +249,6 @@ func classifyStatusError(err error) (category string, transient bool, harmless b
 		harmless = reason == helloRejectSessionUnavailable || reason == helloRejectLegUnavailable
 		return "hello_rejected", harmless, harmless
 	}
-	if strings.Contains(message, "multipath hello rejected") {
-		return "hello_rejected", false, false
-	}
 	if errors.Is(err, errLeg1Stalled) {
 		return "replay_timeout", true, false
 	}

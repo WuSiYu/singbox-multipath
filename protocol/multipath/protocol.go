@@ -49,14 +49,13 @@ func (e *helloRejectedError) Error() string {
 func helloRejectReasonFromError(err error) (helloRejectReason, bool) {
 	var rejection *helloRejectedError
 	if !errors.As(err, &rejection) {
-		return helloRejectUnknown, false
+		return 0, false
 	}
 	return rejection.reason, true
 }
 
 const (
-	helloRejectUnknown helloRejectReason = iota
-	helloRejectInvalidLegID
+	helloRejectInvalidLegID helloRejectReason = iota + 1
 	helloRejectInvalidDestination
 	helloRejectSessionMismatch
 	helloRejectDuplicateControl
@@ -64,6 +63,10 @@ const (
 	helloRejectSessionUnavailable
 	helloRejectChunkSizeLimit
 )
+
+func (r helloRejectReason) valid() bool {
+	return r >= helloRejectInvalidLegID && r <= helloRejectChunkSizeLimit
+}
 
 func (r helloRejectReason) String() string {
 	switch r {
@@ -82,7 +85,7 @@ func (r helloRejectReason) String() string {
 	case helloRejectChunkSizeLimit:
 		return "requested chunk size exceeds server limit"
 	default:
-		return "unspecified by server"
+		return "invalid rejection reason"
 	}
 }
 
@@ -158,17 +161,25 @@ func readHello(conn net.Conn) (helloMessage, error) {
 }
 
 func writeHelloResponse(conn net.Conn, response helloResponse) error {
-	if response.Status == helloStatusOK && (response.ChunkSize == 0 || response.ChunkSize > maxFramePayload) {
-		return errors.New("invalid accepted multipath chunk size")
+	var value uint32
+	switch response.Status {
+	case helloStatusOK:
+		if response.ChunkSize == 0 || response.ChunkSize > maxFramePayload {
+			return errors.New("invalid accepted multipath chunk size")
+		}
+		value = response.ChunkSize
+	case helloStatusRejected:
+		if !response.RejectReason.valid() {
+			return errors.New("invalid multipath hello rejection reason")
+		}
+		value = uint32(response.RejectReason)
+	default:
+		return errors.New("invalid multipath hello response status")
 	}
 	var header [responseHeaderSize]byte
 	copy(header[0:4], responseMagic[:])
 	header[4] = helloVersion
 	header[5] = response.Status
-	value := response.ChunkSize
-	if response.Status != helloStatusOK {
-		value = uint32(response.RejectReason)
-	}
 	binary.BigEndian.PutUint32(header[6:10], value)
 	return writeAll(conn, header[:])
 }
@@ -184,10 +195,17 @@ func readHelloResponse(conn net.Conn) (helloResponse, error) {
 	}
 	response.Status = header[5]
 	response.ChunkSize = binary.BigEndian.Uint32(header[6:10])
-	if response.Status != helloStatusOK {
+	switch response.Status {
+	case helloStatusRejected:
 		response.RejectReason = helloRejectReason(response.ChunkSize)
 		response.ChunkSize = 0
+		if !response.RejectReason.valid() {
+			return response, errors.New("invalid multipath hello rejection reason")
+		}
 		return response, &helloRejectedError{reason: response.RejectReason}
+	case helloStatusOK:
+	default:
+		return response, errors.New("invalid multipath hello response status")
 	}
 	if response.ChunkSize == 0 || response.ChunkSize > maxFramePayload {
 		return response, errors.New("invalid multipath accepted chunk size")

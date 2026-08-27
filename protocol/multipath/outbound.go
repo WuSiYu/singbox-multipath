@@ -384,8 +384,8 @@ func needsHandshakeForWrite(conn net.Conn) bool {
 	if N.NeedHandshakeForWrite(conn) {
 		return true
 	}
-	// slowOpenConn still implements the legacy interface. Trackers hide that
-	// method on the outer net.Conn but expose the connection through Upstream.
+	// slowOpenConn exposes its lazy state through NeedHandshake. Trackers hide
+	// that method on the outer net.Conn but expose it through Upstream.
 	earlyConn, loaded := common.Cast[interface{ NeedHandshake() bool }](conn)
 	return loaded && earlyConn.NeedHandshake()
 }
