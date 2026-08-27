@@ -156,7 +156,13 @@ type statusErrorEvent struct {
 	attempt     uint64
 	count       uint64
 	transient   bool
+	harmless    bool
 	at          time.Time
+}
+
+type udpTrafficCounters struct {
+	txBytes atomic.Uint64
+	rxBytes atomic.Uint64
 }
 
 type outboundStatus struct {
@@ -171,10 +177,12 @@ type outboundStatus struct {
 	closedAttempts  uint64
 	connectionsMade uint64
 	legErrors       [2]statusErrorEvent
+	udpCounters     udpTrafficCounters
 
 	sampleAccess     sync.Mutex
 	lastSample       time.Time
 	previous         coreTrafficCounters
+	previousUDP      statusTraffic
 	previousSessions map[string]coreTrafficCounters
 
 	stop      chan struct{}
@@ -226,32 +234,35 @@ func (s *outboundStatus) removeSession(session *statusSession) {
 	s.access.Unlock()
 }
 
-func classifyStatusError(err error) (string, bool) {
+func classifyStatusError(err error) (category string, transient bool, harmless bool) {
 	if err == nil {
-		return "unknown", false
+		return "unknown", false, false
 	}
 	message := strings.ToLower(err.Error())
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
-		return "peer_closed", true
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return "peer_closed", true, true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return "peer_closed", true, false
 	}
 	if strings.Contains(message, "multipath hello rejected") {
-		transient := strings.Contains(message, "session no longer exists") || strings.Contains(message, "unspecified by server") || strings.Contains(message, "leg already attached")
-		return "hello_rejected", transient
+		harmless = strings.Contains(message, "session no longer exists") || strings.Contains(message, "leg already attached")
+		return "hello_rejected", harmless, harmless
 	}
 	if errors.Is(err, errLeg1Stalled) {
-		return "replay_timeout", true
+		return "replay_timeout", true, false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(message, "timeout") {
-		return "timeout", true
+		return "timeout", true, false
 	}
-	return "transport_error", false
+	return "transport_error", false, false
 }
 
 func (s *outboundStatus) recordLegError(legID uint8, stage string, destination string, sessionID string, attempt uint64, err error, at time.Time) {
 	if s == nil || err == nil || legID > 1 {
 		return
 	}
-	category, transient := classifyStatusError(err)
+	category, transient, harmless := classifyStatusError(err)
 	s.access.Lock()
 	count := s.legErrors[legID].count + 1
 	s.legErrors[legID] = statusErrorEvent{
@@ -263,9 +274,29 @@ func (s *outboundStatus) recordLegError(legID uint8, stage string, destination s
 		attempt:     attempt,
 		count:       count,
 		transient:   transient,
+		harmless:    harmless,
 		at:          at,
 	}
 	s.access.Unlock()
+}
+
+func (s *outboundStatus) countUDPTX(bytes int64) {
+	if s != nil && bytes > 0 {
+		s.udpCounters.txBytes.Add(uint64(bytes))
+	}
+}
+
+func (s *outboundStatus) countUDPRX(bytes int64) {
+	if s != nil && bytes > 0 {
+		s.udpCounters.rxBytes.Add(uint64(bytes))
+	}
+}
+
+func (s *outboundStatus) udpSnapshot() statusTraffic {
+	return statusTraffic{
+		TXBytes: s.udpCounters.txBytes.Load(),
+		RXBytes: s.udpCounters.rxBytes.Load(),
+	}
 }
 
 type statusTraffic struct {
@@ -359,6 +390,9 @@ type statusLeg struct {
 	TXSharePercent          float64       `json:"tx_share_percent"`
 	JoinCount               uint64        `json:"join_count"`
 	AttemptCount            uint64        `json:"attempt_count"`
+	UDPSelected             bool          `json:"udp_selected"`
+	UDPCurrent              statusRate    `json:"udp_current"`
+	UDPCumulative           statusTraffic `json:"udp_cumulative"`
 	LastError               string        `json:"last_error,omitempty"`
 	LastErrorAt             string        `json:"last_error_at,omitempty"`
 	LastErrorCategory       string        `json:"last_error_category,omitempty"`
@@ -368,6 +402,7 @@ type statusLeg struct {
 	LastErrorAttempt        uint64        `json:"last_error_attempt,omitempty"`
 	ErrorCount              uint64        `json:"error_count"`
 	LastErrorTransient      bool          `json:"last_error_transient"`
+	LastErrorHarmless       bool          `json:"last_error_harmless"`
 	TopFlows                []statusFlow  `json:"top_flows"`
 }
 
@@ -462,10 +497,18 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	elapsed := now.Sub(s.lastSample)
 	firstSample := s.lastSample.IsZero()
 	logicalRate, legRates := trafficRate(totals, s.previous, elapsed)
+	udpTotals := s.udpSnapshot()
+	udpRate := statusRate{
+		TXBytesPS: counterRate(udpTotals.TXBytes, s.previousUDP.TXBytes, elapsed),
+		RXBytesPS: counterRate(udpTotals.RXBytes, s.previousUDP.RXBytes, elapsed),
+	}
 	if firstSample {
 		logicalRate = statusRate{}
 		legRates = [2]statusRate{}
+		udpRate = statusRate{}
 	}
+	logicalRate.TXBytesPS += udpRate.TXBytesPS
+	logicalRate.RXBytesPS += udpRate.RXBytesPS
 
 	nextPreviousSessions := make(map[string]coreTrafficCounters, len(snapshots))
 	for index := range snapshots {
@@ -479,6 +522,7 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	}
 	s.lastSample = now
 	s.previous = totals
+	s.previousUDP = udpTotals
 	s.previousSessions = nextPreviousSessions
 
 	parameters := statusParameters{
@@ -499,8 +543,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		ConnectionsTotal: connectionsMade,
 		Current:          logicalRate,
 		Cumulative: statusTraffic{
-			TXBytes: totals.logicalTX,
-			RXBytes: totals.logicalRX,
+			TXBytes: totals.logicalTX + udpTotals.TXBytes,
+			RXBytes: totals.logicalRX + udpTotals.RXBytes,
 		},
 	}
 	legs := []statusLeg{
@@ -527,6 +571,15 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	}
 	weightTotal := uint64(0)
 	for index := range legs {
+		if legs[index].Tag == s.config.udpOutbound {
+			legs[index].UDPSelected = true
+			legs[index].UDPCurrent = udpRate
+			legs[index].UDPCumulative = udpTotals
+			legs[index].Current.TXBytesPS += udpRate.TXBytesPS
+			legs[index].Current.RXBytesPS += udpRate.RXBytesPS
+			legs[index].Cumulative.TXBytes += udpTotals.TXBytes
+			legs[index].Cumulative.RXBytes += udpTotals.RXBytes
+		}
 		if index < len(s.config.cfg.BandwidthMbps) {
 			legs[index].ConfiguredBandwidthMbps = s.config.cfg.BandwidthMbps[index]
 		}
@@ -545,6 +598,7 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			legs[index].LastErrorAttempt = legErrors[index].attempt
 			legs[index].ErrorCount = legErrors[index].count
 			legs[index].LastErrorTransient = legErrors[index].transient
+			legs[index].LastErrorHarmless = legErrors[index].harmless
 		}
 	}
 	for index := range legs {
@@ -624,7 +678,9 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		if len(leg.TopFlows) > statusTopFlowCount {
 			leg.TopFlows = leg.TopFlows[:statusTopFlowCount]
 		}
-		if len(snapshots) == 0 {
+		if leg.Current.TXBytesPS+leg.Current.RXBytesPS > 0 {
+			leg.State = "carrying"
+		} else if len(snapshots) == 0 {
 			leg.State = "idle"
 		} else if leg.CarryingConnections > 0 {
 			leg.State = "carrying"
@@ -636,7 +692,9 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			leg.State = "connecting"
 		}
 	}
-	if len(snapshots) == 0 {
+	if len(snapshots) == 0 && udpRate.TXBytesPS+udpRate.RXBytesPS > 0 {
+		logical.State = "preferred_only"
+	} else if len(snapshots) == 0 {
 		logical.State = "idle"
 	} else if logical.BoosterDegraded > 0 {
 		logical.State = "booster_degraded"

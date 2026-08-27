@@ -11,6 +11,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -202,7 +203,11 @@ func (o *Outbound) Close() error {
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	switch N.NetworkName(network) {
 	case N.NetworkUDP:
-		return o.udpOutbound.DialContext(ctx, network, destination)
+		conn, err := o.udpOutbound.DialContext(ctx, network, destination)
+		if err != nil {
+			return conn, err
+		}
+		return o.trackUDPConnection(conn), nil
 	case N.NetworkTCP:
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
@@ -421,5 +426,27 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if o.udpOutbound == nil {
 		return nil, E.New("multipath outbound is not started")
 	}
-	return o.udpOutbound.ListenPacket(ctx, destination)
+	conn, err := o.udpOutbound.ListenPacket(ctx, destination)
+	if err != nil {
+		return conn, err
+	}
+	return o.trackUDPPacketConnection(conn), nil
+}
+
+func (o *Outbound) trackUDPConnection(conn net.Conn) net.Conn {
+	if o.status == nil {
+		return conn
+	}
+	return bufio.NewCounterConn(conn, []N.CountFunc{o.status.countUDPRX}, []N.CountFunc{o.status.countUDPTX})
+}
+
+func (o *Outbound) trackUDPPacketConnection(conn net.PacketConn) net.PacketConn {
+	if o.status == nil {
+		return conn
+	}
+	return bufio.NewNetPacketConn(bufio.NewCounterPacketConn(
+		bufio.NewPacketConn(conn),
+		[]N.CountFunc{o.status.countUDPRX},
+		[]N.CountFunc{o.status.countUDPTX},
+	))
 }

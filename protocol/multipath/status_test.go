@@ -260,6 +260,9 @@ func TestOutboundStatusErrorDetails(t *testing.T) {
 	if !leg.LastErrorTransient {
 		t.Fatal("late secondary hello rejection should be transient")
 	}
+	if !leg.LastErrorHarmless {
+		t.Fatal("late secondary hello rejection should be harmless")
+	}
 	if leg.LastErrorDestination != "1.1.1.1:443" || leg.LastErrorSessionID != "12345678" {
 		t.Fatalf("unexpected error context: %+v", leg)
 	}
@@ -274,19 +277,99 @@ func TestClassifyStatusError(t *testing.T) {
 		err       error
 		category  string
 		transient bool
+		harmless  bool
 	}{
-		{"eof", io.EOF, "peer_closed", true},
-		{"replay timeout", errLeg1Stalled, "replay_timeout", true},
-		{"dial timeout", errors.New("dial tcp: i/o timeout"), "timeout", true},
-		{"transport", errors.New("connection reset by peer"), "transport_error", false},
+		{"eof", io.EOF, "peer_closed", true, true},
+		{"unexpected eof", io.ErrUnexpectedEOF, "peer_closed", true, false},
+		{"late secondary", errors.New("multipath hello rejected: session no longer exists; control leg already closed"), "hello_rejected", true, true},
+		{"legacy rejection", errors.New("multipath hello rejected: unspecified by server"), "hello_rejected", false, false},
+		{"replay timeout", errLeg1Stalled, "replay_timeout", true, false},
+		{"dial timeout", errors.New("dial tcp: i/o timeout"), "timeout", true, false},
+		{"transport", errors.New("connection reset by peer"), "transport_error", false, false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			category, transient := classifyStatusError(test.err)
-			if category != test.category || transient != test.transient {
-				t.Fatalf("classifyStatusError(%v) = %q, %v", test.err, category, transient)
+			category, transient, harmless := classifyStatusError(test.err)
+			if category != test.category || transient != test.transient || harmless != test.harmless {
+				t.Fatalf("classifyStatusError(%v) = %q, transient=%v, harmless=%v", test.err, category, transient, harmless)
 			}
 		})
+	}
+}
+
+func TestOutboundStatusIncludesUDPInLogicalAndSelectedLeg(t *testing.T) {
+	status := newOutboundStatus(filepath.Join(t.TempDir(), "status.json"), outboundStatusConfig{
+		udpOutbound: "leg1",
+		legTags:     [2]string{"leg0", "leg1"},
+		cfg:         testCoreConfig(),
+	})
+	now := time.Now()
+	status.buildDocument(now)
+	status.countUDPTX(1500)
+	status.countUDPRX(3000)
+
+	document := status.buildDocument(now.Add(time.Second))
+	logical := document.Node.Logical
+	if logical.Current.TXBytesPS != 1500 || logical.Current.RXBytesPS != 3000 {
+		t.Fatalf("unexpected logical UDP rate: %+v", logical.Current)
+	}
+	if logical.Cumulative.TXBytes != 1500 || logical.Cumulative.RXBytes != 3000 {
+		t.Fatalf("unexpected logical UDP cumulative traffic: %+v", logical.Cumulative)
+	}
+	leg0, leg1 := document.Node.Legs[0], document.Node.Legs[1]
+	if leg0.UDPSelected || leg0.Cumulative.TXBytes+leg0.Cumulative.RXBytes != 0 {
+		t.Fatalf("UDP traffic was attributed to leg0: %+v", leg0)
+	}
+	if !leg1.UDPSelected || leg1.UDPCurrent != logical.Current || leg1.UDPCumulative != logical.Cumulative {
+		t.Fatalf("UDP traffic missing from selected leg: %+v", leg1)
+	}
+	if leg1.Current != logical.Current || leg1.Cumulative != logical.Cumulative {
+		t.Fatalf("UDP traffic missing from leg totals: %+v", leg1)
+	}
+	if logical.State != "preferred_only" || leg1.State != "carrying" {
+		t.Fatalf("UDP activity did not update states: logical=%s leg1=%s", logical.State, leg1.State)
+	}
+}
+
+func TestUDPConnectionCounters(t *testing.T) {
+	status := newOutboundStatus(filepath.Join(t.TempDir(), "status.json"), outboundStatusConfig{})
+	outbound := &Outbound{status: status}
+	rawConn, peerConn := net.Pipe()
+	defer rawConn.Close()
+	defer peerConn.Close()
+	conn := outbound.trackUDPConnection(rawConn)
+
+	upload := []byte("udp-upload")
+	uploadDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(upload)
+		uploadDone <- err
+	}()
+	receivedUpload := make([]byte, len(upload))
+	if _, err := io.ReadFull(peerConn, receivedUpload); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-uploadDone; err != nil {
+		t.Fatal(err)
+	}
+
+	download := []byte("udp-download")
+	downloadDone := make(chan error, 1)
+	go func() {
+		_, err := peerConn.Write(download)
+		downloadDone <- err
+	}()
+	receivedDownload := make([]byte, len(download))
+	if _, err := io.ReadFull(conn, receivedDownload); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-downloadDone; err != nil {
+		t.Fatal(err)
+	}
+
+	counters := status.udpSnapshot()
+	if counters.TXBytes != uint64(len(upload)) || counters.RXBytes != uint64(len(download)) {
+		t.Fatalf("unexpected UDP connection counters: %+v", counters)
 	}
 }
 
