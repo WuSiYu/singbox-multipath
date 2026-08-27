@@ -45,8 +45,18 @@ type coreConfig struct {
 	ReplayBytes          int64
 	ReplayTimeout        time.Duration
 	OnLeg1Active         func(activationInfo, bool)
-	OnLegFailure         func(uint8, error)
+	OnLegFailure         func(uint8, legFailureStage, error)
 }
+
+type legFailureStage string
+
+const (
+	legFailureWriteControl legFailureStage = "write_control"
+	legFailureWriteData    legFailureStage = "write_data"
+	legFailureHandshake    legFailureStage = "handshake_response"
+	legFailureReadData     legFailureStage = "read_data"
+	legFailureReplay       legFailureStage = "replay_timeout"
+)
 
 type activationReason string
 
@@ -785,7 +795,7 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 		select {
 		case control := <-leg.control:
 			if err := writeWireFrame(leg.conn, control); err != nil {
-				c.legFailed(leg, err)
+				c.legFailed(leg, legFailureWriteControl, err)
 				return
 			}
 			continue
@@ -798,7 +808,7 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 			return
 		case control := <-leg.control:
 			if err := writeWireFrame(leg.conn, control); err != nil {
-				c.legFailed(leg, err)
+				c.legFailed(leg, legFailureWriteControl, err)
 				return
 			}
 		case frame := <-leg.send:
@@ -811,7 +821,7 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 			err := writeWireFrame(leg.conn, frame)
 			leg.writingBytes.Add(-length)
 			if err != nil {
-				c.legFailed(leg, err)
+				c.legFailed(leg, legFailureWriteData, err)
 				return
 			}
 			c.legCounters[leg.id].txBytes.Add(uint64(length))
@@ -831,7 +841,7 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 	if leg.readPreamble != nil {
 		if err := leg.readPreamble(leg.conn); err != nil {
 			if !c.isDone() {
-				c.legFailed(leg, err)
+				c.legFailed(leg, legFailureHandshake, err)
 			}
 			return
 		}
@@ -840,7 +850,7 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 		frame, err := readWireFrame(leg.conn, c)
 		if err != nil {
 			if !c.isDone() {
-				c.legFailed(leg, err)
+				c.legFailed(leg, legFailureReadData, err)
 			}
 			return
 		}
@@ -874,7 +884,7 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 	}
 }
 
-func (c *mpCore) legFailed(leg *mpLeg, err error) {
+func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 	c.legsMu.Lock()
 	if c.legs[leg.id] != leg {
 		c.legsMu.Unlock()
@@ -885,7 +895,7 @@ func (c *mpCore) legFailed(leg *mpLeg, err error) {
 	c.legsMu.Unlock()
 	leg.close(err)
 	if c.cfg.OnLegFailure != nil {
-		c.cfg.OnLegFailure(leg.id, err)
+		c.cfg.OnLegFailure(leg.id, stage, err)
 	}
 	if leg.id == 0 {
 		c.fail(err)
@@ -1148,7 +1158,7 @@ func (c *mpCore) replayLoop() {
 			c.replayMu.Unlock()
 			if stalled {
 				if leg := c.getLeg(1); leg != nil {
-					c.legFailed(leg, errLeg1Stalled)
+					c.legFailed(leg, legFailureReplay, errLeg1Stalled)
 				}
 			}
 		}

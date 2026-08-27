@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 func waitForStatus(t *testing.T, check func() bool) {
@@ -231,5 +234,78 @@ func TestOutboundStatusDoesNotCountFailedLegAsCarrying(t *testing.T) {
 	}
 	if len(leg1.TopFlows) != 1 {
 		t.Fatal("failed leg's traffic from the latest sample should remain visible")
+	}
+}
+
+func TestOutboundStatusErrorDetails(t *testing.T) {
+	core, appConn := newCore(context.Background(), testCoreConfig())
+	defer appConn.Close()
+	status := newOutboundStatus(filepath.Join(t.TempDir(), "status.json"), outboundStatusConfig{
+		legTags: [2]string{"leg0", "leg1"},
+		cfg:     testCoreConfig(),
+	})
+	var id [16]byte
+	copy(id[:], []byte{0x12, 0x34, 0x56, 0x78})
+	session := status.addSession(id, "1.1.1.1:443", core, leg1PhaseRetrying)
+	session.leg1Attempts.Store(3)
+	err := errors.New("multipath hello rejected: session no longer exists; control leg already closed")
+	session.recordLegError(1, "secondary_handshake", err)
+	session.recordLegError(1, "secondary_handshake", err)
+
+	document := status.buildDocument(time.Now())
+	leg := document.Node.Legs[1]
+	if leg.LastErrorCategory != "hello_rejected" || leg.LastErrorStage != "secondary_handshake" {
+		t.Fatalf("unexpected error classification: %+v", leg)
+	}
+	if !leg.LastErrorTransient {
+		t.Fatal("late secondary hello rejection should be transient")
+	}
+	if leg.LastErrorDestination != "1.1.1.1:443" || leg.LastErrorSessionID != "12345678" {
+		t.Fatalf("unexpected error context: %+v", leg)
+	}
+	if leg.LastErrorAttempt != 3 || leg.ErrorCount != 2 {
+		t.Fatalf("unexpected error counters: %+v", leg)
+	}
+}
+
+func TestClassifyStatusError(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		category  string
+		transient bool
+	}{
+		{"eof", io.EOF, "peer_closed", true},
+		{"replay timeout", errLeg1Stalled, "replay_timeout", true},
+		{"dial timeout", errors.New("dial tcp: i/o timeout"), "timeout", true},
+		{"transport", errors.New("connection reset by peer"), "transport_error", false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			category, transient := classifyStatusError(test.err)
+			if category != test.category || transient != test.transient {
+				t.Fatalf("classifyStatusError(%v) = %q, %v", test.err, category, transient)
+			}
+		})
+	}
+}
+
+func TestConnectionCoreConfigAttributesPreferredFailureToLeg0(t *testing.T) {
+	status := newOutboundStatus(filepath.Join(t.TempDir(), "status.json"), outboundStatusConfig{
+		legTags: [2]string{"leg0", "leg1"},
+		cfg:     testCoreConfig(),
+	})
+	outbound := &Outbound{status: status}
+	var id [16]byte
+	id[0] = 0x42
+	cfg := outbound.connectionCoreConfig(context.Background(), M.ParseSocksaddr("1.1.1.1:443"), id)
+	cfg.OnLegFailure(0, legFailureHandshake, io.EOF)
+
+	document := status.buildDocument(time.Now())
+	if document.Node.Legs[0].ErrorCount != 1 || document.Node.Legs[0].LastErrorStage != "handshake_response" {
+		t.Fatalf("preferred failure missing from leg0: %+v", document.Node.Legs[0])
+	}
+	if document.Node.Legs[1].ErrorCount != 0 {
+		t.Fatalf("preferred failure was incorrectly attributed to leg1: %+v", document.Node.Legs[1])
 	}
 }

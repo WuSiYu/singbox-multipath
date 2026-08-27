@@ -5,9 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -102,9 +105,10 @@ type statusSession struct {
 	core         *mpCore
 	leg1Phase    atomic.Int32
 	leg1Attempts atomic.Uint64
-	errorAccess  sync.Mutex
-	lastError    string
-	lastErrorAt  time.Time
+}
+
+func statusSessionID(id [16]byte) string {
+	return hex.EncodeToString(id[:4])
 }
 
 func (s *statusSession) setLeg1Phase(phase int32) {
@@ -121,22 +125,15 @@ func (s *statusSession) beginLeg1Attempt() {
 	s.leg1Phase.Store(leg1PhaseConnecting)
 }
 
-func (s *statusSession) setLeg1Error(err error) {
+func (s *statusSession) recordLegError(legID uint8, stage string, err error) {
 	if s == nil || err == nil {
 		return
 	}
-	now := time.Now()
-	s.errorAccess.Lock()
-	s.lastError = err.Error()
-	s.lastErrorAt = now
-	s.errorAccess.Unlock()
-	s.parent.recordLegError(1, err, now)
-}
-
-func (s *statusSession) errorSnapshot() (string, time.Time) {
-	s.errorAccess.Lock()
-	defer s.errorAccess.Unlock()
-	return s.lastError, s.lastErrorAt
+	attempt := uint64(0)
+	if legID == 1 {
+		attempt = s.leg1Attempts.Load()
+	}
+	s.parent.recordLegError(legID, stage, s.destination, s.id[:8], attempt, err, time.Now())
 }
 
 type outboundStatusConfig struct {
@@ -151,8 +148,15 @@ type outboundStatusConfig struct {
 }
 
 type statusErrorEvent struct {
-	message string
-	at      time.Time
+	message     string
+	category    string
+	stage       string
+	destination string
+	sessionID   string
+	attempt     uint64
+	count       uint64
+	transient   bool
+	at          time.Time
 }
 
 type outboundStatus struct {
@@ -222,12 +226,45 @@ func (s *outboundStatus) removeSession(session *statusSession) {
 	s.access.Unlock()
 }
 
-func (s *outboundStatus) recordLegError(legID uint8, err error, at time.Time) {
+func classifyStatusError(err error) (string, bool) {
+	if err == nil {
+		return "unknown", false
+	}
+	message := strings.ToLower(err.Error())
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return "peer_closed", true
+	}
+	if strings.Contains(message, "multipath hello rejected") {
+		transient := strings.Contains(message, "session no longer exists") || strings.Contains(message, "unspecified by server") || strings.Contains(message, "leg already attached")
+		return "hello_rejected", transient
+	}
+	if errors.Is(err, errLeg1Stalled) {
+		return "replay_timeout", true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(message, "timeout") {
+		return "timeout", true
+	}
+	return "transport_error", false
+}
+
+func (s *outboundStatus) recordLegError(legID uint8, stage string, destination string, sessionID string, attempt uint64, err error, at time.Time) {
 	if s == nil || err == nil || legID > 1 {
 		return
 	}
+	category, transient := classifyStatusError(err)
 	s.access.Lock()
-	s.legErrors[legID] = statusErrorEvent{message: err.Error(), at: at}
+	count := s.legErrors[legID].count + 1
+	s.legErrors[legID] = statusErrorEvent{
+		message:     err.Error(),
+		category:    category,
+		stage:       stage,
+		destination: destination,
+		sessionID:   sessionID,
+		attempt:     attempt,
+		count:       count,
+		transient:   transient,
+		at:          at,
+	}
 	s.access.Unlock()
 }
 
@@ -324,6 +361,13 @@ type statusLeg struct {
 	AttemptCount            uint64        `json:"attempt_count"`
 	LastError               string        `json:"last_error,omitempty"`
 	LastErrorAt             string        `json:"last_error_at,omitempty"`
+	LastErrorCategory       string        `json:"last_error_category,omitempty"`
+	LastErrorStage          string        `json:"last_error_stage,omitempty"`
+	LastErrorDestination    string        `json:"last_error_destination,omitempty"`
+	LastErrorSessionID      string        `json:"last_error_session_id,omitempty"`
+	LastErrorAttempt        uint64        `json:"last_error_attempt,omitempty"`
+	ErrorCount              uint64        `json:"error_count"`
+	LastErrorTransient      bool          `json:"last_error_transient"`
 	TopFlows                []statusFlow  `json:"top_flows"`
 }
 
@@ -494,6 +538,13 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		if !legErrors[index].at.IsZero() {
 			legs[index].LastError = legErrors[index].message
 			legs[index].LastErrorAt = legErrors[index].at.Format(time.RFC3339Nano)
+			legs[index].LastErrorCategory = legErrors[index].category
+			legs[index].LastErrorStage = legErrors[index].stage
+			legs[index].LastErrorDestination = legErrors[index].destination
+			legs[index].LastErrorSessionID = legErrors[index].sessionID
+			legs[index].LastErrorAttempt = legErrors[index].attempt
+			legs[index].ErrorCount = legErrors[index].count
+			legs[index].LastErrorTransient = legErrors[index].transient
 		}
 	}
 	for index := range legs {

@@ -143,7 +143,7 @@ func TestCoreLeg1ActiveNotification(t *testing.T) {
 	default:
 	}
 
-	core.legFailed(firstLeg, net.ErrClosed)
+	core.legFailed(firstLeg, legFailureReadData, net.ErrClosed)
 	secondCoreConn, secondPeerConn := net.Pipe()
 	defer secondPeerConn.Close()
 	if _, err = core.addLeg(1, secondCoreConn, nil); err != nil {

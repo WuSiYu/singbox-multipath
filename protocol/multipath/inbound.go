@@ -168,12 +168,12 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		return
 	}
 	if hello.LegID > 1 {
-		i.rejectHello(conn, onClose, E.New("invalid multipath leg id: ", hello.LegID))
+		i.rejectHello(conn, onClose, helloRejectInvalidLegID, E.New("invalid multipath leg id: ", hello.LegID))
 		return
 	}
 	destination := M.ParseSocksaddr(hello.Destination)
 	if !destination.IsValid() || destination.Port == 0 {
-		i.rejectHello(conn, onClose, E.New("invalid multipath destination: ", hello.Destination))
+		i.rejectHello(conn, onClose, helloRejectInvalidDestination, E.New("invalid multipath destination: ", hello.Destination))
 		return
 	}
 
@@ -182,18 +182,18 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	if session != nil {
 		if session.destination.String() != destination.String() || session.chunkSize != hello.ChunkSize {
 			i.access.Unlock()
-			i.rejectHello(conn, onClose, E.New("multipath session parameters mismatch"))
+			i.rejectHello(conn, onClose, helloRejectSessionMismatch, E.New("multipath session parameters mismatch"))
 			return
 		}
 		if hello.LegID != 1 {
 			i.access.Unlock()
-			i.rejectHello(conn, onClose, E.New("multipath session already has a control leg"))
+			i.rejectHello(conn, onClose, helloRejectDuplicateControl, E.New("multipath session already has a control leg"))
 			return
 		}
 		err = session.core.reserveLeg(hello.LegID)
 		i.access.Unlock()
 		if err != nil {
-			i.rejectHello(conn, onClose, err)
+			i.rejectHello(conn, onClose, helloRejectLegUnavailable, err)
 			return
 		}
 		if err = writeHelloResponse(conn, helloResponse{Status: helloStatusOK, ChunkSize: session.chunkSize}); err != nil {
@@ -211,12 +211,12 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 	if hello.LegID != 0 {
 		i.access.Unlock()
-		i.rejectHello(conn, onClose, E.New("multipath control leg must create the session"))
+		i.rejectHello(conn, onClose, helloRejectSessionNotFound, E.New("multipath control leg must create the session"))
 		return
 	}
 	if int(hello.ChunkSize) > i.cfg.ChunkSize {
 		i.access.Unlock()
-		i.rejectHello(conn, onClose, E.New("multipath requested chunk size exceeds server limit: ", hello.ChunkSize, " > ", i.cfg.ChunkSize))
+		i.rejectHello(conn, onClose, helloRejectChunkSizeLimit, E.New("multipath requested chunk size exceeds server limit: ", hello.ChunkSize, " > ", i.cfg.ChunkSize))
 		return
 	}
 
@@ -242,7 +242,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	if err = core.reserveLeg(hello.LegID); err != nil {
 		i.access.Unlock()
 		appConn.Close()
-		i.rejectHello(conn, onClose, err)
+		i.rejectHello(conn, onClose, helloRejectLegUnavailable, err)
 		return
 	}
 	i.sessions[hello.Session] = session
@@ -277,8 +277,8 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	i.router.RouteConnectionEx(ctx, appConn, metadata, logicalOnClose)
 }
 
-func (i *Inbound) rejectHello(conn net.Conn, onClose N.CloseHandlerFunc, err error) {
-	_ = writeHelloResponse(conn, helloResponse{Status: helloStatusRejected})
+func (i *Inbound) rejectHello(conn net.Conn, onClose N.CloseHandlerFunc, reason helloRejectReason, err error) {
+	_ = writeHelloResponse(conn, helloResponse{Status: helloStatusRejected, RejectReason: reason})
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 }
 

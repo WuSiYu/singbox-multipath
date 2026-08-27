@@ -3,6 +3,7 @@ package multipath
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -69,9 +70,25 @@ func TestHelloRejectsBoosterStatus(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 	go func() {
+		_ = writeHelloResponse(server, helloResponse{Status: helloStatusRejected, RejectReason: helloRejectSessionNotFound})
+	}()
+	if _, err := readHelloResponse(client); err == nil {
+		t.Fatal("expected rejected hello response")
+	} else if !strings.Contains(err.Error(), "session no longer exists") {
+		t.Fatalf("rejection reason missing from error: %v", err)
+	}
+}
+
+func TestHelloRejectWithoutReasonRemainsCompatible(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	go func() {
 		_ = writeHelloResponse(server, helloResponse{Status: helloStatusRejected})
 	}()
 	if _, err := readHelloResponse(client); err == nil {
 		t.Fatal("expected rejected hello response")
+	} else if !strings.Contains(err.Error(), "unspecified by server") {
+		t.Fatalf("unexpected legacy rejection error: %v", err)
 	}
 }

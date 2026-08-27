@@ -31,8 +31,43 @@ type helloMessage struct {
 }
 
 type helloResponse struct {
-	Status    byte
-	ChunkSize uint32
+	Status       byte
+	ChunkSize    uint32
+	RejectReason helloRejectReason
+}
+
+type helloRejectReason uint32
+
+const (
+	helloRejectUnknown helloRejectReason = iota
+	helloRejectInvalidLegID
+	helloRejectInvalidDestination
+	helloRejectSessionMismatch
+	helloRejectDuplicateControl
+	helloRejectLegUnavailable
+	helloRejectSessionNotFound
+	helloRejectChunkSizeLimit
+)
+
+func (r helloRejectReason) String() string {
+	switch r {
+	case helloRejectInvalidLegID:
+		return "invalid leg id"
+	case helloRejectInvalidDestination:
+		return "invalid destination"
+	case helloRejectSessionMismatch:
+		return "session parameters mismatch"
+	case helloRejectDuplicateControl:
+		return "session already has a control leg"
+	case helloRejectLegUnavailable:
+		return "leg already attached or joining"
+	case helloRejectSessionNotFound:
+		return "session no longer exists; control leg already closed"
+	case helloRejectChunkSizeLimit:
+		return "requested chunk size exceeds server limit"
+	default:
+		return "unspecified by server"
+	}
 }
 
 func newSessionID() ([16]byte, error) {
@@ -114,7 +149,11 @@ func writeHelloResponse(conn net.Conn, response helloResponse) error {
 	copy(header[0:4], responseMagic[:])
 	header[4] = helloVersion
 	header[5] = response.Status
-	binary.BigEndian.PutUint32(header[6:10], response.ChunkSize)
+	value := response.ChunkSize
+	if response.Status != helloStatusOK {
+		value = uint32(response.RejectReason)
+	}
+	binary.BigEndian.PutUint32(header[6:10], value)
 	return writeAll(conn, header[:])
 }
 
@@ -130,7 +169,9 @@ func readHelloResponse(conn net.Conn) (helloResponse, error) {
 	response.Status = header[5]
 	response.ChunkSize = binary.BigEndian.Uint32(header[6:10])
 	if response.Status != helloStatusOK {
-		return response, errors.New("multipath hello rejected")
+		response.RejectReason = helloRejectReason(response.ChunkSize)
+		response.ChunkSize = 0
+		return response, errors.New("multipath hello rejected: " + response.RejectReason.String())
 	}
 	if response.ChunkSize == 0 || response.ChunkSize > maxFramePayload {
 		return response, errors.New("invalid multipath accepted chunk size")
