@@ -37,6 +37,12 @@ func (c *fastOpenSpyConn) Write(payload []byte) (int, error) {
 	return len(payload), nil
 }
 
+func (c *fastOpenSpyConn) NeedHandshake() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
+	return !c.wrote
+}
+
 func (c *fastOpenSpyConn) Close() error {
 	c.access.Lock()
 	c.closed = true

@@ -68,7 +68,7 @@ func (c *clientFastOpenConn) start(payload []byte) (bool, error) {
 func (c *clientFastOpenConn) writeInitial(payload []byte) error {
 	deadlineSet := true
 	if err := c.Conn.SetDeadline(c.handshakeDeadline); err != nil {
-		if !errors.Is(err, os.ErrInvalid) {
+		if !errors.Is(err, os.ErrInvalid) || !N.NeedHandshakeForWrite(c.Conn) {
 			return err
 		}
 		deadlineSet = false

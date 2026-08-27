@@ -2,11 +2,46 @@ package multipath
 
 import (
 	"context"
+	"errors"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+type pendingHandshakeConn struct {
+	net.Conn
+	pending               bool
+	deadlineSetAfterWrite bool
+}
+
+func (c *pendingHandshakeConn) NeedHandshake() bool {
+	return c.pending
+}
+
+func (c *pendingHandshakeConn) Write(payload []byte) (int, error) {
+	c.pending = false
+	return c.Conn.Write(payload)
+}
+
+func (c *pendingHandshakeConn) SetDeadline(deadline time.Time) error {
+	if c.pending {
+		return os.ErrInvalid
+	}
+	if !deadline.IsZero() {
+		c.deadlineSetAfterWrite = true
+	}
+	return c.Conn.SetDeadline(deadline)
+}
+
+type invalidDeadlineConn struct {
+	net.Conn
+}
+
+func (c *invalidDeadlineConn) SetDeadline(time.Time) error {
+	return os.ErrInvalid
+}
 
 func TestHelloResponseCarriesChunkSize(t *testing.T) {
 	client, server := net.Pipe()
@@ -62,6 +97,93 @@ func TestClientHandshakeRejectsChunkSizeChange(t *testing.T) {
 	}
 	if err := <-serverResult; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestClientHandshakeWaitsForResponse(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	message := helloMessage{LegID: 0, ChunkSize: 64 * 1024, Destination: "example.com:443"}
+	helloRead := make(chan struct{})
+	responseGate := make(chan struct{})
+	serverResult := make(chan error, 1)
+	go func() {
+		received, err := readHello(server)
+		if err == nil && received != message {
+			err = errors.New("hello mismatch")
+		}
+		close(helloRead)
+		if err == nil {
+			<-responseGate
+			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, ChunkSize: message.ChunkSize})
+		}
+		serverResult <- err
+	}()
+	outbound := &Outbound{handshakeTimeout: time.Second}
+	clientResult := make(chan error, 1)
+	go func() {
+		clientResult <- outbound.clientHandshake(context.Background(), client, message)
+	}()
+	<-helloRead
+	select {
+	case err := <-clientResult:
+		t.Fatalf("client handshake returned before response: %v", err)
+	default:
+	}
+	close(responseGate)
+	if err := <-clientResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientHandshakeSupportsPendingChild(t *testing.T) {
+	clientWire, server := net.Pipe()
+	client := &pendingHandshakeConn{Conn: clientWire, pending: true}
+	defer client.Close()
+	defer server.Close()
+	message := helloMessage{LegID: 0, ChunkSize: 64 * 1024, Destination: "example.com:443"}
+	serverResult := make(chan error, 1)
+	go func() {
+		received, err := readHello(server)
+		if err == nil && received != message {
+			err = errors.New("hello mismatch")
+		}
+		if err == nil {
+			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, ChunkSize: message.ChunkSize})
+		}
+		serverResult <- err
+	}()
+	outbound := &Outbound{handshakeTimeout: time.Second}
+	if err := outbound.clientHandshake(context.Background(), client, message); err != nil {
+		t.Fatal(err)
+	}
+	if client.pending {
+		t.Fatal("child handshake was not completed by the multipath hello")
+	}
+	if !client.deadlineSetAfterWrite {
+		t.Fatal("handshake deadline was not applied after the child first write")
+	}
+	if err := <-serverResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientHandshakeDoesNotIgnoreInvalidDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	outbound := &Outbound{handshakeTimeout: time.Second}
+	err := outbound.clientHandshake(context.Background(), &invalidDeadlineConn{Conn: client}, helloMessage{
+		LegID:       0,
+		ChunkSize:   64 * 1024,
+		Destination: "example.com:443",
+	})
+	if !errors.Is(err, os.ErrInvalid) {
+		t.Fatalf("expected invalid deadline error, got %v", err)
 	}
 }
 
