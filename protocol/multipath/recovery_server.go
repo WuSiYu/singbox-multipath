@@ -39,7 +39,7 @@ func (i *Inbound) recoveryGroup(id [16]byte) *recoveryServerGroup {
 }
 
 func (i *Inbound) serveRecoveryControl(conn net.Conn, h helloMessage, onClose N.CloseHandlerFunc) {
-	if !h.Recovery || h.Group == [16]byte{} || h.Group != h.Session || h.Create || h.ChunkSize != 1 {
+	if !h.Recovery || h.Group == [16]byte{} || h.Group != h.Session || h.Create || h.FrameSize != 1 {
 		i.rejectHello(conn, onClose, helloRejectSessionMismatch, errors.New("invalid multipath recovery control hello"))
 		return
 	}
@@ -78,7 +78,7 @@ func (i *Inbound) serveRecoveryControl(conn net.Conn, h helloMessage, onClose N.
 			onClose(nil)
 		}
 	}()
-	if err := writeHelloResponse(conn, helloResponse{Status: helloStatusOK, ChunkSize: 1}); err != nil {
+	if err := writeHelloResponse(conn, helloResponse{Status: helloStatusOK, FrameSize: 1, PolicyDigest: h.Policy.digest()}); err != nil {
 		return
 	}
 	for {

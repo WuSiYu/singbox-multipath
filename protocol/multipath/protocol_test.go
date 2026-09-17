@@ -52,7 +52,7 @@ func TestHelloResponseCarriesChunkSize(t *testing.T) {
 	message := helloMessage{
 		LegID:         0,
 		RequestStatus: true,
-		ChunkSize:     64 * 1024,
+		FrameSize:     64 * 1024,
 		Destination:   "example.com:443",
 	}
 	serverResult := make(chan error, 1)
@@ -62,7 +62,7 @@ func TestHelloResponseCarriesChunkSize(t *testing.T) {
 			t.Errorf("hello mismatch: %#v != %#v", received, message)
 		}
 		if err == nil {
-			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, ChunkSize: 32 * 1024})
+			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, FrameSize: 32 * 1024})
 		}
 		serverResult <- err
 	}()
@@ -73,8 +73,8 @@ func TestHelloResponseCarriesChunkSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.ChunkSize != 32*1024 {
-		t.Fatalf("unexpected negotiated chunk size: %d", response.ChunkSize)
+	if response.FrameSize != 32*1024 {
+		t.Fatalf("unexpected negotiated chunk size: %d", response.FrameSize)
 	}
 	if err = <-serverResult; err != nil {
 		t.Fatal(err)
@@ -85,12 +85,12 @@ func TestClientHandshakeRejectsChunkSizeChange(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
-	message := helloMessage{LegID: 1, ChunkSize: 64 * 1024, Destination: "example.com:443"}
+	message := helloMessage{LegID: 1, FrameSize: 64 * 1024, Destination: "example.com:443"}
 	serverResult := make(chan error, 1)
 	go func() {
 		_, err := readHello(server)
 		if err == nil {
-			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, ChunkSize: 32 * 1024})
+			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, FrameSize: 32 * 1024})
 		}
 		serverResult <- err
 	}()
@@ -107,7 +107,7 @@ func TestClientHandshakeWaitsForResponse(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
-	message := helloMessage{LegID: 0, ChunkSize: 64 * 1024, Destination: "example.com:443"}
+	message := helloMessage{LegID: 0, FrameSize: 64 * 1024, Destination: "example.com:443"}
 	helloRead := make(chan struct{})
 	responseGate := make(chan struct{})
 	serverResult := make(chan error, 1)
@@ -119,7 +119,7 @@ func TestClientHandshakeWaitsForResponse(t *testing.T) {
 		close(helloRead)
 		if err == nil {
 			<-responseGate
-			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, ChunkSize: message.ChunkSize})
+			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, FrameSize: message.FrameSize, PolicyDigest: message.Policy.digest()})
 		}
 		serverResult <- err
 	}()
@@ -148,7 +148,7 @@ func TestClientHandshakeSupportsPendingChild(t *testing.T) {
 	client := &pendingHandshakeConn{Conn: clientWire, pending: true}
 	defer client.Close()
 	defer server.Close()
-	message := helloMessage{LegID: 0, ChunkSize: 64 * 1024, Destination: "example.com:443"}
+	message := helloMessage{LegID: 0, FrameSize: 64 * 1024, Destination: "example.com:443"}
 	serverResult := make(chan error, 1)
 	go func() {
 		received, err := readHello(server)
@@ -156,7 +156,7 @@ func TestClientHandshakeSupportsPendingChild(t *testing.T) {
 			err = errors.New("hello mismatch")
 		}
 		if err == nil {
-			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, ChunkSize: message.ChunkSize})
+			err = writeHelloResponse(server, helloResponse{Status: helloStatusOK, FrameSize: message.FrameSize, PolicyDigest: message.Policy.digest()})
 		}
 		serverResult <- err
 	}()
@@ -182,7 +182,7 @@ func TestClientHandshakeDoesNotIgnoreInvalidDeadline(t *testing.T) {
 	outbound := &Outbound{handshakeTimeout: time.Second}
 	err := outbound.clientHandshake(context.Background(), &invalidDeadlineConn{Conn: client}, helloMessage{
 		LegID:       0,
-		ChunkSize:   64 * 1024,
+		FrameSize:   64 * 1024,
 		Destination: "example.com:443",
 	})
 	if !errors.Is(err, os.ErrInvalid) {
@@ -206,35 +206,35 @@ func TestHelloRejectsBoosterStatus(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionTenHello(t *testing.T) {
+func TestProtocolVersionElevenHello(t *testing.T) {
 	encoded, err := encodeHello(helloMessage{
 		LegID:       0,
-		ChunkSize:   64 * 1024,
+		FrameSize:   64 * 1024,
 		Destination: "example.com:443",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded[:4]) != "SMPA" || encoded[4] != 10 {
+	if string(encoded[:4]) != "SMPA" || encoded[4] != 11 {
 		t.Fatalf("unexpected multipath protocol header: %q version=%d", encoded[:4], encoded[4])
 	}
 }
 
-func TestWriteHelloResponseRejectsInvalidV9Values(t *testing.T) {
+func TestWriteHelloResponseRejectsInvalidV11Values(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
 	for _, response := range []helloResponse{
 		{Status: helloStatusRejected},
-		{Status: 2, ChunkSize: 64 * 1024},
+		{Status: 2, FrameSize: 64 * 1024},
 	} {
 		if err := writeHelloResponse(client, response); err == nil {
-			t.Fatalf("accepted invalid v9 hello response: %+v", response)
+			t.Fatalf("accepted invalid v11 hello response: %+v", response)
 		}
 	}
 }
 
-func TestReadHelloResponseRejectsInvalidV9Values(t *testing.T) {
+func TestReadHelloResponseRejectsInvalidV11Values(t *testing.T) {
 	tests := []struct {
 		name    string
 		version byte
@@ -246,6 +246,8 @@ func TestReadHelloResponseRejectsInvalidV9Values(t *testing.T) {
 		{"v6 response", 6, helloStatusOK, 64 * 1024},
 		{"v7 response", 7, helloStatusOK, 64 * 1024},
 		{"v8 response", 8, helloStatusOK, 64 * 1024},
+		{"v9 response", 9, helloStatusOK, 64 * 1024},
+		{"v10 response", 10, helloStatusOK, 64 * 1024},
 		{"unknown status", helloVersion, 2, 64 * 1024},
 		{"missing rejection reason", helloVersion, helloStatusRejected, 0},
 		{"unknown rejection reason", helloVersion, helloStatusRejected, 255},
@@ -265,9 +267,10 @@ func TestReadHelloResponseRejectsInvalidV9Values(t *testing.T) {
 				writeDone <- writeAll(server, header[:])
 			}()
 			if _, err := readHelloResponse(client); err == nil {
-				t.Fatal("accepted invalid v9 hello response")
+				t.Fatal("accepted invalid v11 hello response")
 			}
-			if err := <-writeDone; err != nil {
+			client.Close()
+			if err := <-writeDone; err != nil && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
 				t.Fatal(err)
 			}
 		})
@@ -275,12 +278,12 @@ func TestReadHelloResponseRejectsInvalidV9Values(t *testing.T) {
 }
 
 func TestReadHelloRejectsOldProtocolVersions(t *testing.T) {
-	for _, version := range []byte{4, 5, 6, 7, 8} {
-		header, err := encodeHelloHeader(helloMessage{LegID: 0, ChunkSize: 64 * 1024, Destination: "example.com:443"})
+	for _, version := range []byte{4, 5, 6, 7, 8, 9, 10} {
+		header, err := encodeHelloHeader(helloMessage{LegID: 0, FrameSize: 64 * 1024, Destination: "example.com:443"})
 		if err != nil {
 			t.Fatal(err)
 		}
-		header[3], header[4] = '0'+version, version
+		header[4] = version
 		client, server := net.Pipe()
 		writeDone := make(chan error, 1)
 		go func() { writeDone <- writeAll(client, header[:]) }()
@@ -288,7 +291,8 @@ func TestReadHelloRejectsOldProtocolVersions(t *testing.T) {
 		if err == nil {
 			t.Fatalf("accepted protocol version %d", version)
 		}
-		if err = <-writeDone; err != nil {
+		server.Close()
+		if err = <-writeDone; err != nil && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
 			t.Fatal(err)
 		}
 		client.Close()
@@ -299,7 +303,7 @@ func TestReadHelloRejectsOldProtocolVersions(t *testing.T) {
 func TestReadHelloRejectsUnknownFlags(t *testing.T) {
 	header, err := encodeHelloHeader(helloMessage{
 		LegID:       0,
-		ChunkSize:   64 * 1024,
+		FrameSize:   64 * 1024,
 		Destination: "example.com:443",
 	})
 	if err != nil {
@@ -327,6 +331,7 @@ func TestSenderStatusRoundTrip(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 	expected := senderStatus{
+		DataMode: 3, SendBufferLimit: 64 << 20, ReceiveWindowLimit: 128 << 20,
 		Sequence:                 42,
 		Flags:                    senderStatusFlagActive | senderStatusFlagLeg0Present | senderStatusFlagMemoryPressure,
 		LogicalTX:                1000,
@@ -336,7 +341,7 @@ func TestSenderStatusRoundTrip(t *testing.T) {
 		LegWriting:               [2]uint64{10, 20},
 		LegWriteBlockedNanos:     [2]uint64{30, 40},
 		LegPeakBacklog:           [2]uint64{300, 400},
-		ReplayBytes:              500,
+		SendBufferBytes:          500,
 		ReplayPeakBytes:          600,
 		FallbackBytes:            700,
 		FallbackFrames:           8,

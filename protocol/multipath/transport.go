@@ -111,7 +111,7 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 
 func (c *mpCore) legReadLoop(leg *mpLeg) {
 	defer close(leg.readerDone)
-	scratch := c.memory.takeReservedBuffer(c.cfg.ChunkSize)
+	scratch := c.memory.takeReservedBuffer(c.cfg.FrameSize)
 	defer c.memory.putReservedBuffer(scratch)
 	if leg.readPreamble != nil {
 		if err := leg.readPreamble(leg.conn); err != nil {

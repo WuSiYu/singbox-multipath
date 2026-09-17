@@ -14,7 +14,7 @@ var (
 )
 
 const (
-	helloVersion      byte = 10
+	helloVersion      byte = 11
 	helloFlagStatus   byte = 1 << 0
 	helloFlagRecovery byte = 1 << 1
 	helloFlagControl  byte = 1 << 2
@@ -23,15 +23,16 @@ const (
 	helloStatusOK       byte = 0
 	helloStatusRejected byte = 1
 
-	helloHeaderSize    = 55
-	responseHeaderSize = 10
+	helloHeaderSize    = 55 + sessionPolicySize
+	responseHeaderSize = 42
 )
 
 type helloMessage struct {
 	Session       [16]byte
 	LegID         uint8
 	RequestStatus bool
-	ChunkSize     uint32
+	FrameSize     uint32
+	Policy        sessionPolicy
 	Destination   string
 	Group         [16]byte
 	Recovery      bool
@@ -44,7 +45,8 @@ type helloMessage struct {
 
 type helloResponse struct {
 	Status       byte
-	ChunkSize    uint32
+	PolicyDigest [32]byte
+	FrameSize    uint32
 	RejectReason helloRejectReason
 }
 
@@ -73,11 +75,11 @@ const (
 	helloRejectDuplicateControl
 	helloRejectLegUnavailable
 	helloRejectSessionUnavailable
-	helloRejectChunkSizeLimit
+	helloRejectPolicy
 )
 
 func (r helloRejectReason) valid() bool {
-	return r >= helloRejectInvalidLegID && r <= helloRejectChunkSizeLimit
+	return r >= helloRejectInvalidLegID && r <= helloRejectPolicy
 }
 
 func (r helloRejectReason) String() string {
@@ -94,8 +96,8 @@ func (r helloRejectReason) String() string {
 		return "leg already attached or joining"
 	case helloRejectSessionUnavailable:
 		return "control session is not established yet or is already closed"
-	case helloRejectChunkSizeLimit:
-		return "requested chunk size exceeds server limit"
+	case helloRejectPolicy:
+		return "invalid multipath session policy"
 	default:
 		return "invalid rejection reason"
 	}
@@ -112,9 +114,18 @@ func encodeHelloHeader(message helloMessage) ([helloHeaderSize]byte, error) {
 	if len(message.Destination) == 0 || len(message.Destination) > 65535 {
 		return header, errors.New("invalid multipath destination")
 	}
-	if message.ChunkSize == 0 || message.ChunkSize > maxFramePayload {
-		return header, errors.New("invalid multipath chunk size")
+	if message.FrameSize == 0 || message.FrameSize > maxFramePayload {
+		return header, errors.New("invalid multipath frame size")
 	}
+	if message.Control {
+		if message.Policy != (sessionPolicy{}) || message.FrameSize != 1 {
+			return header, errors.New("invalid control policy")
+		}
+	} else if err := message.Policy.validate(int(message.FrameSize)); err != nil {
+		return header, err
+	}
+	policy := message.Policy.encode()
+	copy(header[55:], policy[:])
 	copy(header[0:4], helloMagic[:])
 	header[4] = helloVersion
 	header[5] = message.LegID
@@ -134,7 +145,7 @@ func encodeHelloHeader(message helloMessage) ([helloHeaderSize]byte, error) {
 	binary.BigEndian.PutUint64(header[45:53], message.RecoveryEpoch)
 	header[53], header[54] = message.RecoveryMask, message.RecoveryUDP
 	copy(header[7:23], message.Session[:])
-	binary.BigEndian.PutUint32(header[23:27], message.ChunkSize)
+	binary.BigEndian.PutUint32(header[23:27], message.FrameSize)
 	binary.BigEndian.PutUint16(header[27:29], uint16(len(message.Destination)))
 	return header, nil
 }
@@ -163,11 +174,19 @@ func writeHello(conn net.Conn, message helloMessage) error {
 func readHello(conn net.Conn) (helloMessage, error) {
 	var message helloMessage
 	var header [helloHeaderSize]byte
-	if _, err := io.ReadFull(conn, header[:]); err != nil {
+	if _, err := io.ReadFull(conn, header[:7]); err != nil {
 		return message, err
 	}
 	if string(header[0:4]) != string(helloMagic[:]) || header[4] != helloVersion {
-		return message, errors.New("invalid multipath hello")
+		return message, errors.New("invalid multipath hello (requires protocol v11)")
+	}
+	if _, err := io.ReadFull(conn, header[7:]); err != nil {
+		return message, err
+	}
+	var policyErr error
+	message.Policy, policyErr = decodeSessionPolicy(header[55:])
+	if policyErr != nil {
+		return message, policyErr
 	}
 	if header[6]&^(helloFlagStatus|helloFlagRecovery|helloFlagControl|helloFlagCreate) != 0 {
 		return message, errors.New("invalid multipath hello flags")
@@ -187,9 +206,16 @@ func readHello(conn net.Conn) (helloMessage, error) {
 		return message, errors.New("invalid multipath recovery flags")
 	}
 	copy(message.Session[:], header[7:23])
-	message.ChunkSize = binary.BigEndian.Uint32(header[23:27])
-	if message.ChunkSize == 0 || message.ChunkSize > maxFramePayload {
-		return message, errors.New("invalid multipath hello chunk size")
+	message.FrameSize = binary.BigEndian.Uint32(header[23:27])
+	if message.FrameSize == 0 || message.FrameSize > maxFramePayload {
+		return message, errors.New("invalid multipath hello frame size")
+	}
+	if message.Control {
+		if message.Policy != (sessionPolicy{}) || message.FrameSize != 1 {
+			return message, errors.New("invalid control policy")
+		}
+	} else if err := message.Policy.validate(int(message.FrameSize)); err != nil {
+		return message, err
 	}
 	length := int(binary.BigEndian.Uint16(header[27:29]))
 	if length <= 0 {
@@ -207,10 +233,10 @@ func writeHelloResponse(conn net.Conn, response helloResponse) error {
 	var value uint32
 	switch response.Status {
 	case helloStatusOK:
-		if response.ChunkSize == 0 || response.ChunkSize > maxFramePayload {
-			return errors.New("invalid accepted multipath chunk size")
+		if response.FrameSize == 0 || response.FrameSize > maxFramePayload {
+			return errors.New("invalid accepted multipath frame size")
 		}
-		value = response.ChunkSize
+		value = response.FrameSize
 	case helloStatusRejected:
 		if !response.RejectReason.valid() {
 			return errors.New("invalid multipath hello rejection reason")
@@ -224,24 +250,29 @@ func writeHelloResponse(conn net.Conn, response helloResponse) error {
 	header[4] = helloVersion
 	header[5] = response.Status
 	binary.BigEndian.PutUint32(header[6:10], value)
+	copy(header[10:], response.PolicyDigest[:])
 	return writeAll(conn, header[:])
 }
 
 func readHelloResponse(conn net.Conn) (helloResponse, error) {
 	var response helloResponse
 	var header [responseHeaderSize]byte
-	if _, err := io.ReadFull(conn, header[:]); err != nil {
+	if _, err := io.ReadFull(conn, header[:7]); err != nil {
 		return response, err
 	}
 	if string(header[0:4]) != string(responseMagic[:]) || header[4] != helloVersion {
-		return response, errors.New("invalid multipath hello response")
+		return response, errors.New("invalid multipath hello response (requires protocol v11)")
 	}
+	if _, err := io.ReadFull(conn, header[7:]); err != nil {
+		return response, err
+	}
+	copy(response.PolicyDigest[:], header[10:])
 	response.Status = header[5]
-	response.ChunkSize = binary.BigEndian.Uint32(header[6:10])
+	response.FrameSize = binary.BigEndian.Uint32(header[6:10])
 	switch response.Status {
 	case helloStatusRejected:
-		response.RejectReason = helloRejectReason(response.ChunkSize)
-		response.ChunkSize = 0
+		response.RejectReason = helloRejectReason(response.FrameSize)
+		response.FrameSize = 0
 		if !response.RejectReason.valid() {
 			return response, errors.New("invalid multipath hello rejection reason")
 		}
@@ -250,8 +281,8 @@ func readHelloResponse(conn net.Conn) (helloResponse, error) {
 	default:
 		return response, errors.New("invalid multipath hello response status")
 	}
-	if response.ChunkSize == 0 || response.ChunkSize > maxFramePayload {
-		return response, errors.New("invalid multipath accepted chunk size")
+	if response.FrameSize == 0 || response.FrameSize > maxFramePayload {
+		return response, errors.New("invalid multipath accepted frame size")
 	}
 	return response, nil
 }

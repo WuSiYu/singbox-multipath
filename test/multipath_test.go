@@ -45,6 +45,14 @@ type multipathTestLeg struct {
 }
 
 func TestMultipathTFOCombinations(t *testing.T) {
+	testMultipathTFOCombinations(t, false)
+}
+
+func TestMultipathTrafficSavingTFOCombinations(t *testing.T) {
+	testMultipathTFOCombinations(t, true)
+}
+
+func testMultipathTFOCombinations(t *testing.T, saving bool) {
 	method := shadowaead.List[0]
 	password := mkBase64(t, 16)
 	legKinds := []string{multipathTestLegDirect, multipathTestLegProxy}
@@ -75,7 +83,10 @@ func TestMultipathTFOCombinations(t *testing.T) {
 							multipathTFO,
 						)
 						t.Run(name, func(t *testing.T) {
-							startInstance(t, multipathTFOTestOptions(multipathTFO, leg0, leg1, method, password))
+							opts := multipathTFOTestOptions(multipathTFO, leg0, leg1, method, password)
+							mp := opts.Outbounds[len(opts.Outbounds)-1].Options.(*option.MultipathOutboundOptions)
+							mp.Upload.Leg0TrafficSaving, mp.Download.Leg0TrafficSaving = saving, saving
+							startInstance(t, opts)
 							testTCP(t, clientPort, testPort)
 						})
 					}
@@ -124,16 +135,15 @@ func TestMultipathDirectionalAggregation(t *testing.T) {
 					leg0 := multipathTestLeg{tag: "leg0", kind: multipathTestLegDirect, tfo: fastOpen}
 					leg1 := multipathTestLeg{tag: "leg1", kind: multipathTestLegProxy, tfo: fastOpen, proxyPort: otherClientPort}
 					options := multipathTFOTestOptions(fastOpen, leg0, leg1, shadowaead.List[0], mkBase64(t, 16))
-					inbound := options.Inbounds[1].Options.(*option.MultipathInboundOptions)
-					inbound.AggregationEnabled = common.Ptr(serverEnabled)
-					inbound.ActivationOnQueue = common.Ptr(false)
-					inbound.ActivationThresholdMbps = common.Ptr(uint32(0))
-					inbound.ActivationWindow = badoption.Duration(50 * time.Millisecond)
 					outbound := options.Outbounds[len(options.Outbounds)-1].Options.(*option.MultipathOutboundOptions)
-					outbound.AggregationEnabled = common.Ptr(clientEnabled)
-					outbound.ActivationOnQueue = common.Ptr(false)
-					outbound.ActivationThresholdMbps = common.Ptr(uint32(0))
-					outbound.ActivationWindow = badoption.Duration(50 * time.Millisecond)
+					outbound.Upload.AggregationEnabled = common.Ptr(clientEnabled)
+					outbound.Download.AggregationEnabled = common.Ptr(serverEnabled)
+					outbound.Upload.ActivationOnQueue = common.Ptr(false)
+					outbound.Upload.ActivationThresholdMbps = common.Ptr(uint32(0))
+					outbound.Upload.ActivationWindow = badoption.Duration(50 * time.Millisecond)
+					outbound.Download.ActivationOnQueue = outbound.Upload.ActivationOnQueue
+					outbound.Download.ActivationThresholdMbps = outbound.Upload.ActivationThresholdMbps
+					outbound.Download.ActivationWindow = outbound.Upload.ActivationWindow
 					outbound.StatusFile = filepath.Join(t.TempDir(), "multipath.json")
 					startInstance(t, options)
 					dialer := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
@@ -222,13 +232,13 @@ func multipathTFOTestOptions(
 	sharedMultipathOptions := struct {
 		activationAfterBytes uint64
 		activationWindow     badoption.Duration
-		chunkSize            uint32
+		frameSize            uint32
 		queueFrames          uint32
 		handshakeTimeout     badoption.Duration
 	}{
 		activationAfterBytes: 1,
 		activationWindow:     badoption.Duration(time.Second),
-		chunkSize:            16 * 1024,
+		frameSize:            16 * 1024,
 		queueFrames:          64,
 		handshakeTimeout:     badoption.Duration(5 * time.Second),
 	}
@@ -253,11 +263,7 @@ func multipathTFOTestOptions(
 					ListenPort:  serverPort,
 					TCPFastOpen: aggregationTFO,
 				},
-				ActivationAfterBytes: multipathMemoryBytes("1"),
-				ActivationWindow:     sharedMultipathOptions.activationWindow,
-				ChunkSize:            sharedMultipathOptions.chunkSize,
-				QueueFrames:          sharedMultipathOptions.queueFrames,
-				HandshakeTimeout:     sharedMultipathOptions.handshakeTimeout,
+				HandshakeTimeout: sharedMultipathOptions.handshakeTimeout,
 			},
 		},
 	}
@@ -315,17 +321,16 @@ func multipathTFOTestOptions(
 		Type: C.TypeMultipath,
 		Tag:  "mp-out",
 		Options: &option.MultipathOutboundOptions{
-			Outbounds:            []string{leg0.tag, leg1.tag},
-			Preferred:            leg0.tag,
-			UDPOutbound:          leg0.tag,
-			Server:               "127.0.0.1",
-			ServerPort:           serverPort,
-			TCPFastOpen:          multipathTFO,
-			ActivationAfterBytes: multipathMemoryBytes("1"),
-			ActivationWindow:     sharedMultipathOptions.activationWindow,
-			ChunkSize:            sharedMultipathOptions.chunkSize,
-			QueueFrames:          sharedMultipathOptions.queueFrames,
-			HandshakeTimeout:     sharedMultipathOptions.handshakeTimeout,
+			Outbounds:        []string{leg0.tag, leg1.tag},
+			Preferred:        leg0.tag,
+			UDPOutbound:      leg0.tag,
+			Server:           "127.0.0.1",
+			ServerPort:       serverPort,
+			TCPFastOpen:      multipathTFO,
+			FrameSize:        multipathMemoryBytes(fmt.Sprint(sharedMultipathOptions.frameSize)),
+			Upload:           option.MultipathDirectionOptions{ActivationAfterBytes: multipathMemoryBytes("1"), ActivationWindow: sharedMultipathOptions.activationWindow, QueueFrames: sharedMultipathOptions.queueFrames},
+			Download:         option.MultipathDirectionOptions{ActivationAfterBytes: multipathMemoryBytes("1"), ActivationWindow: sharedMultipathOptions.activationWindow, QueueFrames: sharedMultipathOptions.queueFrames},
+			HandshakeTimeout: sharedMultipathOptions.handshakeTimeout,
 		},
 	})
 

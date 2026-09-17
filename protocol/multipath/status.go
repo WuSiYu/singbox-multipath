@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	statusSchemaVersion = 3
+	statusSchemaVersion = 4
 	statusTopFlowCount  = 10
 
 	leg1PhaseWaiting int32 = iota
@@ -107,6 +107,7 @@ func (c *coreTrafficCounters) add(other coreTrafficCounters) {
 }
 
 type coreStatusSnapshot struct {
+	dataMode           uint64
 	counters           coreTrafficCounters
 	active             bool
 	activation         activationInfo
@@ -156,6 +157,9 @@ func (c *mpCore) statusSnapshot() coreStatusSnapshot {
 			logicalRX: c.egressBytes.Load(),
 		},
 	}
+	c.stateMu.Lock()
+	snapshot.dataMode = c.dataModeLocked()
+	c.stateMu.Unlock()
 	for index := range snapshot.legPresent {
 		snapshot.counters.legJoins[index] = c.legCounters[index].joins.Load()
 		leg := c.getLeg(uint8(index))
@@ -236,6 +240,7 @@ type outboundStatusConfig struct {
 	legTags          [2]string
 	legTypes         [2]string
 	cfg              coreConfig
+	policy           sessionPolicy
 }
 
 type statusErrorEvent struct {
@@ -463,21 +468,38 @@ type statusActivation struct {
 }
 
 type statusParameters struct {
-	AggregationEnabled          bool   `json:"aggregation_enabled"`
-	ActivationOnQueue           bool   `json:"activation_on_queue"`
-	ActivationThresholdMbps     uint64 `json:"activation_threshold_mbps"`
-	ActivationAfterBytes        uint64 `json:"activation_after_bytes"`
-	ActivationAfterBytesMinMbps uint64 `json:"activation_after_bytes_min_mbps"`
-	ActivationWindowMS          int64  `json:"activation_window_ms"`
-	ChunkSize                   int    `json:"chunk_size"`
-	QueueFrames                 int    `json:"queue_frames"`
-	QueueBytes                  int64  `json:"queue_bytes"`
-	MaxReorderFrames            int    `json:"max_reorder_frames"`
-	MaxReorderBytes             int64  `json:"max_reorder_bytes"`
-	Leg1ReplayBytes             int64  `json:"leg1_replay_bytes"`
-	Leg1ReplayTimeoutMS         int64  `json:"leg1_replay_timeout_ms"`
-	MemoryLimitBytes            int64  `json:"memory_limit_bytes"`
-	HandshakeTimeoutMS          int64  `json:"handshake_timeout_ms"`
+	FrameSize          int                       `json:"frame_size"`
+	MemoryLimitBytes   int64                     `json:"memory_limit_bytes"`
+	HandshakeTimeoutMS int64                     `json:"handshake_timeout_ms"`
+	Upload             statusDirectionParameters `json:"upload"`
+	Download           statusDirectionParameters `json:"download"`
+}
+type statusDirectionParameters struct {
+	AggregationEnabled          bool    `json:"aggregation_enabled"`
+	Leg0TrafficSaving           bool    `json:"leg0_traffic_saving"`
+	ActivationOnQueue           bool    `json:"activation_on_queue"`
+	ActivationThresholdMbps     uint64  `json:"activation_threshold_mbps"`
+	ActivationAfterBytes        uint64  `json:"activation_after_bytes"`
+	ActivationAfterBytesMinMbps uint64  `json:"activation_after_bytes_min_mbps"`
+	ActivationWindowMS          int64   `json:"activation_window_ms"`
+	QueueFrames                 uint32  `json:"queue_frames"`
+	QueueBytes                  uint64  `json:"queue_bytes"`
+	SendBufferBytes             uint64  `json:"send_buffer_bytes"`
+	ReceiveWindowBytes          uint64  `json:"receive_window_bytes"`
+	PathStallTimeoutMinMS       int64   `json:"path_stall_timeout_min_ms"`
+	EffectiveSendBufferBytes    *uint64 `json:"effective_send_buffer_bytes,omitempty"`
+	EffectiveReceiveWindowBytes *uint64 `json:"effective_receive_window_bytes,omitempty"`
+}
+
+func directionParameters(p directionPolicy, frame int) statusDirectionParameters {
+	p = p.normalized()
+	return statusDirectionParameters{
+		AggregationEnabled: p.AggregationEnabled, Leg0TrafficSaving: p.Leg0TrafficSaving,
+		ActivationOnQueue: p.ActivationOnQueue, ActivationThresholdMbps: p.ThresholdBytesPS * 8 / 1_000_000,
+		ActivationAfterBytes: p.ActivationAfterBytes, ActivationAfterBytesMinMbps: p.ActivationAfterBytesMinBytesPS * 8 / 1_000_000,
+		ActivationWindowMS: p.ActivationWindow.Milliseconds(), QueueFrames: p.QueueFrames, QueueBytes: uint64(p.QueueFrames) * uint64(frame),
+		SendBufferBytes: p.SendBufferBytes, ReceiveWindowBytes: p.ReceiveWindowBytes, PathStallTimeoutMinMS: p.PathStallTimeoutMin.Milliseconds(),
+	}
 }
 
 type statusMemory struct {
@@ -500,7 +522,7 @@ type statusSenderDiagnostics struct {
 	Stale                    bool   `json:"stale"`
 	UpdatedAt                string `json:"updated_at,omitempty"`
 	StaleConnections         int    `json:"stale_connections"`
-	ReplayBytes              int64  `json:"replay_bytes"`
+	SendBufferBytes          int64  `json:"replay_bytes"`
 	ReplayPeakBytes          int64  `json:"replay_peak_bytes"`
 	FallbackBytes            uint64 `json:"fallback_bytes"`
 	FallbackFrames           uint64 `json:"fallback_frames"`
@@ -517,6 +539,8 @@ type statusSenderDiagnostics struct {
 }
 
 type statusLogical struct {
+	UploadStates             map[string]int          `json:"upload_states"`
+	DownloadStates           map[string]int          `json:"download_states"`
 	State                    string                  `json:"state"`
 	Connections              int                     `json:"connections"`
 	ConnectionsTotal         uint64                  `json:"connections_total"`
@@ -527,7 +551,7 @@ type statusLogical struct {
 	Current                  statusRate              `json:"current"`
 	Peak                     statusPeakRate          `json:"peak"`
 	Cumulative               statusTraffic           `json:"cumulative"`
-	ReplayBytes              int64                   `json:"replay_bytes"`
+	SendBufferBytes          int64                   `json:"replay_bytes"`
 	ReorderBytes             int64                   `json:"reorder_bytes"`
 	ReorderFrames            int64                   `json:"reorder_pages"`
 	ReorderPeakBytes         int64                   `json:"reorder_peak_bytes"`
@@ -760,22 +784,14 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 
 	memorySnapshot := s.config.cfg.Memory.snapshot()
 	parameters := statusParameters{
-		AggregationEnabled:          s.config.cfg.AggregationEnabled,
-		ActivationOnQueue:           s.config.cfg.ActivationOnQueue,
-		ActivationThresholdMbps:     s.config.cfg.ThresholdBytesPS * 8 / 1_000_000,
-		ActivationAfterBytes:        s.config.cfg.ActivationAfterBytes,
-		ActivationAfterBytesMinMbps: s.config.cfg.ActivationAfterBytesMinBytesPS * 8 / 1_000_000,
-		ActivationWindowMS:          s.config.cfg.ActivationWindow.Milliseconds(),
-		ChunkSize:                   s.config.cfg.ChunkSize,
-		QueueFrames:                 s.config.cfg.QueueFrames,
-		QueueBytes:                  s.config.cfg.QueueBytes,
-		MaxReorderFrames:            s.config.cfg.MaxReorderFrames,
-		MaxReorderBytes:             s.config.cfg.MaxReorderBytes,
-		Leg1ReplayBytes:             s.config.cfg.ReplayBytes,
-		Leg1ReplayTimeoutMS:         s.config.cfg.ReplayTimeout.Milliseconds(),
-		MemoryLimitBytes:            memorySnapshot.LimitBytes,
-		HandshakeTimeoutMS:          s.config.handshakeTimeout.Milliseconds(),
+		FrameSize: s.config.cfg.FrameSize, MemoryLimitBytes: memorySnapshot.LimitBytes, HandshakeTimeoutMS: s.config.handshakeTimeout.Milliseconds(),
+		Upload:   directionParameters(s.config.policy.Upload, s.config.cfg.FrameSize),
+		Download: directionParameters(s.config.policy.Download, s.config.cfg.FrameSize),
 	}
+	localSend, localReceive := uint64(s.config.cfg.SendBufferBytes), uint64(s.config.cfg.ReceiveWindowBytes)
+	parameters.Upload.EffectiveSendBufferBytes = &localSend
+	parameters.Download.EffectiveReceiveWindowBytes = &localReceive
+
 	memory := statusMemory{
 		LimitBytes:         memorySnapshot.LimitBytes,
 		UsedBytes:          memorySnapshot.UsedBytes,
@@ -793,6 +809,7 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		memory.PressureSince = memorySnapshot.PressureSince.Format(time.RFC3339Nano)
 	}
 	logical := statusLogical{
+		UploadStates: make(map[string]int), DownloadStates: make(map[string]int),
 		Connections:      len(snapshots),
 		ConnectionsTotal: connectionsMade,
 		Current:          logicalRate,
@@ -889,8 +906,14 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	var latestRemoteFailure [2]time.Time
 	for _, item := range snapshots {
 		snapshot := item.snapshot
-		logical.ReplayBytes += snapshot.replayBytes
-		logical.LocalSender.ReplayBytes += snapshot.replayBytes
+		logical.UploadStates[dataModeName(snapshot.dataMode)]++
+		if snapshot.peerSender.status.Sequence > 0 && now.Sub(snapshot.peerSender.receivedAt) <= 3*time.Second {
+			logical.DownloadStates[dataModeName(snapshot.peerSender.status.DataMode)]++
+		} else {
+			logical.DownloadStates["unknown"]++
+		}
+		logical.SendBufferBytes += snapshot.replayBytes
+		logical.LocalSender.SendBufferBytes += snapshot.replayBytes
 		s.peakReplayLocal = max(s.peakReplayLocal, snapshot.replayPeak)
 		logical.ReorderBytes += snapshot.reorderBytes
 		logical.ReorderFrames += snapshot.reorderFrames
@@ -899,13 +922,16 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		remote := snapshot.peerSender
 		if remote.status.Sequence > 0 {
 			logical.RemoteSender.Available = true
-			logical.RemoteSender.ReplayBytes += int64(remote.status.ReplayBytes)
+			logical.RemoteSender.SendBufferBytes += int64(remote.status.SendBufferBytes)
 			s.peakReplayRemote = max(s.peakReplayRemote, int64(remote.status.ReplayPeakBytes))
 			if now.Sub(remote.receivedAt) > 3*time.Second {
 				logical.RemoteSender.StaleConnections++
 			}
 			if remote.receivedAt.After(latestRemote) {
 				latestRemote = remote.receivedAt
+				remoteSend, remoteReceive := remote.status.SendBufferLimit, remote.status.ReceiveWindowLimit
+				parameters.Download.EffectiveSendBufferBytes = &remoteSend
+				parameters.Upload.EffectiveReceiveWindowBytes = &remoteReceive
 				logical.RemoteSender.UpdatedAt = remote.receivedAt.Format(time.RFC3339Nano)
 				logical.RemoteSender.MemoryPressure = remote.status.Flags&senderStatusFlagMemoryPressure != 0
 				logical.RemoteSender.MemoryUsedBytes = remote.status.MemoryUsed
@@ -914,12 +940,12 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 				logical.RemoteSender.MemoryBackpressureEvents = remote.status.MemoryBackpressureEvents
 			}
 		}
-		if snapshot.active {
+		if snapshot.dataMode == 2 {
 			logical.TXAggregatingConnections++
-		} else {
+		} else if snapshot.dataMode == 1 {
 			logical.PreferredOnlyConnections++
 		}
-		if item.rates[1].RXBytesPS > 0 {
+		if remote.status.Sequence > 0 && now.Sub(remote.receivedAt) <= 3*time.Second && remote.status.DataMode == 2 {
 			logical.RXAggregatingConnections++
 		}
 		if snapshot.active && !snapshot.legPresent[1] {
@@ -1001,8 +1027,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		}
 	}
 	logical.RemoteSender.Stale = logical.RemoteSender.StaleConnections > 0
-	s.peakReplayLocal = max(s.peakReplayLocal, logical.LocalSender.ReplayBytes)
-	s.peakReplayRemote = max(s.peakReplayRemote, logical.RemoteSender.ReplayBytes)
+	s.peakReplayLocal = max(s.peakReplayLocal, logical.LocalSender.SendBufferBytes)
+	s.peakReplayRemote = max(s.peakReplayRemote, logical.RemoteSender.SendBufferBytes)
 	logical.LocalSender.ReplayPeakBytes = s.peakReplayLocal
 	logical.RemoteSender.ReplayPeakBytes = s.peakReplayRemote
 	updatePeakRate(&s.peakLogical, logical.Current, now)
@@ -1055,6 +1081,10 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		logical.State = "idle"
 	} else if logical.BoosterDegraded > 0 {
 		logical.State = "booster_degraded"
+	} else if logical.UploadStates["leg1"] > 0 || logical.DownloadStates["leg1"] > 0 {
+		logical.State = "traffic_saving"
+	} else if logical.UploadStates["leg0_fallback"] > 0 || logical.DownloadStates["leg0_fallback"] > 0 {
+		logical.State = "leg0_fallback"
 	} else if logical.TXAggregatingConnections > 0 || logical.RXAggregatingConnections > 0 {
 		logical.State = "aggregating"
 	} else {
@@ -1072,7 +1102,7 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		}
 	}
 	return statusDocument{
-		// Recovery is additive to schema 3; older readers can ignore it.
+		// Schema 4 reports client-owned directional policies and sender modes.
 		SchemaVersion:    statusSchemaVersion,
 		GeneratedAt:      now.Format(time.RFC3339Nano),
 		ProcessStartedAt: s.startedAt.Format(time.RFC3339Nano),

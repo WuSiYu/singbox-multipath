@@ -61,15 +61,14 @@ func (c *delayedWriteConn) Write(buffer []byte) (int, error) {
 
 func testCoreConfig() coreConfig {
 	return coreConfig{
-		AggregationEnabled: true,
-		ActivationOnQueue:  true,
-		ChunkSize:          4 * 1024,
-		QueueFrames:        64,
-		QueueBytes:         256 * 1024,
-		MaxReorderFrames:   4096,
-		MaxReorderBytes:    16 << 20,
-		ReplayBytes:        16 << 20,
-		ReplayTimeout:      time.Second,
+		AggregationEnabled:  true,
+		ActivationOnQueue:   true,
+		FrameSize:           4 * 1024,
+		QueueFrames:         64,
+		QueueBytes:          256 * 1024,
+		ReceiveWindowBytes:  16 << 20,
+		SendBufferBytes:     16 << 20,
+		PathStallTimeoutMin: time.Second,
 	}
 }
 
@@ -423,8 +422,18 @@ func TestCoreSmallFlowUsesOnlyLeg0(t *testing.T) {
 }
 
 func TestCoreLeg1FailureFallsBackToLeg0(t *testing.T) {
-	left, leftApp := newCore(context.Background(), testCoreConfig())
-	right, rightApp := newCore(context.Background(), testCoreConfig())
+	testCoreLeg1FailureFallsBackToLeg0(t, false)
+}
+
+func TestTrafficSavingLeg1FailureFallsBackToLeg0(t *testing.T) {
+	testCoreLeg1FailureFallsBackToLeg0(t, true)
+}
+
+func testCoreLeg1FailureFallsBackToLeg0(t *testing.T, saving bool) {
+	cfg := testCoreConfig()
+	cfg.Leg0TrafficSaving = saving
+	left, leftApp := newCore(context.Background(), cfg)
+	right, rightApp := newCore(context.Background(), cfg)
 	left.activate(activationInfo{Reason: activationReasonBytes})
 	right.activate(activationInfo{Reason: activationReasonBytes})
 	defer left.Close()
@@ -481,8 +490,17 @@ func TestCoreLeg1FailureFallsBackToLeg0(t *testing.T) {
 }
 
 func TestCoreLeg1StallFallsBackToLeg0(t *testing.T) {
+	testCoreLeg1StallFallsBackToLeg0(t, false)
+}
+
+func TestTrafficSavingLeg1StallFallsBackToLeg0(t *testing.T) {
+	testCoreLeg1StallFallsBackToLeg0(t, true)
+}
+
+func testCoreLeg1StallFallsBackToLeg0(t *testing.T, saving bool) {
 	cfg := testCoreConfig()
-	cfg.ReplayTimeout = 100 * time.Millisecond
+	cfg.Leg0TrafficSaving = saving
+	cfg.PathStallTimeoutMin = 100 * time.Millisecond
 	left, leftApp := newCore(context.Background(), cfg)
 	right, rightApp := newCore(context.Background(), cfg)
 	left.activate(activationInfo{Reason: activationReasonBytes})

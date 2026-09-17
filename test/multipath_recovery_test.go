@@ -200,14 +200,18 @@ func recoveryTestInstance(t *testing.T, fast, secondaryUDP, startDown bool, useH
 			opts.Outbounds[j].Type = "recovery-fault"
 		}
 	}
-	in := opts.Inbounds[1].Options.(*option.MultipathInboundOptions)
 	out := opts.Outbounds[len(opts.Outbounds)-1].Options.(*option.MultipathOutboundOptions)
 	out.FailoverEnabled = true
 	out.FailoverTimeout = badoption.Duration(time.Second)
 	out.FailbackDelay = badoption.Duration(2 * time.Second)
 	disabled := false
-	in.AggregationEnabled = &disabled
-	out.AggregationEnabled = &disabled
+	out.Upload.AggregationEnabled = &disabled
+	out.Download.AggregationEnabled = &disabled
+	if len(useHY2) > 1 && useHY2[1] {
+		enabled := true
+		out.Upload.AggregationEnabled, out.Download.AggregationEnabled = &enabled, &enabled
+		out.Upload.Leg0TrafficSaving, out.Download.Leg0TrafficSaving = true, true
+	}
 	if secondaryUDP {
 		out.UDPOutbound = "leg1"
 	}
@@ -258,7 +262,15 @@ func TestMultipathRecoveryHy2Blackhole(t *testing.T) {
 	testMultipathRecoveryBlackhole(t, true)
 }
 
-func testMultipathRecoveryBlackhole(t *testing.T, hy2 bool) {
+func TestMultipathTrafficSavingRecoveryBlackhole(t *testing.T) {
+	testMultipathRecoveryBlackhole(t, false, true)
+}
+
+func TestMultipathTrafficSavingRecoveryHy2Blackhole(t *testing.T) {
+	testMultipathRecoveryBlackhole(t, true, true)
+}
+
+func testMultipathRecoveryBlackhole(t *testing.T, hy2 bool, saving ...bool) {
 	for _, fast := range []bool{false, true} {
 		for _, secondaryUDP := range []bool{false, true} {
 			t.Run(fmt.Sprintf("tfo=%t/udp_leg1=%t", fast, secondaryUDP), func(t *testing.T) {
@@ -300,7 +312,7 @@ func testMultipathRecoveryBlackhole(t *testing.T, hy2 bool) {
 						udp.WriteTo(append([]byte(addr.String()+"|"), p[:n]...), addr)
 					}
 				}()
-				instance, down, status := recoveryTestInstance(t, fast, secondaryUDP, false, hy2)
+				instance, down, status := recoveryTestInstance(t, fast, secondaryUDP, false, hy2, len(saving) > 0 && saving[0])
 				udpNormal := 0
 				if secondaryUDP {
 					udpNormal = 1
@@ -419,6 +431,14 @@ func TestMultipathRecoveryStartsOnLeg1(t *testing.T) {
 }
 
 func TestMultipathRecoveryTFOCombinations(t *testing.T) {
+	testMultipathRecoveryTFOCombinations(t, false)
+}
+
+func TestMultipathTrafficSavingRecoveryTFOCombinations(t *testing.T) {
+	testMultipathRecoveryTFOCombinations(t, true)
+}
+
+func testMultipathRecoveryTFOCombinations(t *testing.T, saving bool) {
 	for _, kind0 := range []string{multipathTestLegDirect, multipathTestLegProxy} {
 		for _, kind1 := range []string{multipathTestLegDirect, multipathTestLegProxy} {
 			for _, fast := range []bool{false, true} {
@@ -426,7 +446,9 @@ func TestMultipathRecoveryTFOCombinations(t *testing.T) {
 					for _, tfo1 := range []bool{false, true} {
 						t.Run(fmt.Sprintf("%s-%t/%s-%t/mp-%t", kind0, tfo0, kind1, tfo1, fast), func(t *testing.T) {
 							opts := multipathTFOTestOptions(fast, multipathTestLeg{tag: "leg0", kind: kind0, tfo: tfo0, proxyPort: otherPort}, multipathTestLeg{tag: "leg1", kind: kind1, tfo: tfo1, proxyPort: otherClientPort}, shadowaead.List[0], mkBase64(t, 16))
-							opts.Outbounds[len(opts.Outbounds)-1].Options.(*option.MultipathOutboundOptions).FailoverEnabled = true
+							mp := opts.Outbounds[len(opts.Outbounds)-1].Options.(*option.MultipathOutboundOptions)
+							mp.FailoverEnabled = true
+							mp.Upload.Leg0TrafficSaving, mp.Download.Leg0TrafficSaving = saving, saving
 							startInstance(t, opts)
 							testTCP(t, clientPort, testPort)
 						})

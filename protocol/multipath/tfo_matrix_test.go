@@ -150,7 +150,7 @@ func testTFOCombination(t *testing.T, multipathTFO, childTFO bool) {
 			err = readFrame()
 		}
 		if err == nil {
-			err = writeHelloResponse(serverWire, helloResponse{Status: helloStatusOK, ChunkSize: message.ChunkSize})
+			err = writeHelloResponse(serverWire, helloResponse{Status: helloStatusOK, FrameSize: message.FrameSize, PolicyDigest: message.Policy.digest()})
 		}
 		if err == nil && !multipathTFO {
 			err = readFrame()
@@ -199,7 +199,7 @@ func testTFOCombination(t *testing.T, multipathTFO, childTFO bool) {
 		t.Fatal("timed out waiting for the multipath exchange")
 	}
 	message := <-messageResult
-	if message.Destination != destination.String() || message.LegID != 0 || message.ChunkSize != uint32(cfg.ChunkSize) {
+	if message.Destination != destination.String() || message.LegID != 0 || message.FrameSize != uint32(cfg.FrameSize) {
 		t.Fatalf("unexpected multipath hello: %#v", message)
 	}
 	if N.NeedHandshakeForWrite(logical) {

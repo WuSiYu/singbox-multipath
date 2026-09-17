@@ -138,7 +138,7 @@ func (r *recoveryClient) runControl(id byte) {
 			}
 			r.control[id] = conn
 			r.mu.Unlock()
-			err = r.o.clientHandshake(ctx, conn, helloMessage{Session: r.id, Group: r.id, Recovery: true, Control: true, LegID: id, ChunkSize: 1, Destination: r.o.aggregation.String()})
+			err = r.o.clientHandshake(ctx, conn, helloMessage{Session: r.id, Group: r.id, Recovery: true, Control: true, LegID: id, FrameSize: 1, Destination: r.o.aggregation.String()})
 		}
 		cancel()
 		if err == nil {

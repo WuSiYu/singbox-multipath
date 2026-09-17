@@ -28,14 +28,11 @@ func TestActivationOptionsDefaultsAndExplicitZero(t *testing.T) {
 		{"explicit_on", `{"aggregation_enabled":true,"activation_on_queue":true,"activation_threshold_mbps":120}`, true, true, 120_000_000 / 8},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			var inboundOptions option.MultipathInboundOptions
-			var outboundOptions option.MultipathOutboundOptions
-			if err := json.Unmarshal([]byte(test.options), &inboundOptions); err != nil {
+			var direction option.MultipathDirectionOptions
+			if err := json.Unmarshal([]byte(test.options), &direction); err != nil {
 				t.Fatal(err)
 			}
-			if err := json.Unmarshal([]byte(test.options), &outboundOptions); err != nil {
-				t.Fatal(err)
-			}
+			outboundOptions := option.MultipathOutboundOptions{Upload: direction, Download: direction}
 			// Marshal/unmarshal must retain explicit false/zero as well as omission.
 			encoded, err := json.Marshal(outboundOptions)
 			if err != nil {
@@ -48,15 +45,15 @@ func TestActivationOptionsDefaultsAndExplicitZero(t *testing.T) {
 			outboundOptions.Outbounds = []string{"leg0", "leg1"}
 			outboundOptions.Server, outboundOptions.ServerPort = "127.0.0.1", 39000
 			logger := log.NewNOPFactory().Logger()
-			inbound, err := NewInbound(context.Background(), nil, logger, "in", inboundOptions)
-			if err != nil {
-				t.Fatal(err)
-			}
 			outbound, err := NewOutbound(context.Background(), nil, logger, "out", outboundOptions)
 			if err != nil {
 				t.Fatal(err)
 			}
-			for side, cfg := range map[string]coreConfig{"inbound": inbound.(*Inbound).cfg, "outbound": outbound.(*Outbound).cfg} {
+			remote, err := configForPolicy(outbound.(*Outbound).cfg.Memory, outbound.(*Outbound).cfg.FrameSize, outbound.(*Outbound).policy.Download, outbound.(*Outbound).policy.Upload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for side, cfg := range map[string]coreConfig{"server": remote, "client": outbound.(*Outbound).cfg} {
 				if cfg.AggregationEnabled != test.enabled || cfg.ActivationOnQueue != test.queue || cfg.ThresholdBytesPS != test.rate {
 					t.Fatalf("%s: enabled=%t queue=%t rate=%d", side, cfg.AggregationEnabled, cfg.ActivationOnQueue, cfg.ThresholdBytesPS)
 				}
@@ -137,7 +134,7 @@ func TestActivationStatusFlags(t *testing.T) {
 	cfg.Memory = newMemoryBudget(8<<20, false)
 	status := newOutboundStatus("", outboundStatusConfig{cfg: cfg})
 	document := status.buildDocument(time.Now())
-	encoded, err := json.Marshal(document.Node.Parameters)
+	encoded, err := json.Marshal(document.Node.Parameters.Upload)
 	if err != nil {
 		t.Fatal(err)
 	}

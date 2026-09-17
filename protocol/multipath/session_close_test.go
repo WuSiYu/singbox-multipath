@@ -128,7 +128,7 @@ func TestJoinSecondaryDefersSessionNotFound(t *testing.T) {
 	var sessionID [16]byte
 	joinDone := make(chan struct{})
 	go func() {
-		outbound.joinSecondary(core, sessionID, uint32(testCoreConfig().ChunkSize), "example.com:443", nil)
+		outbound.joinSecondary(core, sessionID, uint32(testCoreConfig().FrameSize), "example.com:443", nil)
 		close(joinDone)
 	}()
 

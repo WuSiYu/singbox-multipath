@@ -41,7 +41,7 @@ func TestEarlyWriteDeadline(t *testing.T) {
 					defer core.Close()
 					a, b := net.Pipe()
 					defer b.Close()
-					primary, err := newClientFastOpenConn(a, helloMessage{ChunkSize: 1024, Destination: "example.com:80"}, time.Now().Add(5*time.Second))
+					primary, err := newClientFastOpenConn(a, helloMessage{FrameSize: 1024, Destination: "example.com:80"}, time.Now().Add(5*time.Second))
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -82,8 +82,8 @@ func TestEarlyWriteDeadline(t *testing.T) {
 func TestDeadlineRecoveryPreservesStream(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := flowTestConfig()
-		cfg.MaxReorderFrames = 1
-		cfg.ReplayBytes = 8 << 10
+		cfg.ReceiveWindowBytes = int64(cfg.FrameSize)
+		cfg.SendBufferBytes = 8 << 10
 		left, app := newCore(context.Background(), cfg)
 		right, peer := newCore(context.Background(), cfg)
 		defer closeFlowCores(left, right)
@@ -129,7 +129,7 @@ func TestEarlyWriteDeadlineExtensionAndClose(t *testing.T) {
 					defer core.Close()
 					a, b := net.Pipe()
 					defer b.Close()
-					primary, err := newClientFastOpenConn(a, helloMessage{ChunkSize: 1024, Destination: "example.com:80"}, time.Now().Add(5*time.Second))
+					primary, err := newClientFastOpenConn(a, helloMessage{FrameSize: 1024, Destination: "example.com:80"}, time.Now().Add(5*time.Second))
 					if err != nil {
 						t.Fatal(err)
 					}

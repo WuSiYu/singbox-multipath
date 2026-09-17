@@ -19,7 +19,7 @@ func TestAutomaticMemoryLimit(t *testing.T) {
 
 func TestIdleSessionsDoNotAllocateAdvertisedWindows(t *testing.T) {
 	cfg := testCoreConfig()
-	cfg.ChunkSize, cfg.QueueFrames, cfg.QueueBytes = 65536, 256, 16<<20
+	cfg.FrameSize, cfg.QueueFrames, cfg.QueueBytes = 65536, 256, 16<<20
 	budget := newMemoryBudget(512<<20, false)
 	cfg.Memory = budget
 	var cores []*mpCore
@@ -144,7 +144,7 @@ func TestCoreMemoryPressureKeepsLeg0Available(t *testing.T) {
 	pressureBuffer := acquireTestMemory(t, budget, pressureBytes)
 	defer budget.release(pressureBuffer)
 	core.stateMu.Lock()
-	selected := core.choosePathLocked(cfg.ChunkSize)
+	selected := core.choosePathLocked(cfg.FrameSize)
 	core.stateMu.Unlock()
 	if selected == nil || selected.id != 0 {
 		t.Fatalf("memory pressure selected leg %v instead of leg0", selected)

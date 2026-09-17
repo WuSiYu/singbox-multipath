@@ -86,13 +86,13 @@ func TestPerformanceHealthyLinks(t *testing.T) {
 		t.Run(fmt.Sprintf("%d_%d+%dMbps_%d+%dms", parallel, tc.rate0, tc.rate1, tc.rtt0, tc.rtt1), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				cfg := testCoreConfig()
-				cfg.ChunkSize = 65536
+				cfg.FrameSize = 65536
 				cfg.QueueFrames = 256
 				cfg.QueueBytes = 16 << 20
-				cfg.MaxReorderFrames = 2048
-				cfg.MaxReorderBytes = 64 << 20
-				cfg.ReplayBytes = 64 << 20
-				cfg.ReplayTimeout = time.Second
+				// The old 2048-frame ceiling was above this fixture's byte cap.
+				cfg.ReceiveWindowBytes = 64 << 20
+				cfg.SendBufferBytes = 64 << 20
+				cfg.PathStallTimeoutMin = time.Second
 				budget := int64(512 << 20)
 				senderMemory, receiverMemory := newMemoryBudget(budget, false), newMemoryBudget(budget, false)
 				var senders, receivers []*mpCore
@@ -192,12 +192,12 @@ func TestPerformanceColdResponse(t *testing.T) {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				cfg := testCoreConfig()
-				cfg.ChunkSize = 65536
+				cfg.FrameSize = 65536
 				cfg.QueueFrames = 256
 				cfg.QueueBytes = 16 << 20
-				cfg.MaxReorderFrames = 2048
-				cfg.MaxReorderBytes = 64 << 20
-				cfg.ReplayBytes = 64 << 20
+				// The old 2048-frame ceiling was above this fixture's byte cap.
+				cfg.ReceiveWindowBytes = 64 << 20
+				cfg.SendBufferBytes = 64 << 20
 				left, app := newCore(context.Background(), cfg)
 				right, peer := newCore(context.Background(), cfg)
 				defer left.Close()

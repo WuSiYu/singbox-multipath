@@ -17,12 +17,12 @@ import (
 
 // Wire-format fixtures own their scratch independently of runtime page storage.
 func readWireFrame(conn net.Conn, core *mpCore) (wireFrame, error) {
-	return readFrame(conn, make([]byte, core.cfg.ChunkSize))
+	return readFrame(conn, make([]byte, core.cfg.FrameSize))
 }
 
 func beta5Pair(t *testing.T, memory int64) (*mpCore, *mpCore, net.Conn, net.Conn, [2]net.Conn) {
 	t.Helper()
-	cfg := coreConfig{AggregationEnabled: true, ChunkSize: 64 << 10, QueueFrames: 256, MaxReorderBytes: 8 << 20}
+	cfg := coreConfig{AggregationEnabled: true, FrameSize: 64 << 10, QueueFrames: 256, ReceiveWindowBytes: 8 << 20}
 	cfg.Memory = newMemoryBudget(memory, false)
 	a, appA, err := newCoreWithError(context.Background(), cfg)
 	if err != nil {
@@ -167,7 +167,7 @@ func TestBeta5ManyTinyWrites(t *testing.T) {
 func TestBeta5IncrementalMapping(t *testing.T) {
 	for _, secondaryFailure := range []bool{false, true} {
 		t.Run(fmt.Sprint(secondaryFailure), func(t *testing.T) {
-			core, app := newCore(context.Background(), coreConfig{ChunkSize: 65536, Memory: newMemoryBudget(16<<20, false)})
+			core, app := newCore(context.Background(), coreConfig{FrameSize: 65536, Memory: newMemoryBudget(16<<20, false)})
 			defer core.Close()
 			_ = app.SetDeadline(time.Now().Add(3 * time.Second))
 			var peers [2]net.Conn
@@ -337,7 +337,7 @@ func (c *beta5HeldConn) Write(data []byte) (int, error) {
 }
 
 func TestBeta5HeldSecondaryWriterDoesNotOwnACKedBuffer(t *testing.T) {
-	cfg := coreConfig{AggregationEnabled: true, ChunkSize: 64 << 10, QueueFrames: 256, Memory: newMemoryBudget(64<<20, false)}
+	cfg := coreConfig{AggregationEnabled: true, FrameSize: 64 << 10, QueueFrames: 256, Memory: newMemoryBudget(64<<20, false)}
 	a, appA := newCore(context.Background(), cfg)
 	cfg.Memory = newMemoryBudget(64<<20, false)
 	b, appB := newCore(context.Background(), cfg)

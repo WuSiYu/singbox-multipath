@@ -26,6 +26,54 @@ func waitForStatus(t *testing.T, check func() bool) {
 	}
 }
 
+func TestBeta8StatusPoliciesAndModes(t *testing.T) {
+	p := sessionPolicy{Upload: directionPolicy{}, Download: directionPolicy{AggregationEnabled: true, Leg0TrafficSaving: true, ActivationAfterBytes: 1}}
+	clientCfg, err := configForPolicy(newMemoryBudget(64<<20, false), 65536, p.Upload, p.Download)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCfg, err := configForPolicy(newMemoryBudget(128<<20, false), 65536, p.Download, p.Upload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCfg.SendStatus = true
+	left, _ := newCore(context.Background(), clientCfg)
+	right, _ := newCore(context.Background(), serverCfg)
+	defer left.Close()
+	defer right.Close()
+	for id := uint8(0); id < 2; id++ {
+		a, b := net.Pipe()
+		connectTestLeg(t, left, right, id, a, b)
+	}
+	right.activate(activationInfo{Reason: activationReasonBytes})
+	status := newOutboundStatus(filepath.Join(t.TempDir(), "status.json"), outboundStatusConfig{
+		tag: "beta8-status", aggregation: "10.66.67.1:39000", udpOutbound: "leg0", cfg: clientCfg, policy: p,
+		legTags: [2]string{"leg0", "leg1"}, legTypes: [2]string{"direct", "hysteria2"},
+	})
+	status.addSession([16]byte{1}, "example.com:443", left, leg1PhaseReady)
+	waitForStatus(t, func() bool {
+		right.queueSenderStatus(time.Now(), true)
+		return left.peerSenderStatusSnapshot().status.DataMode == 3
+	})
+	doc := status.buildDocument(time.Now())
+	u, d := doc.Node.Parameters.Upload, doc.Node.Parameters.Download
+	if u.AggregationEnabled || !d.Leg0TrafficSaving || *u.EffectiveSendBufferBytes != 28<<20 || *u.EffectiveReceiveWindowBytes != 56<<20 || *d.EffectiveSendBufferBytes != 56<<20 || *d.EffectiveReceiveWindowBytes != 28<<20 {
+		t.Fatalf("incorrect directional limits: %+v / %+v", u, d)
+	}
+	if doc.Node.Logical.UploadStates["leg0"] != 1 || doc.Node.Logical.DownloadStates["leg1"] != 1 || doc.Node.Logical.State != "traffic_saving" || doc.Node.Logical.RXAggregatingConnections != 0 {
+		t.Fatalf("incorrect modes: %+v", doc.Node.Logical)
+	}
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("STATUS %s", encoded)
+	doc = status.buildDocument(time.Now().Add(4 * time.Second))
+	if doc.Node.Logical.DownloadStates["unknown"] != 1 || doc.Node.Logical.DownloadStates["leg1"] != 0 {
+		t.Fatal("stale remote mode was treated as current")
+	}
+}
+
 func TestCoreStatusCounters(t *testing.T) {
 	left, leftApp := newCore(context.Background(), testCoreConfig())
 	right, rightApp := newCore(context.Background(), testCoreConfig())
@@ -128,7 +176,7 @@ func TestOutboundStatusDocument(t *testing.T) {
 	})
 
 	document := status.buildDocument(time.Now().Add(time.Second))
-	if document.SchemaVersion != 3 {
+	if document.SchemaVersion != 4 {
 		t.Fatalf("unexpected status schema: %d", document.SchemaVersion)
 	}
 	if document.Node.Parameters.MemoryLimitBytes != 8<<20 || document.Node.Memory.LimitBytes != 8<<20 || !document.Node.Memory.Automatic {

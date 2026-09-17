@@ -13,18 +13,18 @@ import (
 type coreConfig struct {
 	Recovery                       *recoveryPolicy
 	AggregationEnabled             bool
+	Leg0TrafficSaving              bool
 	ActivationOnQueue              bool
-	ChunkSize                      int
+	FrameSize                      int
 	QueueFrames                    int
 	QueueBytes                     int64
 	ThresholdBytesPS               uint64
 	ActivationAfterBytes           uint64
 	ActivationAfterBytesMinBytesPS uint64
 	ActivationWindow               time.Duration
-	MaxReorderFrames               int
-	MaxReorderBytes                int64
-	ReplayBytes                    int64
-	ReplayTimeout                  time.Duration
+	ReceiveWindowBytes             int64
+	SendBufferBytes                int64
+	PathStallTimeoutMin            time.Duration
 	Memory                         *memoryBudget
 	OnLeg1Active                   func(activationInfo, bool)
 	OnLegFailure                   func(uint8, legFailureStage, error)

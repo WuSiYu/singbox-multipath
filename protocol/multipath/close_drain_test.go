@@ -105,7 +105,7 @@ func TestApplicationCloseDrainsAcrossTransientLegs(t *testing.T) {
 			t.Run(fmt.Sprintf("leg%d/%s", legID, delay), func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					cfg := flowTestConfig()
-					cfg.ReplayTimeout = time.Second
+					cfg.PathStallTimeoutMin = time.Second
 					left, app := newCore(context.Background(), cfg)
 					cfg.Memory = newMemoryBudget(1<<20, false)
 					right, peer := newCore(context.Background(), cfg)

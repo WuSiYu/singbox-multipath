@@ -11,7 +11,7 @@ import (
 )
 
 func (o *Outbound) recoveryHello(session [16]byte, id byte, destination string, create bool) helloMessage {
-	h := helloMessage{Session: session, LegID: id, RequestStatus: o.statusFile != "", ChunkSize: uint32(o.cfg.ChunkSize), Destination: destination, Recovery: true, Group: o.recovery.id, Create: create}
+	h := helloMessage{Session: session, LegID: id, RequestStatus: o.statusFile != "", FrameSize: uint32(o.cfg.FrameSize), Destination: destination, Policy: o.policy, Recovery: true, Group: o.recovery.id, Create: create}
 	h.RecoveryEpoch, h.RecoveryMask, h.RecoveryUDP = o.recovery.policy.snapshot()
 	return h
 }
@@ -78,7 +78,7 @@ func (o *Outbound) dialRecovery(ctx context.Context, destination M.Socksaddr) (n
 			if err != nil {
 				return err
 			}
-			if response.ChunkSize != message.ChunkSize {
+			if response.FrameSize != message.FrameSize || response.PolicyDigest != message.Policy.digest() {
 				return errRecoveryNotReady
 			}
 			confirmed.Store(true)

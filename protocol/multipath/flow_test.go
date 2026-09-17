@@ -60,9 +60,9 @@ func (c *partialBoosterConn) Close() error {
 
 func flowTestConfig() coreConfig {
 	cfg := testCoreConfig()
-	cfg.ChunkSize, cfg.QueueFrames, cfg.QueueBytes = 1024, 64, 64<<10
-	cfg.MaxReorderFrames, cfg.MaxReorderBytes = 64, 8<<10
-	cfg.ReplayTimeout = 200 * time.Millisecond
+	cfg.FrameSize, cfg.QueueFrames, cfg.QueueBytes = 1024, 64, 64<<10
+	cfg.ReceiveWindowBytes = 8 << 10
+	cfg.PathStallTimeoutMin = 200 * time.Millisecond
 	cfg.Memory = newMemoryBudget(1<<20, false)
 	return cfg
 }
@@ -99,7 +99,7 @@ func assertFlowAlive(t *testing.T, cores ...*mpCore) {
 		if core.memory.snapshot().PeakUsedBytes > core.memory.snapshot().LimitBytes {
 			t.Fatal("memory budget exceeded")
 		}
-		if core.reorderPeak.Load() > core.cfg.MaxReorderBytes || core.reorderFPeak.Load() > int64(core.cfg.MaxReorderFrames) {
+		if core.reorderPeak.Load() > core.cfg.ReceiveWindowBytes {
 			t.Fatal("reorder limits exceeded")
 		}
 	}
@@ -166,7 +166,7 @@ func TestFlowTinyWindowSurvivesPartialBooster(t *testing.T) {
 func TestFlowBidirectionalStallAndMemoryPressure(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		leftCfg, rightCfg := flowTestConfig(), flowTestConfig()
-		leftCfg.MaxReorderBytes, rightCfg.MaxReorderBytes = 64<<10, 128<<10
+		leftCfg.ReceiveWindowBytes, rightCfg.ReceiveWindowBytes = 64<<10, 128<<10
 		leftCfg.Memory, rightCfg.Memory = newMemoryBudget(512<<10, false), newMemoryBudget(512<<10, false)
 		left, app := newCore(context.Background(), leftCfg)
 		right, peerApp := newCore(context.Background(), rightCfg)
@@ -262,7 +262,7 @@ func TestFlowSlowReaderDoesNotBlockControlOrReverseData(t *testing.T) {
 func TestFlowIdleReleasesStorageWithoutRetractingWindow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := flowTestConfig()
-		cfg.MaxReorderBytes = 128 << 10
+		cfg.ReceiveWindowBytes = 128 << 10
 		left, app := newCore(context.Background(), cfg)
 		cfg.Memory = newMemoryBudget(1<<20, false)
 		right, peerApp := newCore(context.Background(), cfg)

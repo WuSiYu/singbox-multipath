@@ -54,8 +54,9 @@ func TestMultipathNormalTCPHalfClose(t *testing.T) {
 								opts := multipathTFOTestOptions(tfo, leg0, leg1, shadowaead.List[0], mkBase64(t, 16))
 								in := opts.Inbounds[1].Options.(*option.MultipathInboundOptions)
 								out := opts.Outbounds[len(opts.Outbounds)-1].Options.(*option.MultipathOutboundOptions)
-								in.AggregationEnabled = &agg
-								out.AggregationEnabled = &agg
+								_ = in
+								out.Upload.AggregationEnabled = &agg
+								out.Download.AggregationEnabled = &agg
 								instance := startInstance(t, opts)
 								time.Sleep(50 * time.Millisecond)
 								d, found := instance.Outbound().Outbound("mp-out")

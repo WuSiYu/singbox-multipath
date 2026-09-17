@@ -113,7 +113,7 @@ func sessionMemoryReservation(cfg coreConfig) int64 {
 	// frame per path. The base also covers worker stacks and 16 prepaid primary
 	// flight records. Two reader scratch buffers and one primary TX reserve
 	// keep head recovery independent of speculative allocations.
-	return sessionMemoryBase + 2*34*wireFrameMemoryEstimate + int64(cfg.ChunkSize)*3
+	return sessionMemoryBase + 2*34*wireFrameMemoryEstimate + int64(cfg.FrameSize)*3
 }
 
 func (b *memoryBudget) tryAcquirePrimary(size int) ([]byte, <-chan struct{}) {

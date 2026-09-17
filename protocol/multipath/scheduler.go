@@ -57,7 +57,7 @@ func (c *mpCore) pumpLoop() {
 			}
 		}
 		for _, leg := range c.availableLegs() {
-			if leg.path.Stalled(now, c.cfg.ReplayTimeout) && !leg.path.Stale {
+			if leg.path.Stalled(now, c.cfg.PathStallTimeoutMin) && !leg.path.Stale {
 				leg.path.Stale = true
 				c.replayTO.Add(1)
 			}
@@ -73,7 +73,7 @@ func (c *mpCore) pumpLoop() {
 			} else if sent {
 				continue
 			}
-			segment, ok := c.tx.NextRange(c.cfg.ChunkSize)
+			segment, ok := c.tx.NextRange(c.cfg.FrameSize)
 			if !ok {
 				break
 			}
@@ -179,9 +179,16 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	for _, leg := range legs {
 		provisionalRate = max(provisionalRate, leg.path.Rate)
 	}
+	// Selection policy and transient readiness are distinct: a healthy secondary
+	// remains the sole new-data path while busy or discovery/window constrained.
+	// Only unavailable/stale paths or allocator protection permit primary fallback.
+	exclusiveSecondary := c.trafficSavingSecondaryLocked()
 	var chosen *mpLeg
 	score := math.Inf(1)
 	for _, leg := range legs {
+		if exclusiveSecondary != nil && leg != exclusiveSecondary {
+			continue
+		}
 		if c.cfg.Recovery != nil && !c.cfg.Recovery.allows(leg.id) {
 			continue
 		}
@@ -197,8 +204,8 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 		}
 		// Startup sampling is bounded. Thereafter the connection-level byte
 		// window and memory, not an extra per-path cwnd, bound lookahead.
-		initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.ChunkSize)*4)
-		pipeline := leg.path.Pipeline(initial, uint64(c.cfg.ReplayBytes))
+		initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.FrameSize)*4)
+		pipeline := leg.path.Pipeline(initial, uint64(c.cfg.SendBufferBytes))
 		if leg.path.Outstanding()+uint64(length) > pipeline {
 			continue
 		}
@@ -269,7 +276,7 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 		}
 		// A path receipt with no corresponding Data ACK may indicate receive
 		// pruning. Allow normal coalescing/reordering before repairing it.
-		if pruned && !stale && now.Sub(mapping.sentAt) < owner.path.RTO(c.cfg.ReplayTimeout) {
+		if pruned && !stale && now.Sub(mapping.sentAt) < owner.path.RTO(c.cfg.PathStallTimeoutMin) {
 			continue
 		}
 		target := c.controlLeg()
@@ -282,7 +289,7 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 		if target == nil || target.busy || !target.ready.Load() || target.path.Stale {
 			continue
 		}
-		if !mapping.repairedAt.IsZero() && now.Sub(mapping.repairedAt) < target.path.RTO(c.cfg.ReplayTimeout) {
+		if !mapping.repairedAt.IsZero() && now.Sub(mapping.repairedAt) < target.path.RTO(c.cfg.PathStallTimeoutMin) {
 			continue
 		}
 		segment, ok := c.tx.Range(max(mapping.seq, c.tx.Una), int(mapping.end-max(mapping.seq, c.tx.Una)))
@@ -301,4 +308,51 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// Caller holds stateMu. Busy writers are healthy, and must not cause spillover.
+func (c *mpCore) trafficSavingSecondaryLocked() *mpLeg {
+	if !c.active.Load() || !c.cfg.Leg0TrafficSaving || c.peerPressure || !c.memory.boosterAllowed() {
+		return nil
+	}
+	leg := c.getLeg(1)
+	if leg == nil || !leg.ready.Load() || leg.path.Stale || (c.cfg.Recovery != nil && !c.cfg.Recovery.allows(1)) {
+		return nil
+	}
+	return leg
+}
+
+func (c *mpCore) dataModeLocked() uint64 {
+	if c.cfg.Recovery != nil {
+		if leg := c.controlLeg(); leg != nil && leg.id == 1 {
+			return 5
+		}
+	}
+	if !c.active.Load() {
+		return 1
+	}
+	if !c.cfg.Leg0TrafficSaving {
+		return 2
+	}
+	if c.trafficSavingSecondaryLocked() != nil {
+		return 3
+	}
+	return 4
+}
+
+func dataModeName(mode uint64) string {
+	switch mode {
+	case 1:
+		return "leg0"
+	case 2:
+		return "aggregate"
+	case 3:
+		return "leg1"
+	case 4:
+		return "leg0_fallback"
+	case 5:
+		return "failover"
+	default:
+		return "unknown"
+	}
 }

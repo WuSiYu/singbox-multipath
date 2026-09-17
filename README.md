@@ -18,7 +18,7 @@ The multipath protocol does not provide authentication or encryption by itself. 
 aggregation listener should only be reachable through trusted or authenticated child
 paths, such as a private WireGuard path and a Hysteria2 path.
 
-Both endpoints must use multipath protocol **v10** (beta6). Older protocol versions are
+Both endpoints must use multipath protocol **v11** (beta8). Older protocol versions are
 rejected; there is no compatibility mode.
 
 ### Data path and leg roles
@@ -48,16 +48,28 @@ normal child backpressure without the discovery-probe limit. Packet-level conges
 control, pacing, and retransmission remain in the child: this protocol does not
 replace Hysteria2's congestion controller with an outer TCP one.
 
-`aggregation_enabled` controls only the local sending direction: client upload on
-an outbound, server download on an inbound. With it disabled, all locally sent
-application data stays on leg 0, except during optional failover. Leg 1 can still attach and receive data when the
-peer enables aggregation, and the selected UDP outbound is unaffected.
+The client configures separate `upload` and `download` policies and sends both
+during session establishment. Upload applies to the client sender and server
+receiver; download applies to the server sender and client receiver. The server
+accepts the exact session policy, subject to protocol validation and its own memory
+budget. Joins and recovery reattachments must carry the same policy.
+
+Each direction has an `aggregation_enabled` master switch. When false, new data
+uses leg 0 except during optional failover. The other direction can still activate
+leg 1. With `leg0_traffic_saving: true`, activation switches new data to leg 1
+instead of using both legs. Before activation and while leg 1 is connecting,
+data still uses leg 0. Healthy leg 1 writer backpressure or exhausted discovery
+credit causes waiting, not spillover onto leg 0. A missing or stalled leg 1, or
+local/peer memory pressure, permits leg 0 fallback; once eligible again, leg 1
+resumes exclusive new-data transmission. Existing leg 0 assignments finish normally.
+Reinjection and control traffic may still use leg 0, so this is not a zero-byte
+guarantee. UDP preference and failover are separate from this switch.
 
 With aggregation enabled, the following triggers are independent alternatives
 (OR), evaluated separately for each connection and sending direction:
 
 - Queue: `activation_on_queue` is enabled and leg 0 in-flight plus local unsent
-  bytes stay at least 80% of `queue_frames * chunk_size` for `activation_window`.
+  bytes stay at least 80% of `queue_frames * frame_size` for `activation_window`.
 - Rate: `activation_threshold_mbps` is greater than zero and the average local
   ingress rate over `activation_window` reaches it.
 - Bytes: `activation_after_bytes` is greater than zero and the local TX accepted-byte
@@ -115,7 +127,7 @@ reordering, not evidence that the missing byte was lost.
 
 The adaptive no-progress interval is smoothed delivery RTT plus four times its
 variation, at least 200 ms, initially one second before measurements are available.
-An explicit `leg1_replay_timeout` supplies an additional lower bound. Buffering in
+An explicit `path_stall_timeout_min` supplies an additional lower bound. Buffering in
 child transports is included in timing measurements. Control/window updates take
 priority over DATA not yet submitted to the primary child; they cannot overtake an
 already blocked child write or bytes already queued inside a reliable transport.
@@ -134,10 +146,9 @@ does not include child TCP/QUIC buffers.
 
 Omitted receive/send-history ceilings are derived from the node budget: half of
 its ordinary allocation region (7/16 of the total, capped at 512 MiB and at least
-one chunk). With a 512 MiB budget this is 224 MiB per direction. These are ceilings,
+one frame). With a 512 MiB budget this is 224 MiB per direction. These are ceilings,
 not allocations or per-session reservations; concurrent sessions still share the
-same global allocator. Explicit byte limits remain hard caps. An omitted
-`max_reorder_frames` adds no independent chunk-count ceiling.
+same global allocator. Explicit byte limits remain hard caps. There is no frame-count receive limit; only the byte window and shared memory budget apply.
 
 The byte-sequence, Data ACK, shared-window, reinjection, and DATA_FIN model follows
 [RFC 8684](https://www.rfc-editor.org/rfc/rfc8684.html). The delivery-based scheduling
@@ -198,7 +209,7 @@ The protocol adds no authentication or encryption; keep this listener on trusted
 paths. Failover cannot prevent a game from disconnecting if its own timeout expires
 during detection, or preserve a socket across server restart.
 
-Client additions (independent of `aggregation_enabled`):
+Client additions (independent of directional aggregation switches):
 
 ```json
 {
@@ -236,7 +247,7 @@ error rather than a clean EOF, while local close interrupts pending application 
 
 ### Runtime telemetry
 
-When the client enables `status_file`, protocol v10 requests a compact sender-status
+When the client enables `status_file`, protocol v11 requests a compact sender-status
 frame from the server on the control path (leg 0 normally, leg 1 during failover).
 It reports the server-side downlink queues, replay and fallback counters,
 write stalls, and memory pressure for the matching logical session. Status frames
@@ -270,9 +281,9 @@ Only close-related I/O errors inherit endpoint attribution; timeouts and protoco
 errors remain visible. A missing close marker leaves the source unknown rather
 than guessing from EOF, reset or QUIC cancellation text. The marker is diagnostic
 only: it does not change FIN handling, scheduling, recovery or close timing.
-Status schema 3 adds the source field. Confirmed endpoint-close events do not
+Status schema 4 includes error provenance, directional policies and sender modes. Confirmed endpoint-close events do not
 increment leg failure/event counters; other events, including unattributed and
-harmless closures, retain their existing counting semantics. Protocol v10 requires
+harmless closures, retain their existing counting semantics. Protocol v11 requires
 updating both endpoints.
 
 Remote scheduler rate estimates are not one-second throughput or physical link
@@ -286,8 +297,10 @@ below the resume watermark each emit one informational transition log.
 
 ### Client outbound example
 
-The following example uses a system WireGuard interface for the preferred leg and an
-already configured Hysteria2 outbound for the secondary leg:
+The preferred leg can use a system WireGuard interface; the second leg can be an
+existing Hysteria2 outbound. Upload stays on leg 0 in this example. Download switches
+to leg 1 after any enabled trigger fires. Set `download.leg0_traffic_saving` to
+`false` to aggregate instead.
 
 ```json
 {
@@ -304,44 +317,44 @@ already configured Hysteria2 outbound for the secondary leg:
       "server": "hy2.example.com",
       "server_port": 443,
       "password": "change-me",
-      "tls": {
-        "enabled": true,
-        "server_name": "hy2.example.com"
-      }
+      "tls": { "enabled": true, "server_name": "hy2.example.com" }
     },
     {
       "type": "multipath",
       "tag": "mp-out",
-      "outbounds": [
-        "wg-dedicated",
-        "hy2-public"
-      ],
+      "outbounds": ["wg-dedicated", "hy2-public"],
       "preferred": "wg-dedicated",
       "udp_outbound": "wg-dedicated",
       "server": "10.66.67.1",
       "server_port": 39000,
       "tcp_fast_open": true,
-      "aggregation_enabled": true,
-      "activation_on_queue": true,
-      "activation_threshold_mbps": 120,
-      "activation_after_bytes": "2MB",
-      "activation_after_bytes_min_mbps": 120,
-      "activation_window": "1s",
-      "chunk_size": 65536,
-      "queue_frames": 256
+      "frame_size": "64KB",
+      "upload": { "aggregation_enabled": false },
+      "download": {
+        "aggregation_enabled": true,
+        "leg0_traffic_saving": true,
+        "activation_on_queue": true,
+        "activation_threshold_mbps": 120,
+        "activation_after_bytes": "2MB",
+        "activation_after_bytes_min_mbps": 120,
+        "activation_window": "1s",
+        "queue_frames": 256,
+        "send_buffer_bytes": 0,
+        "receive_window_bytes": 0,
+        "path_stall_timeout_min": "0s"
+      },
+      "memory_limit": "512MB"
     }
   ]
 }
 ```
 
-`tcp_fast_open` on the multipath outbound enables its early-write path: the
-multipath hello and first data frame are emitted together. It does not enable TCP
-Fast Open inside a child outbound. To place that first write in the TCP SYN, also
-enable `tcp_fast_open` on the preferred child outbound and on the server's multipath
-inbound, as shown in the examples. If the child transport does not support TCP Fast
-Open, the combined early write still works but is sent after its connection is
-established. When multipath `tcp_fast_open` is false or omitted, the multipath hello
-is completed before the logical connection is returned.
+Multipath `tcp_fast_open` combines the hello and first DATA write; it does not
+enable TCP Fast Open inside a child. To carry that write in a TCP SYN, **also
+enable the child's `tcp_fast_open`**, and enable it on the multipath server
+listener. A child without TCP TFO still supports multipath early-write after
+establishing its transport. With multipath TFO false or omitted, Dial waits for
+the multipath hello response before returning the logical connection.
 
 ### Server inbound example
 
@@ -354,115 +367,107 @@ is completed before the logical connection is returned.
       "listen": "10.66.67.1",
       "listen_port": 39000,
       "tcp_fast_open": true,
-      "aggregation_enabled": true,
-      "activation_on_queue": true,
-      "activation_threshold_mbps": 120,
-      "activation_window": "1s",
-      "chunk_size": 65536,
-      "queue_frames": 256
+      "memory_limit": "512MB",
+      "handshake_timeout": "10s"
     }
   ]
 }
 ```
 
-### Parameter direction and negotiation
+### Parameter ownership
 
-Here, **client** means the multipath outbound and **server** means the multipath
-inbound. TX and RX are relative to the side where a field is configured:
+The client is the multipath outbound; the server is the multipath inbound.
+Policies apply per logical TCP connection. They do not tune child TCP/QUIC
+buffers, congestion control, or UDP forwarding.
 
-| Local scope | Client outbound | Server inbound |
+| Client policy | Sender | Receiver |
 | --- | --- | --- |
-| **Local TX** | Upload towards the aggregation server | Download towards the client |
-| **Local RX** | Download received from the server | Upload received from the client |
+| `upload` | Client | Server |
+| `download` | Server | Client |
 
-Unless stated otherwise, tuning limits apply per logical TCP connection. The memory budget is shared by all sessions of
-one multipath inbound or outbound. These TCP tuning fields do not configure UDP
-forwarding or the child transports' TCP/QUIC buffers and congestion control.
+The client sends both policies and a common `frame_size` in the v11 hello.
+The server validates them and confirms a digest; it does not substitute its own
+directional defaults or negotiate a smaller frame. Both legs and all reattachments
+must match. Invalid policies or insufficient server session-admission memory reject
+the connection. The two hosts' `memory_limit` values remain independent and are
+never overridden by the client.
 
-Most settings are local and independent: the server does not push its activation,
-queue, replay, or memory configuration to the client. Receive limits are
-also configured locally, but constrain the byte window advertised to the peer. Telemetry
-reports remote values without applying them to local configuration.
+An automatic send/receive ceiling is resolved on the host that owns that buffer.
+For example, `upload.receive_window_bytes: 0` resolves against server memory;
+`download.receive_window_bytes: 0` resolves against client memory. A zero on the
+wire means automatic, not zero capacity. Explicit per-session ceilings never
+override the owning host's shared memory budget.
 
-`chunk_size` is agreed during the hello exchange: the client requests one maximum frame payload size
-for the session. The server accepts that exact value if it does not exceed the
-server's configured limit, otherwise it rejects the connection; it does not silently
-reduce an oversized request. The accepted size is used for **both upload and
-download**, and both legs must use the same session value. Actual frames may be
-smaller. Enabling client `status_file` also sends a hello flag requesting server
-telemetry; the file path itself is not sent.
+### Client fields
 
-For example, with client `chunk_size: 16384, queue_frames: 64` and server
-`chunk_size: 65536, queue_frames: 256`, both directions use frames of at most 16 KiB.
-The client has 1 MiB of local unsent capacity per connection; the server has 4 MiB.
-This does not cap whole-path in-flight data. Already assigned bytes stay in the
-connection's send history until Data ACK; each path writer holds at most one
-assignment. Reinjection references history rather than a separate recovery queue.
-
-`max_reorder_frames` is a capacity in negotiated chunk-size units, not a count of
-received wire frames. Together with `max_reorder_bytes` it sets the local RX byte
-window: `min(max_reorder_frames * chunk_size, max_reorder_bytes)`. With 16 KiB chunks,
-an explicit 2048 units mean 32 MiB. Short mappings consume only their actual byte range. Both
-limits include in-order data awaiting application reads; sparse page allocation and
-the shared memory budget separately control actual storage.
-
-### Outbound fields
-
-| Field | Scope and peer interaction | Description | Accepted format / example |
+| Field | Scope and peer interaction | Default / meaning | Accepted format examples |
 | --- | --- | --- | --- |
-| `outbounds` | Client path selection for **both directions**; tags are local, while hello messages identify the leg roles. | Exactly two child outbound tags. Both children must support TCP. | `["leg0", "leg1"]` |
-| `preferred` | Client assigns the shared leg 0 role; the server uses the leg IDs supplied by the client. | Session anchor, initial data path, and fallback path. Defaults to the first entry in `outbounds`; changing it affects both directions' path roles, not just upload scheduling. | `"leg0"` |
-| `udp_outbound` | Client UDP preference, independent of TCP. With failover, the selected path is synchronized for server replies. | Defaults to `preferred`. Without failover it forwards directly and may name another outbound. With failover it must be one of the two legs; both must support UDP, and the server relays all packets. | `"leg0"` or `"leg1"` |
-| `failover_enabled` | Client-only, applies to the entire session in both directions; the server accepts the requested mode. | Default `false`: no client recovery probes or UDP relay. When enabled, either leg may carry control and data. Independent of aggregation. The server always listens on TCP and UDP and has no matching option. | `true` or `false` |
-| `failover_timeout` | Client-only shared TCP/UDP health detection, applies to both directions. | Default `5s`; range `1s`–`5m`. A path needs fresh TCP and UDP replies. Only active when failover is enabled. | Duration, e.g. `"5s"` or `"10s"` |
-| `failback_delay` | Client-only preferred-path stability hold, applies to both directions. | Default `30s`; range `1s`–`1h`. TCP returns to leg 0; UDP returns to `udp_outbound`. Hold is bypassed if the fallback fails. | Duration, e.g. `"30s"` or `"1m"` |
-| `server` / `server_port` | Client connection destination for both legs; must reach the server listener. | Address and port of the remote multipath inbound. These are not the final application destination. | `"10.66.67.1"` / `39000` |
-| `tcp_fast_open` | Client connection setup / early TX; not a negotiated multipath flag. The server's same-named listen option has a different role. | Enables the multipath early-write path. Also enable TCP Fast Open on the preferred child and server inbound for SYN data. Default: `false`. | `true` or `false` |
-| `status_file` | Client-local file containing local TX/RX statistics and requested remote sender telemetry. | Optional path for periodically written status JSON. Enables client status probes and requests server TX statistics; the server does not use or write this path. Active-session recovery probes do not require it. | `"/var/run/multipath.json"` |
+| `outbounds` | Client-local tags define both-direction paths. | Exactly two TCP-capable children. | `["leg0", "leg1"]` |
+| `preferred` | Assigns shared leg 0 role. | First child; initial/control/preferred path, including recovery. | `"leg0"` |
+| `udp_outbound` | Client UDP preference; with failover, synchronized for server replies. | Preferred child. Without failover may name another outbound; with failover must name one of the two UDP-capable children. | `"leg0"`, `"leg1"` |
+| `server`, `server_port` | Destination reached through both child outbounds. | Required aggregation listener. | `"10.66.67.1"`, `39000` |
+| `tcp_fast_open` | Client logical-connection setup. | False; early-write when true. Also enable child TFO for TCP SYN data. Server listener TFO is a separate socket option. | `true`, `false` |
+| `frame_size` | Client-selected maximum DATA payload, shared by both TX/RX directions and confirmed by server. | 64 KiB; omitted/0 uses default, explicit nonzero range 1 KiB–1 MiB. Payload excludes headers; frames can be smaller and are read incrementally. | `65536`, `"64KB"`, `"16 KiB"` |
+| `upload`, `download` | Client sends immutable directional policies to server. | Both default to aggregation enabled, traffic-saving disabled. Fields below. | `{"aggregation_enabled": false}` |
+| `status_file` | Client-local output path; hello requests peer sender telemetry. | Disabled when empty. One-second JSON status including policies, effective buffer ceilings and directional modes. | `"/var/run/multipath.json"` |
+| `failover_enabled` | Client-only shared TCP/UDP recovery; server always supports it. | False; no shared recovery probes/UDP relay associations when off. Independent of activation and traffic-saving. | `true`, `false` |
+| `failover_timeout` | Client path failure detection; sent to recovery group. | 5 seconds; requires failover enabled. | `"5s"`, `"10s"` |
+| `failback_delay` | Client preferred-path stability hold; synchronized with server. | 30 seconds; requires failover enabled. It restores normal policy, not forced leg 0 DATA in an activated saving direction. | `"30s"`, `"1m"` |
 
-### Tuning fields and direction
+### Fields inside upload and download
 
-All fields below are available on both sides.
+All these fields are set **only on the client**, then applied on the appropriate
+host. Sender means client for upload and server for download. Receiver means the
+opposite host. Limits are per logical connection and direction.
 
-| Field | Scope and peer interaction | Description | Accepted format / example |
+| Field | Application | Default / meaning | Accepted format examples |
 | --- | --- | --- | --- |
-| `aggregation_enabled` | **Local TX**, independent on each side; not negotiated. | `false` keeps local application data on leg 0 except during optional failover, without disabling peer TX aggregation, local RX over leg 1, or UDP. Default: `true`. | `true` or `false` |
-| `activation_on_queue` | **Local TX**; not negotiated. | **Condition 1**, an independent OR trigger: primary path in-flight plus local unsent bytes stay at least 80% of `chunk_size * queue_frames` for `activation_window`. Default: `true`. | `true` or `false` |
-| `activation_threshold_mbps` | **Local TX** ingress rate per connection; not negotiated. | **Condition 2**, an independent OR trigger measured over `activation_window`. Explicit `0` disables it. If omitted, defaults to `150` when the byte trigger is disabled, otherwise `0`. | Non-negative integer Mbps, e.g. `120` or `0` |
-| `activation_after_bytes` | **Local TX** cumulative application bytes per connection; not negotiated. | **Condition 3**, an independent OR trigger. Counts bytes accepted into the local multipath sender, not peer delivery or combined RX/TX traffic. `0` or omitted disables it. | Non-negative integer or memory string, e.g. `2097152`, `"2MB"`, or `0` |
-| `activation_after_bytes_min_mbps` | **Local TX** rate gate for condition 3 only; not negotiated. | The byte threshold and this average rate over a complete `activation_window` must both be met. `0` or omitted removes the gate. Conditions 1 and 2 remain independent. | Non-negative integer Mbps, e.g. `120` or `0` |
-| `activation_window` | **Local TX** measurement / trigger timing; not negotiated. | Rate sampling window and sustained high-queue duration. Default: `1s`. Does not set a receive or replay timeout. | Duration, e.g. `"1s"` |
-| `chunk_size` | **Both TX and RX**, client-requested and server-accepted per session. | Client value is the requested maximum frame payload for both directions; server value is the maximum acceptable request. Oversized requests are rejected, not reduced. Range: 1 KiB to 1 MiB; default: 64 KiB. | Non-negative integer bytes, e.g. `16384` or `65536` |
-| `queue_frames` | **Local TX**, per connection; not negotiated. | Local unsent capacity in negotiated chunk-size units. Range: 8–4096; configured product at most 64 MiB. Not a per-leg in-flight limit or receive window. Default: `256`. | Non-negative integer, e.g. `64` or `256` |
-| `max_reorder_frames` | **Local RX**; window constrains peer TX. Client: download; server: upload. | Window capacity in negotiated chunk-size units, limited further by `max_reorder_bytes`. Not a count of wire frames. Omitted / `0`: no additional chunk-count ceiling. Explicit range: 64–65536. | Non-negative integer, e.g. `2048` or `8192` |
-| `max_reorder_bytes` | **Local RX**, per connection; window constrains peer TX. | Maximum receive-window byte span, including unread in-order data. Sparse storage is allocated on arrival; small frames do not consume a full chunk. Default: budget-derived (7/16 of total, capped at 512 MiB); explicit maximum: 512 MiB. | Non-negative integer bytes, e.g. `67108864` |
-| `leg1_replay_bytes` | **Local TX**, per connection; not negotiated. | Historical field name; now limits the connection send history for **both** paths, including unsent bytes. Only peer Data ACK releases history. Separate from peer RX capacity. Default: budget-derived (7/16 of total, capped at 512 MiB); explicit maximum: 512 MiB. | Non-negative integer bytes, e.g. `67108864` |
-| `leg1_replay_timeout` | **Local TX** recovery timing; not negotiated. | Historical field name; optional floor on adaptive path no-progress detection. Stale paths pause assignment without automatic disconnection. Omitted / `"0s"`: adaptive. Explicit non-zero range: `100ms`–`5m`. Not a total recovery deadline. | Duration, e.g. `"0s"` or `"1s"` |
-| `memory_limit` | **Local TX and RX**, shared across sessions of one inbound/outbound; independently resolved. | Budget for actual storage, cache, metadata and reserved progress buffers, not unused advertised windows, RSS, or child buffers. Default: `min(512 MiB, MemAvailable * 0.5)`. Booster/ordinary window growth pauses at 7/8 and resumes below 3/4. | Non-negative integer or memory string, e.g. `268435456` or `"256MB"` |
-| `handshake_timeout` | **Local connection setup**, covering hello reads/writes rather than application TX/RX; not negotiated. | Client limits the hello exchange and each secondary dial-plus-handshake attempt; the initial preferred-child dial uses its own context/child settings. Server applies a deadline while handling each accepted leg's hello. Default: `10s`; range: `1s` to `1m`. | Duration, e.g. `"10s"` |
+| `aggregation_enabled` | Sender activation master switch. | True; false keeps new DATA on leg 0 except optional failover. | `true`, `false` |
+| `leg0_traffic_saving` | Sender path-selection policy. | False; true switches to leg 1 instead of aggregating after activation. Has no activation effect by itself. | `true`, `false` |
+| `activation_on_queue` | Sender **condition 1**. | True; leg 0 in-flight plus unsent bytes stay at least 80% of `queue_frames * frame_size` over the window. | `true`, `false` |
+| `activation_threshold_mbps` | Sender **condition 2**. | Average accepted application rate. Omitted: 150 Mbps, or 0 when byte trigger is enabled. Explicit 0 disables. | `0`, `120` |
+| `activation_after_bytes` | Sender **condition 3**. | Cumulative accepted application bytes; 0 or omitted disables. Subject to the following rate gate only. | `0`, `2097152`, `"2MB"` |
+| `activation_after_bytes_min_mbps` | Extra AND gate within condition 3. | 0; otherwise requires minimum average rate over a complete activation window as well as byte count. Does not gate conditions 1 or 2. | `0`, `5`, `120` |
+| `activation_window` | Sender queue/rate sampling interval. | 1 second; omitted or zero uses default. | `"1s"`, `"500ms"` |
+| `queue_frames` | Sender unsent capacity, in frame-size units. | 256; omitted/0 defaults, explicit range 8–4096. Product with frame_size ≤64 MiB. Not an in-flight or receive-frame count. This storage is part of send_buffer_bytes. | `64`, `256` |
+| `send_buffer_bytes` | Sender connection history, **both paths**, including unsent bytes. | Automatic on sender host; released only by cumulative Data ACK. Explicit range frame_size–512 MiB. | `0`, `67108864`, `"64MB"` |
+| `receive_window_bytes` | Receiver byte-window span constraining sender TX. | Automatic on receiver host; includes unread in-order bytes. Explicit range frame_size–512 MiB. No independent frame-count limit. | `0`, `134217728`, `"128MB"` |
+| `path_stall_timeout_min` | Sender no-progress detection floor on either leg. | Adaptive when omitted/zero; nonzero adds a lower bound. Range 100 ms–5 minutes. Not a fixed retransmission interval or a disconnect deadline. | `"0s"`, `"500ms"`, `"2s"` |
 
-### Server listen fields
+Conditions **1 OR 2 OR 3** activate leg 1; disabling all three prevents activation.
+The master switch overrides all conditions. Once activated, the direction remains
+activated for the connection lifetime; no low-rate switchback is performed.
 
-The inbound also accepts the standard sing-box listen options. They configure the
-local listener and do not override client outbound or child transport options.
+### Host-local fields and server listener
 
-| Field | Scope and peer interaction | Description | Accepted format / example |
+| Field | Scope and peer interaction | Default / meaning | Accepted format examples |
 | --- | --- | --- | --- |
-| `listen` / `listen_port` | Server-local listening endpoint for both bidirectional legs; not a multipath negotiation setting. | Both client-selected paths must be able to reach this listener. | `"10.66.67.1"` / `39000` |
-| `tcp_fast_open` | Server TCP listener setup, not the client's multipath early-write switch or the server's data scheduler. | Enables TCP Fast Open on the listening socket. Actual SYN data also requires support and configuration on the TCP peer/child transport and operating system. Default: `false`. | `true` or `false` |
+| `memory_limit` | Local inbound/outbound shared budget across TCP and recovery UDP sessions. Never negotiated or overridden by peer policy. | `min(512 MiB, MemAvailable * 0.5)`; omitted/0 automatic. Does not cap child transport buffers or process RSS. | `0`, `268435456`, `"256MB"` |
+| `handshake_timeout` | Local leg-handshake deadline, independent on each host. | 10 seconds; omitted/zero default. | `"10s"`, `"5s"` |
+| `listen`, `listen_port` | Server-local TCP and UDP listener. | Standard sing-box listen fields; reachable through both children when failover is used. | `"10.66.67.1"`, `39000` |
+| Server `tcp_fast_open` | Server TCP socket option, not a directional policy. | Standard listener option. | `true`, `false` |
 
-For `chunk_size`, `queue_frames`, reorder limits, replay bytes, and `memory_limit`,
-omission or `0` selects the default/automatic value; it does not disable buffering.
-For `activation_window`, `leg1_replay_timeout`, and `handshake_timeout`, omission or
-`"0s"` selects the default. This differs from the activation thresholds and the
-condition-3 minimum rate, where explicit `0` disables the corresponding trigger or
-gate. `bandwidth_mbps` no longer affects scheduling. For configuration migration,
-both inbound and outbound accept this legacy field, ignore its value, and emit one
-warning per node initialization. Remove it from existing configurations when convenient.
-Other unknown fields still fail strict validation; this does not enable old wire protocols.
+Memory strings use binary units: `"2MB"` and `"2 MiB"` both mean 2,097,152 bytes.
+Automatic buffer limits are ceilings, not preallocations. A smaller shared budget
+can apply backpressure before any one connection reaches its ceiling.
 
-Byte fields that accept a memory string use binary units: for example, `"2MB"`
-means 2 MiB. Bare integers remain supported and are interpreted as bytes.
+### Beta8 field removal
+
+Beta8 recognizes the following **old flat fields only to warn and ignore them**:
+`aggregation_enabled`, all five `activation_*` fields, `queue_frames`,
+`chunk_size`, `max_reorder_frames`, `max_reorder_bytes`,
+`leg1_replay_bytes`, `leg1_replay_timeout`, and `bandwidth_mbps`.
+The old names for frame/reorder/replay/weights are also ignored with a warning if
+placed inside a direction object. They are not migrated, used as defaults, or
+allowed to override new fields. Even an invalid legacy value is ignored.
+
+Reconfigure both directions on the client. Remove all directional tuning from
+the server. Replace chunk_size with frame_size, leg1_replay_bytes with
+send_buffer_bytes, max_reorder_bytes with receive_window_bytes, and
+leg1_replay_timeout with path_stall_timeout_min. There is no replacement frame-count
+receive limit and no `receive_window_frames` option. Unknown fields and invalid
+new-field values are errors. Upgrade both endpoints together; old wire versions
+are rejected immediately.
 
 ## Documentation
 

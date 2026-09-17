@@ -37,6 +37,7 @@ type Outbound struct {
 	aggregation      M.Socksaddr
 	tcpFastOpen      bool
 	cfg              coreConfig
+	policy           sessionPolicy
 	handshakeTimeout time.Duration
 	statusFile       string
 	status           *outboundStatus
@@ -47,16 +48,15 @@ type Outbound struct {
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathOutboundOptions) (adapter.Outbound, error) {
-	if len(options.DeprecatedBandwidthMbps) > 0 {
-		logger.Warn("bandwidth_mbps is obsolete and ignored; multipath uses automatic delivery-based scheduling; remove this field from the configuration")
-	}
+	warnDeprecated(logger, options.MultipathDeprecatedFlatOptions, "")
+	warnDeprecated(logger, options.Upload.MultipathDeprecatedNames, "upload.")
+	warnDeprecated(logger, options.Download.MultipathDeprecatedNames, "download.")
 	if len(options.Outbounds) != 2 {
 		return nil, E.New("multipath PoC requires exactly 2 outbounds")
 	}
 	if options.Server == "" || options.ServerPort == 0 {
 		return nil, E.New("missing multipath server/server_port")
 	}
-	activationAfterBytes := options.ActivationAfterBytes.Value()
 	preferred := options.Preferred
 	if preferred == "" {
 		preferred = options.Outbounds[0]
@@ -80,59 +80,25 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.FailoverEnabled && !slices.Contains(tags, udpTag) {
 		return nil, E.New("failover requires udp_outbound to be one of the two legs")
 	}
-	threshold := resolveActivationThreshold(options.ActivationThresholdMbps, activationAfterBytes)
-	window := time.Duration(options.ActivationWindow)
-	if window <= 0 {
-		window = time.Second
+	frameSize := options.FrameSize.Value()
+	if frameSize == 0 {
+		frameSize = 64 * 1024
 	}
-	chunkSize := int(options.ChunkSize)
-	if chunkSize == 0 {
-		chunkSize = 64 * 1024
+	if frameSize < 1024 || frameSize > maxFramePayload {
+		return nil, E.New("invalid frame_size")
 	}
-	if chunkSize < 1024 || chunkSize > maxFramePayload {
-		return nil, E.New("invalid chunk_size")
-	}
-	queueFrames := int(options.QueueFrames)
-	if queueFrames == 0 {
-		queueFrames = 256
-	}
-	if queueFrames < 8 || queueFrames > 4096 {
-		return nil, E.New("invalid queue_frames")
-	}
-	queueBytes := int64(chunkSize) * int64(queueFrames)
-	if queueBytes > maxQueueBytes {
-		return nil, E.New("chunk_size * queue_frames exceeds 64 MiB")
+	policy := sessionPolicy{Upload: policyFromOptions(options.Upload), Download: policyFromOptions(options.Download)}
+	if err := policy.validate(int(frameSize)); err != nil {
+		return nil, err
 	}
 	memoryLimit, automaticMemoryLimit, memoryErr := resolveMemoryLimit(options.MemoryLimit.Value())
 	if memoryErr != nil {
 		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
 	}
-	minimumMemory := minimumSessionMemory(coreConfig{QueueFrames: queueFrames, ChunkSize: chunkSize})
-	if memoryLimit < minimumMemory {
-		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
-	}
 	memory := newMemoryBudget(memoryLimit, automaticMemoryLimit)
-	maxReorderFrames := int(options.MaxReorderFrames)
-	if maxReorderFrames != 0 && (maxReorderFrames < 64 || maxReorderFrames > 65536) {
-		return nil, E.New("invalid max_reorder_frames")
-	}
-	maxReorderBufferBytes := int64(options.MaxReorderBytes)
-	if maxReorderBufferBytes == 0 {
-		maxReorderBufferBytes = automaticBufferLimit(memory, chunkSize)
-	}
-	if maxReorderBufferBytes < int64(chunkSize) || maxReorderBufferBytes > maxReorderBytes {
-		return nil, E.New("invalid max_reorder_bytes")
-	}
-	replayBytes := int64(options.Leg1ReplayBytes)
-	if replayBytes == 0 {
-		replayBytes = automaticBufferLimit(memory, chunkSize)
-	}
-	if replayBytes < int64(chunkSize) || replayBytes > maxReplayBytes {
-		return nil, E.New("invalid leg1_replay_bytes")
-	}
-	replayTimeout := time.Duration(options.Leg1ReplayTimeout)
-	if replayTimeout != 0 && (replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute) {
-		return nil, E.New("invalid leg1_replay_timeout")
+	cfg, err := configForPolicy(memory, int(frameSize), policy.Upload, policy.Download)
+	if err != nil {
+		return nil, err
 	}
 	handshakeTimeout := time.Duration(options.HandshakeTimeout)
 	if handshakeTimeout <= 0 {
@@ -159,23 +125,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		failoverEnabled:  options.FailoverEnabled,
 		failoverTimeout:  failoverTimeout,
 		failbackDelay:    failbackDelay,
-		cfg: coreConfig{
-			AggregationEnabled:             options.AggregationEnabled == nil || *options.AggregationEnabled,
-			ActivationOnQueue:              options.ActivationOnQueue == nil || *options.ActivationOnQueue,
-			ChunkSize:                      chunkSize,
-			QueueFrames:                    queueFrames,
-			QueueBytes:                     queueBytes,
-			ThresholdBytesPS:               threshold,
-			ActivationAfterBytes:           activationAfterBytes,
-			ActivationAfterBytesMinBytesPS: uint64(options.ActivationAfterBytesMinMbps) * 1000 * 1000 / 8,
-			ActivationWindow:               window,
-			MaxReorderFrames:               maxReorderFrames,
-			MaxReorderBytes:                maxReorderBufferBytes,
-			ReplayBytes:                    replayBytes,
-			ReplayTimeout:                  replayTimeout,
-			Memory:                         memory,
-		},
-	}, nil
+		cfg:              cfg,
+		policy:           policy}, nil
 }
 
 func (o *Outbound) Start() error {
@@ -223,6 +174,7 @@ func (o *Outbound) Start() error {
 			legTags:          [2]string{o.tags[0], o.tags[1]},
 			legTypes:         legTypes,
 			cfg:              o.cfg,
+			policy:           o.policy,
 			recovery:         o.recovery,
 		})
 		o.status.start(o.ctx, func(err error) {
@@ -284,7 +236,8 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		Session:       sessionID,
 		LegID:         0,
 		RequestStatus: o.statusFile != "",
-		ChunkSize:     uint32(o.cfg.ChunkSize),
+		FrameSize:     uint32(o.cfg.FrameSize),
+		Policy:        o.policy,
 		Destination:   destinationString,
 	})
 	if err != nil {
@@ -307,7 +260,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	}
 	statusSession := o.registerStatusSession(sessionID, destinationString, core, leg1PhaseConnecting)
 	o.logger.InfoContext(ctx, "multipath connection to ", destination, " via preferred ", o.tags[0])
-	go o.joinSecondary(core, sessionID, uint32(cfg.ChunkSize), destinationString, statusSession)
+	go o.joinSecondary(core, sessionID, uint32(cfg.FrameSize), destinationString, statusSession)
 	return appConn, nil
 }
 
@@ -325,7 +278,8 @@ func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr)
 		Session:       sessionID,
 		LegID:         0,
 		RequestStatus: o.statusFile != "",
-		ChunkSize:     uint32(o.cfg.ChunkSize),
+		FrameSize:     uint32(o.cfg.FrameSize),
+		Policy:        o.policy,
 		Destination:   destinationString,
 	}
 	fastOpenConn, err := newClientFastOpenConn(primaryConn, message, o.clientHandshakeDeadline(ctx))
@@ -347,8 +301,8 @@ func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr)
 		if responseErr != nil {
 			return responseErr
 		}
-		if response.ChunkSize != message.ChunkSize {
-			return E.New("multipath server changed accepted chunk size from ", message.ChunkSize, " to ", response.ChunkSize)
+		if response.FrameSize != message.FrameSize || response.PolicyDigest != message.Policy.digest() {
+			return E.New("multipath server did not confirm the requested frame size and directional policy")
 		}
 		return conn.SetDeadline(time.Time{})
 	}
@@ -361,7 +315,7 @@ func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr)
 	o.logger.InfoContext(ctx, "multipath fast-open connection to ", destination, " via preferred ", o.tags[0])
 	go func() {
 		if startErr := fastOpenConn.waitStarted(); startErr == nil {
-			o.joinSecondary(core, sessionID, uint32(cfg.ChunkSize), destinationString, statusSession)
+			o.joinSecondary(core, sessionID, uint32(cfg.FrameSize), destinationString, statusSession)
 		}
 	}()
 	return &earlyLogicalConn{
@@ -418,8 +372,8 @@ func (o *Outbound) clientHandshake(ctx context.Context, conn net.Conn, message h
 	if err != nil {
 		return err
 	}
-	if response.ChunkSize != message.ChunkSize {
-		return E.New("multipath server changed accepted chunk size from ", message.ChunkSize, " to ", response.ChunkSize)
+	if response.FrameSize != message.FrameSize || response.PolicyDigest != message.Policy.digest() {
+		return E.New("multipath server did not confirm the requested frame size and directional policy")
 	}
 	return conn.SetDeadline(time.Time{})
 }
@@ -453,7 +407,7 @@ func needsHandshakeForWrite(conn net.Conn) bool {
 	return loaded && earlyConn.NeedHandshake()
 }
 
-func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uint32, destination string, statusSession *statusSession) {
+func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, frameSize uint32, destination string, statusSession *statusSession) {
 	ctx := core.Context()
 	for {
 		select {
@@ -471,7 +425,8 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 				Session:       sessionID,
 				LegID:         1,
 				RequestStatus: o.statusFile != "",
-				ChunkSize:     chunkSize,
+				FrameSize:     frameSize,
+				Policy:        o.policy,
 				Destination:   destination,
 			})
 		}

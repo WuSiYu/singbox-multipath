@@ -27,7 +27,8 @@ type serverSession struct {
 	group         *recoveryServerGroup
 	id            [16]byte
 	destination   M.Socksaddr
-	chunkSize     uint32
+	frameSize     uint32
+	policy        sessionPolicy
 	requestStatus bool
 	core          *mpCore
 	appConn       net.Conn
@@ -52,63 +53,14 @@ type Inbound struct {
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathInboundOptions) (adapter.Inbound, error) {
-	if len(options.DeprecatedBandwidthMbps) > 0 {
-		logger.Warn("bandwidth_mbps is obsolete and ignored; multipath uses automatic delivery-based scheduling; remove this field from the configuration")
-	}
-	activationAfterBytes := options.ActivationAfterBytes.Value()
-	threshold := resolveActivationThreshold(options.ActivationThresholdMbps, activationAfterBytes)
-	window := time.Duration(options.ActivationWindow)
-	if window <= 0 {
-		window = time.Second
-	}
-	chunkSize := int(options.ChunkSize)
-	if chunkSize == 0 {
-		chunkSize = 64 * 1024
-	}
-	if chunkSize < 1024 || chunkSize > maxFramePayload {
-		return nil, E.New("invalid chunk_size")
-	}
-	queueFrames := int(options.QueueFrames)
-	if queueFrames == 0 {
-		queueFrames = 256
-	}
-	if queueFrames < 8 || queueFrames > 4096 {
-		return nil, E.New("invalid queue_frames")
-	}
-	queueBytes := int64(chunkSize) * int64(queueFrames)
-	if queueBytes > maxQueueBytes {
-		return nil, E.New("chunk_size * queue_frames exceeds 64 MiB")
-	}
+	warnDeprecated(logger, options.MultipathDeprecatedFlatOptions, "")
 	memoryLimit, automaticMemoryLimit, memoryErr := resolveMemoryLimit(options.MemoryLimit.Value())
 	if memoryErr != nil {
 		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
 	}
-	minimumMemory := minimumSessionMemory(coreConfig{QueueFrames: queueFrames, ChunkSize: chunkSize})
-	if memoryLimit < minimumMemory {
-		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
-	}
 	memory := newMemoryBudget(memoryLimit, automaticMemoryLimit)
-	maxReorderFrames := int(options.MaxReorderFrames)
-	if maxReorderFrames != 0 && (maxReorderFrames < 64 || maxReorderFrames > 65536) {
-		return nil, E.New("invalid max_reorder_frames")
-	}
-	maxReorderBufferBytes := int64(options.MaxReorderBytes)
-	if maxReorderBufferBytes == 0 {
-		maxReorderBufferBytes = automaticBufferLimit(memory, chunkSize)
-	}
-	if maxReorderBufferBytes < int64(chunkSize) || maxReorderBufferBytes > maxReorderBytes {
-		return nil, E.New("invalid max_reorder_bytes")
-	}
-	replayBytes := int64(options.Leg1ReplayBytes)
-	if replayBytes == 0 {
-		replayBytes = automaticBufferLimit(memory, chunkSize)
-	}
-	if replayBytes < int64(chunkSize) || replayBytes > maxReplayBytes {
-		return nil, E.New("invalid leg1_replay_bytes")
-	}
-	replayTimeout := time.Duration(options.Leg1ReplayTimeout)
-	if replayTimeout != 0 && (replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute) {
-		return nil, E.New("invalid leg1_replay_timeout")
+	if memoryLimit < minimumSessionMemory(coreConfig{FrameSize: 1024}) {
+		return nil, E.New("memory_limit is too small for one multipath session")
 	}
 	handshakeTimeout := time.Duration(options.HandshakeTimeout)
 	if handshakeTimeout <= 0 {
@@ -126,23 +78,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		statusWake:       make(chan struct{}, 1),
 		handshakeTimeout: handshakeTimeout,
 		recoveryGroups:   make(map[[16]byte]*recoveryServerGroup),
-		cfg: coreConfig{
-			AggregationEnabled:             options.AggregationEnabled == nil || *options.AggregationEnabled,
-			ActivationOnQueue:              options.ActivationOnQueue == nil || *options.ActivationOnQueue,
-			ChunkSize:                      chunkSize,
-			QueueFrames:                    queueFrames,
-			QueueBytes:                     queueBytes,
-			ThresholdBytesPS:               threshold,
-			ActivationAfterBytes:           activationAfterBytes,
-			ActivationAfterBytesMinBytesPS: uint64(options.ActivationAfterBytesMinMbps) * 1000 * 1000 / 8,
-			ActivationWindow:               window,
-			MaxReorderFrames:               maxReorderFrames,
-			MaxReorderBytes:                maxReorderBufferBytes,
-			ReplayBytes:                    replayBytes,
-			ReplayTimeout:                  replayTimeout,
-			Memory:                         memory,
-		},
-	}
+		cfg:              coreConfig{Memory: memory}}
 	i.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -231,7 +167,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	i.access.Lock()
 	session := i.sessions[hello.Session]
 	if session != nil {
-		if session.destination.String() != destination.String() || session.chunkSize != hello.ChunkSize || session.requestStatus != hello.RequestStatus || session.group != group {
+		if session.destination.String() != destination.String() || session.frameSize != hello.FrameSize || session.policy != hello.Policy || session.requestStatus != hello.RequestStatus || session.group != group {
 			i.access.Unlock()
 			i.rejectHello(conn, onClose, helloRejectSessionMismatch, E.New("multipath session parameters mismatch"))
 			return
@@ -247,7 +183,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			i.rejectHello(conn, onClose, helloRejectLegUnavailable, err)
 			return
 		}
-		if err = writeHelloResponse(conn, helloResponse{Status: helloStatusOK, ChunkSize: session.chunkSize}); err != nil {
+		if err = writeHelloResponse(conn, helloResponse{Status: helloStatusOK, FrameSize: session.frameSize, PolicyDigest: session.policy.digest()}); err != nil {
 			session.core.cancelLegReservation(hello.LegID)
 			N.CloseOnHandshakeFailure(conn, onClose, E.Cause(err, "write multipath hello response"))
 			return
@@ -276,18 +212,20 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			return
 		}
 	}
-	if int(hello.ChunkSize) > i.cfg.ChunkSize {
+	if err = hello.Policy.validate(int(hello.FrameSize)); err != nil {
 		i.access.Unlock()
-		i.rejectHello(conn, onClose, helloRejectChunkSizeLimit, E.New("multipath requested chunk size exceeds server limit: ", hello.ChunkSize, " > ", i.cfg.ChunkSize))
+		i.rejectHello(conn, onClose, helloRejectPolicy, err)
 		return
 	}
-
-	cfg := i.cfg
+	cfg, err := configForPolicy(i.cfg.Memory, int(hello.FrameSize), hello.Policy.Download, hello.Policy.Upload)
+	if err != nil {
+		i.access.Unlock()
+		i.rejectHello(conn, onClose, helloRejectPolicy, err)
+		return
+	}
 	if group != nil {
 		cfg.Recovery = &group.policy
 	}
-	cfg.ChunkSize = int(hello.ChunkSize)
-	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
 	cfg.OnProtocolError = func(err error) {
 		i.logger.ErrorContext(ctx, "multipath protocol error for ", destination, ": ", err)
 	}
@@ -331,7 +269,8 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		group:         group,
 		id:            hello.Session,
 		destination:   destination,
-		chunkSize:     uint32(cfg.ChunkSize),
+		frameSize:     uint32(cfg.FrameSize),
+		policy:        hello.Policy,
 		requestStatus: hello.RequestStatus,
 		core:          core,
 		appConn:       appConn,
@@ -344,7 +283,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 	i.sessions[hello.Session] = session
 	i.access.Unlock()
-	if err = writeHelloResponse(conn, helloResponse{Status: helloStatusOK, ChunkSize: session.chunkSize}); err != nil {
+	if err = writeHelloResponse(conn, helloResponse{Status: helloStatusOK, FrameSize: session.frameSize, PolicyDigest: session.policy.digest()}); err != nil {
 		core.cancelLegReservation(hello.LegID)
 		core.fail(err)
 		i.removeSession(hello.Session, session)

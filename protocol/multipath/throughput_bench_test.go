@@ -14,8 +14,8 @@ func BenchmarkCoreTCPThroughput(b *testing.B) {
 	for _, legs := range []int{1, 2} {
 		b.Run(fmt.Sprint(legs), func(b *testing.B) {
 			cfg := testCoreConfig()
-			cfg.ChunkSize, cfg.QueueFrames, cfg.QueueBytes = 65536, 256, 16<<20
-			cfg.MaxReorderFrames, cfg.MaxReorderBytes, cfg.ReplayBytes = 2048, 64<<20, 64<<20
+			cfg.FrameSize, cfg.QueueFrames, cfg.QueueBytes = 65536, 256, 16<<20
+			cfg.ReceiveWindowBytes, cfg.SendBufferBytes = 64<<20, 64<<20
 			left, app := newCore(context.Background(), cfg)
 			right, peer := newCore(context.Background(), cfg)
 			defer left.Close()

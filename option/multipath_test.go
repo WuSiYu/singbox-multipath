@@ -35,17 +35,17 @@ func TestMultipathByteOptions(t *testing.T) {
 		"outbounds": ["leg0", "leg1"],
 		"server": "127.0.0.1",
 		"server_port": 39000,
-		"activation_after_bytes": "2MB",
-		"activation_after_bytes_min_mbps": 120,
+		"upload": {"activation_after_bytes": "2MB",
+		"activation_after_bytes_min_mbps": 120},
 		"memory_limit": "64MB"
 	}`), &outbound); err != nil {
 		t.Fatal(err)
 	}
-	if outbound.ActivationAfterBytes.Value() != 2*byteformats.MiByte {
-		t.Fatalf("unexpected activation_after_bytes: %d", outbound.ActivationAfterBytes.Value())
+	if outbound.Upload.ActivationAfterBytes.Value() != 2*byteformats.MiByte {
+		t.Fatalf("unexpected activation_after_bytes: %d", outbound.Upload.ActivationAfterBytes.Value())
 	}
-	if outbound.ActivationAfterBytesMinMbps != 120 {
-		t.Fatalf("unexpected activation_after_bytes_min_mbps: %d", outbound.ActivationAfterBytesMinMbps)
+	if outbound.Upload.ActivationAfterBytesMinMbps != 120 {
+		t.Fatalf("unexpected activation_after_bytes_min_mbps: %d", outbound.Upload.ActivationAfterBytesMinMbps)
 	}
 	if outbound.MemoryLimit.Value() != 64*byteformats.MiByte {
 		t.Fatalf("unexpected memory_limit: %d", outbound.MemoryLimit.Value())
@@ -58,8 +58,8 @@ func TestMultipathByteOptions(t *testing.T) {
 	}`), &inbound); err != nil {
 		t.Fatal(err)
 	}
-	if inbound.ActivationAfterBytes.Value() != 4096 {
-		t.Fatalf("unexpected numeric activation_after_bytes: %d", inbound.ActivationAfterBytes.Value())
+	if len(inbound.DeprecatedActivationAfterBytes) == 0 {
+		t.Fatalf("missing ignored activation_after_bytes: %s", inbound.DeprecatedActivationAfterBytes)
 	}
 	if inbound.MemoryLimit.Value() != 8388608 {
 		t.Fatalf("unexpected numeric memory_limit: %d", inbound.MemoryLimit.Value())

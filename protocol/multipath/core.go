@@ -19,14 +19,14 @@ func newCore(parent context.Context, cfg coreConfig) (*mpCore, net.Conn) {
 }
 
 func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn, error) {
-	if cfg.ChunkSize <= 0 {
-		cfg.ChunkSize = 64 << 10
+	if cfg.FrameSize <= 0 {
+		cfg.FrameSize = 64 << 10
 	}
 	if cfg.QueueFrames <= 0 {
 		cfg.QueueFrames = 256
 	}
 	if cfg.QueueBytes <= 0 {
-		cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
+		cfg.QueueBytes = int64(cfg.FrameSize) * int64(cfg.QueueFrames)
 	}
 	if cfg.ActivationWindow <= 0 {
 		cfg.ActivationWindow = time.Second
@@ -38,11 +38,11 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 	if budget == nil {
 		budget = newMemoryBudget(1<<62, false)
 	}
-	if cfg.MaxReorderBytes <= 0 {
-		cfg.MaxReorderBytes = automaticBufferLimit(budget, cfg.ChunkSize)
+	if cfg.ReceiveWindowBytes <= 0 {
+		cfg.ReceiveWindowBytes = automaticBufferLimit(budget, cfg.FrameSize)
 	}
-	if cfg.ReplayBytes <= 0 {
-		cfg.ReplayBytes = automaticBufferLimit(budget, cfg.ChunkSize)
+	if cfg.SendBufferBytes <= 0 {
+		cfg.SendBufferBytes = automaticBufferLimit(budget, cfg.FrameSize)
 	}
 	reservation := minimumSessionMemory(cfg)
 	if !budget.reserveSession(reservation) {
@@ -61,13 +61,10 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 	}
 	// The first chunk is usable before feedback, preserving the early-write
 	// fast path. Advertised byte capacity is separate from allocated storage.
-	c.tx = stream.NewSender(uint64(cfg.ChunkSize))
-	capacity := uint64(cfg.MaxReorderBytes)
-	if cfg.MaxReorderFrames > 0 {
-		capacity = min(capacity, uint64(cfg.MaxReorderFrames)*uint64(cfg.ChunkSize))
-	}
+	c.tx = stream.NewSender(uint64(cfg.FrameSize))
+	capacity := uint64(cfg.ReceiveWindowBytes)
 	c.rx = stream.NewReceiver(capacity, c)
-	c.txReserve <- budget.takeReservedBuffer(cfg.ChunkSize)
+	c.txReserve <- budget.takeReservedBuffer(cfg.FrameSize)
 	app.onClose = c.closeApplication
 	app.onCloseRead = func() error { c.localReadClosed.Store(true); return app.readConn.Close() }
 	c.startWorkers(c.txLoop, c.rxLoop, c.pumpLoop, c.activationLoop)
@@ -210,9 +207,9 @@ func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
 		}
 		// Charge fixed metadata as well as payload; one-byte application writes
 		// cannot create an unbounded list of uncharged send records.
-		buffer, changed := c.memory.tryAcquirePrimary(c.cfg.ChunkSize + 512)
+		buffer, changed := c.memory.tryAcquirePrimary(c.cfg.FrameSize + 512)
 		if buffer != nil {
-			return stream.NewBuffer(buffer[:c.cfg.ChunkSize], func() { c.memory.release(buffer) }), nil
+			return stream.NewBuffer(buffer[:c.cfg.FrameSize], func() { c.memory.release(buffer) }), nil
 		}
 		select {
 		case <-c.done:
@@ -234,7 +231,7 @@ func (c *mpCore) waitTXSpace() bool {
 	for {
 		c.stateMu.Lock()
 		pending := c.tx.WriteNext - min(c.tx.Next, c.tx.WriteNext)
-		available := c.tx.Buffered()+uint64(c.cfg.ChunkSize) <= uint64(max(c.cfg.ReplayBytes, int64(c.cfg.ChunkSize))) && pending+uint64(c.cfg.ChunkSize) <= uint64(max(c.cfg.QueueBytes, int64(c.cfg.ChunkSize)))
+		available := c.tx.Buffered()+uint64(c.cfg.FrameSize) <= uint64(max(c.cfg.SendBufferBytes, int64(c.cfg.FrameSize))) && pending+uint64(c.cfg.FrameSize) <= uint64(max(c.cfg.QueueBytes, int64(c.cfg.FrameSize)))
 		c.stateMu.Unlock()
 		if available {
 			return !c.isDone()
@@ -258,7 +255,7 @@ func (c *mpCore) txLoop() {
 			return
 		}
 		n, readErr := c.txPipe.Read(buffer.Data)
-		if n > 0 && n <= c.cfg.ChunkSize/2 {
+		if n > 0 && n <= c.cfg.FrameSize/2 {
 			// Retain small writes in a size class instead of charging an entire
 			// maximum-sized slab until Data ACK. This is copying, not batching:
 			// a small first write is never delayed waiting for more application data.

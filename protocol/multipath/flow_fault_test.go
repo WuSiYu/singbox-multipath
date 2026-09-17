@@ -93,7 +93,7 @@ func TestFlowRegressionTransientStallMatrix(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/%s/%s", which, mode, delay), func(t *testing.T) {
 					synctest.Test(t, func(t *testing.T) {
 						cfg := flowTestConfig()
-						cfg.ReplayTimeout = time.Second
+						cfg.PathStallTimeoutMin = time.Second
 						left, app := newCore(context.Background(), cfg)
 						cfg.Memory = newMemoryBudget(1<<20, false)
 						right, peer := newCore(context.Background(), cfg)
@@ -163,8 +163,8 @@ func TestFlowRegressionIdleReturnUnderDelayedLeg0(t *testing.T) {
 		t.Run(delay.String(), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				cfg := flowTestConfig()
-				cfg.MaxReorderBytes = 32 << 10
-				cfg.ReplayTimeout = time.Second
+				cfg.ReceiveWindowBytes = 32 << 10
+				cfg.PathStallTimeoutMin = time.Second
 				left, app := newCore(context.Background(), cfg)
 				cfg.Memory = newMemoryBudget(1<<20, false)
 				right, peer := newCore(context.Background(), cfg)
@@ -201,7 +201,7 @@ func TestFlowRegressionIdleReturnUnderDelayedLeg0(t *testing.T) {
 func TestFlowRegressionExplicitOutOfOrderAndDuplicate(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := flowTestConfig()
-		cfg.MaxReorderBytes = 16 << 10
+		cfg.ReceiveWindowBytes = 16 << 10
 		core, app := newCore(context.Background(), cfg)
 		defer closeFlowCores(core)
 		a, b := net.Pipe()
@@ -261,7 +261,7 @@ func (c *auditControlGate) Write(p []byte) (int, error) {
 func TestFlowRegressionTransientControlStallThenIdle(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := flowTestConfig()
-		cfg.ReplayTimeout = time.Second
+		cfg.PathStallTimeoutMin = time.Second
 		left, app := newCore(context.Background(), cfg)
 		cfg.Memory = newMemoryBudget(1<<20, false)
 		right, peer := newCore(context.Background(), cfg)
@@ -349,7 +349,7 @@ func TestFlowRegressionGracefulEOFWithBufferedResponse(t *testing.T) {
 		t.Run(fmt.Sprint(slow), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				cfg := flowTestConfig()
-				cfg.MaxReorderBytes = 64 << 10
+				cfg.ReceiveWindowBytes = 64 << 10
 				left, app := newCore(context.Background(), cfg)
 				cfg.Memory = newMemoryBudget(1<<20, false)
 				right, peer := newCore(context.Background(), cfg)
@@ -401,7 +401,7 @@ func TestFlowRegressionGracefulEOFWithBufferedResponse(t *testing.T) {
 func TestFlowRegressionCloseDrainsAlreadyACKedReceiveData(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := flowTestConfig()
-		cfg.MaxReorderBytes = 64 << 10
+		cfg.ReceiveWindowBytes = 64 << 10
 		left, app := newCore(context.Background(), cfg)
 		cfg.Memory = newMemoryBudget(1<<20, false)
 		right, peer := newCore(context.Background(), cfg)

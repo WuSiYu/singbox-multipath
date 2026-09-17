@@ -85,7 +85,7 @@ func TestClientFastOpenCombinesHelloAndFirstFrame(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{1, 2, 3, 4},
 		LegID:       0,
-		ChunkSize:   64 * 1024,
+		FrameSize:   64 * 1024,
 		Destination: "1.1.1.1:80",
 	}
 	payload := []byte("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\n\r\n")
@@ -130,7 +130,7 @@ func TestClientFastOpenSupportsOpaqueLazyChild(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{5, 6, 7, 8},
 		LegID:       0,
-		ChunkSize:   64 * 1024,
+		FrameSize:   64 * 1024,
 		Destination: "1.1.1.1:443",
 	}
 	spy := new(fastOpenSpyConn)
@@ -158,7 +158,7 @@ func TestWriteHelloWithoutMultipathTFOUsesSeparateWrites(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{2, 4, 6, 8},
 		LegID:       0,
-		ChunkSize:   64 * 1024,
+		FrameSize:   64 * 1024,
 		Destination: "example.com:443",
 	}
 	spy := new(fastOpenSpyConn)
@@ -182,7 +182,7 @@ func TestClientFastOpenEmptyWriteSendsHelloOnly(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{9, 8, 7, 6},
 		LegID:       0,
-		ChunkSize:   64 * 1024,
+		FrameSize:   64 * 1024,
 		Destination: "example.com:443",
 	}
 	spy := new(fastOpenSpyConn)
@@ -207,7 +207,7 @@ func TestClientFastOpenCloseBeforeWriteUnblocksHandshake(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{4, 3, 2, 1},
 		LegID:       0,
-		ChunkSize:   64 * 1024,
+		FrameSize:   64 * 1024,
 		Destination: "example.com:80",
 	}
 	conn, err := newClientFastOpenConn(new(fastOpenSpyConn), message, time.Now().Add(time.Second))
@@ -235,7 +235,7 @@ func TestEarlyLogicalConnSendsPayloadWithHello(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{1, 3, 3, 7},
 		LegID:       0,
-		ChunkSize:   uint32(cfg.ChunkSize),
+		FrameSize:   uint32(cfg.FrameSize),
 		Destination: "example.com:443",
 	}
 	fastOpenConn, err := newClientFastOpenConn(clientWire, message, time.Now().Add(5*time.Second))
@@ -250,7 +250,7 @@ func TestEarlyLogicalConnSendsPayloadWithHello(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if response.ChunkSize != message.ChunkSize {
+		if response.FrameSize != message.FrameSize {
 			return errors.New("unexpected response chunk size")
 		}
 		return conn.SetDeadline(time.Time{})
@@ -280,7 +280,7 @@ func TestEarlyLogicalConnSendsPayloadWithHello(t *testing.T) {
 		if len(frame.data) > 0 {
 		}
 		if readErr == nil {
-			readErr = writeHelloResponse(serverWire, helloResponse{Status: helloStatusOK, ChunkSize: message.ChunkSize})
+			readErr = writeHelloResponse(serverWire, helloResponse{Status: helloStatusOK, FrameSize: message.FrameSize, PolicyDigest: message.Policy.digest()})
 		}
 		serverResult <- readErr
 	}()
@@ -308,7 +308,7 @@ func TestEarlyLogicalConnRejectClosesConnection(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{8, 6, 4, 2},
 		LegID:       0,
-		ChunkSize:   uint32(cfg.ChunkSize),
+		FrameSize:   uint32(cfg.FrameSize),
 		Destination: "example.com:80",
 	}
 	fastOpenConn, err := newClientFastOpenConn(clientWire, message, time.Now().Add(5*time.Second))
