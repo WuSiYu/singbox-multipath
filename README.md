@@ -407,7 +407,7 @@ override the owning host's shared memory budget.
 | `udp_outbound` | Client UDP preference; with failover, synchronized for server replies. | Preferred child. Without failover may name another outbound; with failover must name one of the two UDP-capable children. | `"leg0"`, `"leg1"` |
 | `server`, `server_port` | Destination reached through both child outbounds. | Required aggregation listener. | `"10.66.67.1"`, `39000` |
 | `tcp_fast_open` | Client logical-connection setup. | False; early-write when true. Also enable child TFO for TCP SYN data. Server listener TFO is a separate socket option. | `true`, `false` |
-| `frame_size` | Client-selected maximum DATA payload, shared by both TX/RX directions and confirmed by server. | 64 KiB; omitted/0 uses default, explicit nonzero range 1 KiB–1 MiB. Payload excludes headers; frames can be smaller and are read incrementally. | `65536`, `"64KB"`, `"16 KiB"` |
+| `frame_size` | Client-selected maximum DATA payload, shared by both TX/RX directions and confirmed by server. | 64 KiB; omitted/0 uses default, explicit nonzero range 1 KiB–1 MiB. Payload excludes headers; frames can be smaller and are read incrementally. | `65536`, `"64KB"`, `"16 KB"` |
 | `upload`, `download` | Client sends immutable directional policies to server. | Both default to aggregation enabled, traffic-saving disabled. Fields below. | `{"aggregation_enabled": false}` |
 | `status_file` | Client-local output path; hello requests peer sender telemetry. | Disabled when empty. One-second JSON status including policies, effective buffer ceilings and directional modes. | `"/var/run/multipath.json"` |
 | `failover_enabled` | Client-only shared TCP/UDP recovery; server always supports it. | False; no shared recovery probes/UDP relay associations when off. Independent of activation and traffic-saving. | `true`, `false` |
@@ -447,7 +447,9 @@ activated for the connection lifetime; no low-rate switchback is performed.
 | `listen`, `listen_port` | Server-local TCP and UDP listener. | Standard sing-box listen fields; reachable through both children when failover is used. | `"10.66.67.1"`, `39000` |
 | Server `tcp_fast_open` | Server TCP socket option, not a directional policy. | Standard listener option. | `true`, `false` |
 
-Memory strings use binary units: `"2MB"` and `"2 MiB"` both mean 2,097,152 bytes.
+Memory strings use binary units: `"2MB"` and `"2 MB"` both mean 2,097,152 bytes.
+Suffixes are case-insensitive `B`, `K`/`KB`, `M`/`MB`, through `E`/`EB`.
+The memory parser does not accept `KiB`/`MiB` suffixes or fractional quantities.
 Automatic buffer limits are ceilings, not preallocations. A smaller shared budget
 can apply backpressure before any one connection reaches its ceiling.
 
