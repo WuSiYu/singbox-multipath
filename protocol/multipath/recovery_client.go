@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -32,6 +31,7 @@ type recoveryClient struct {
 	udpWrite             [2]sync.Mutex
 	udpChallenges        [2]map[uint64]time.Time
 	packets              map[[16]byte]*recoveryPacketConn
+	tcpSessions          map[[16]byte]struct{}
 	changed              chan struct{}
 	tcpChoice, udpChoice byte
 	closed               bool
@@ -47,7 +47,7 @@ func newRecoveryClient(o *Outbound) (*recoveryClient, error) {
 		return nil, errMemoryLimit
 	}
 	ctx, cancel := context.WithCancel(o.ctx)
-	r := &recoveryClient{o: o, id: id, ctx: ctx, cancel: cancel, timeout: o.failoverTimeout, delay: o.failbackDelay, packets: make(map[[16]byte]*recoveryPacketConn), changed: make(chan struct{})}
+	r := &recoveryClient{o: o, id: id, ctx: ctx, cancel: cancel, timeout: o.failoverTimeout, delay: o.failbackDelay, packets: make(map[[16]byte]*recoveryPacketConn), tcpSessions: make(map[[16]byte]struct{}), changed: make(chan struct{})}
 	if o.udpTag == o.tags[1] {
 		r.preferredUDP = 1
 		r.udpChoice = 1
@@ -142,15 +142,17 @@ func (r *recoveryClient) runControl(id byte) {
 		}
 		cancel()
 		if err == nil {
+			var queries recoverySessionQueries
 			for r.ctx.Err() == nil {
 				message := r.controlMessage()
 				started := time.Now()
 				_ = conn.SetDeadline(started.Add(r.timeout))
-				if err = writeAll(conn, message[:]); err != nil {
+				if err = writeRecoveryRequest(conn, message, r.absentSessions(queries)); err != nil {
 					break
 				}
 				var response [recoveryControlSize]byte
-				if _, err = io.ReadFull(conn, response[:]); err != nil {
+				response, queries, err = readRecoveryResponse(conn)
+				if err != nil {
 					break
 				}
 				if response != message || time.Since(started) >= r.timeout {

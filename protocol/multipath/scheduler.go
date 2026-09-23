@@ -160,6 +160,9 @@ func (c *mpCore) handleWindow(message flowMessage) error {
 	}
 	if c.mappingHead == len(c.mappings) {
 		c.mappings = c.mappings[:0]
+		if cap(c.mappings) > 1024 {
+			c.mappings = nil
+		}
 		c.mappingHead = 0
 	} else if c.mappingHead >= 1024 && c.mappingHead*2 >= len(c.mappings) {
 		n := copy(c.mappings, c.mappings[c.mappingHead:])

@@ -156,6 +156,9 @@ func (s *Sender) Acknowledge(next, windowEnd uint64) error {
 	}
 	if s.head == len(s.segments) {
 		s.segments = s.segments[:0]
+		if cap(s.segments) > 1024 {
+			s.segments = nil
+		}
 		s.head = 0
 	} else if s.head >= 1024 && s.head*2 >= len(s.segments) {
 		n := copy(s.segments, s.segments[s.head:])

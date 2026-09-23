@@ -189,6 +189,7 @@ func (o *Outbound) Start() error {
 }
 
 func (o *Outbound) Close() error {
+	o.cfg.Memory.stopLogging()
 	if o.recovery != nil {
 		o.recovery.close()
 	}

@@ -18,7 +18,7 @@ The multipath protocol does not provide authentication or encryption by itself. 
 aggregation listener should only be reachable through trusted or authenticated child
 paths, such as a private WireGuard path and a Hysteria2 path.
 
-Both endpoints must use multipath protocol **v11** (beta8). Older protocol versions are
+Both endpoints must use multipath protocol **v12** (beta9). Older protocol versions are
 rejected; there is no compatibility mode.
 
 ### Data path and leg roles
@@ -139,10 +139,32 @@ time and bandwidth. Aggregation also cannot exceed shared physical bottlenecks.
 
 Payload storage, path/mapping metadata, reserved progress buffers, cache, and estimated
 session overhead share one budget per multipath inbound or outbound. The default is
-`min(512 MiB, MemAvailable * 0.5)`. New booster assignments and ordinary receive-window
+`min(512 MiB, available memory * 0.5)`. On Linux, available memory is the smaller of
+`MemAvailable` and the remaining capacity of visible cgroup v1/v2 memory limits,
+including ancestor groups. Explicit limits are not automatically reduced. New booster assignments and ordinary receive-window
 growth pause at 7/8 and resume below 3/4; head progress remains reserved. Advertised
 but unused window space is not an allocation. This budget is not process RSS and
 does not include child TCP/QUIC buffers.
+
+Checked-out cache entries release their old references immediately; sparse cache
+indexes shrink, and large sender/path indexes are released when fully acknowledged.
+Returning a buffer to the budget makes it reusable or collectible; it does not
+force Go to return physical pages to the OS immediately. No periodic forced GC is
+used. A high RSS alone is therefore not evidence of retained live buffers.
+
+On a 1 GiB host, a conservative starting point is `"memory_limit": "256MB"`, with
+headroom for child protocols, other processes and the OS. Multiple multipath
+instances have separate budgets. Large QUIC windows can add substantial memory
+outside them. If neither `GOMEMLIMIT` nor an existing runtime limit (including
+sing-box's `debug.memory_limit`) is set, starting the first multipath instance
+sets a process-wide Go **soft** limit to its current Go footprint plus 80% of
+detected available memory. All multipath instances share it. Stopping the last
+instance restores the previous setting unless it was subsequently overridden.
+The startup log reports the effective value and its source. There is no periodic
+memory polling or forced collection; normal Go GC uses this limit when needed.
+Explicit `GOMEMLIMIT`, including `GOMEMLIMIT=off`, takes precedence. A soft limit
+controls transient GC headroom, not RSS, and cannot fit a larger live working set
+into RAM; see the [Go GC guide](https://go.dev/doc/gc-guide#Memory_limit).
 
 Omitted receive/send-history ceilings are derived from the node budget: half of
 its ordinary allocation region (7/16 of the total, capped at 512 MiB and at least
@@ -203,6 +225,21 @@ IDs are retained for two minutes to reject delayed packets and joins; these reco
 also consume the shared budget. Group state expires after no control or UDP
 traffic for `max(2 minutes, 4 * failover_timeout + failback_delay)`.
 
+Recovery control heartbeats also verify TCP session ownership. The server rotates
+through at most 64 IDs per heartbeat; the client reports which IDs it no longer
+owns in the next request on that control connection. Only an explicit absence
+releases a server session. Lost control connections discard their outstanding
+query batch and retry through fresh queries, without accumulating a close queue.
+Client ownership begins before sending the first hello, including fast open, and
+ends when the logical core terminates. A connection still owned by the client is
+not removed merely because both data legs are temporarily unavailable.
+
+After the application calls full `Close`, buffered TX is allowed to drain, but
+two minutes without cumulative Data ACK progress ends the remaining session.
+This bounds abandoned FIN/ACK waits even if all control paths are unavailable.
+It does not apply to `CloseWrite`, `CloseRead`, or an open idle connection. Normal
+FIN acknowledgement completes the close immediately.
+
 The server's listening port must be reachable over **both TCP and UDP** through both
 children. The server's normal routing rules determine the final TCP and UDP exit.
 The protocol adds no authentication or encryption; keep this listener on trusted
@@ -247,7 +284,7 @@ error rather than a clean EOF, while local close interrupts pending application 
 
 ### Runtime telemetry
 
-When the client enables `status_file`, protocol v11 requests a compact sender-status
+When the client enables `status_file`, protocol v12 requests a compact sender-status
 frame from the server on the control path (leg 0 normally, leg 1 during failover).
 It reports the server-side downlink queues, replay and fallback counters,
 write stalls, and memory pressure for the matching logical session. Status frames
@@ -283,7 +320,7 @@ than guessing from EOF, reset or QUIC cancellation text. The marker is diagnosti
 only: it does not change FIN handling, scheduling, recovery or close timing.
 Status schema 4 includes error provenance, directional policies and sender modes. Confirmed endpoint-close events do not
 increment leg failure/event counters; other events, including unattributed and
-harmless closures, retain their existing counting semantics. Protocol v11 requires
+harmless closures, retain their existing counting semantics. Protocol v12 requires
 updating both endpoints.
 
 Remote scheduler rate estimates are not one-second throughput or physical link
@@ -385,7 +422,7 @@ buffers, congestion control, or UDP forwarding.
 | `upload` | Client | Server |
 | `download` | Server | Client |
 
-The client sends both policies and a common `frame_size` in the v11 hello.
+The client sends both policies and a common `frame_size` in the v12 hello.
 The server validates them and confirms a digest; it does not substitute its own
 directional defaults or negotiate a smaller frame. Both legs and all reattachments
 must match. Invalid policies or insufficient server session-admission memory reject
@@ -442,7 +479,7 @@ activated for the connection lifetime; no low-rate switchback is performed.
 
 | Field | Scope and peer interaction | Default / meaning | Accepted format examples |
 | --- | --- | --- | --- |
-| `memory_limit` | Local inbound/outbound shared budget across TCP and recovery UDP sessions. Never negotiated or overridden by peer policy. | `min(512 MiB, MemAvailable * 0.5)`; omitted/0 automatic. Does not cap child transport buffers or process RSS. | `0`, `268435456`, `"256MB"` |
+| `memory_limit` | Local inbound/outbound shared budget across TCP and recovery UDP sessions. Never negotiated or overridden by peer policy. | `min(512 MiB, available memory * 0.5)`; omitted/0 automatic. Linux uses the smaller of MemAvailable and visible cgroup remaining capacity. Does not cap child transport buffers or process RSS. | `0`, `268435456`, `"256MB"` |
 | `handshake_timeout` | Local leg-handshake deadline, independent on each host. | 10 seconds; omitted/zero default. | `"10s"`, `"5s"` |
 | `listen`, `listen_port` | Server-local TCP and UDP listener. | Standard sing-box listen fields; reachable through both children when failover is used. | `"10.66.67.1"`, `39000` |
 | Server `tcp_fast_open` | Server TCP socket option, not a directional policy. | Standard listener option. | `true`, `false` |

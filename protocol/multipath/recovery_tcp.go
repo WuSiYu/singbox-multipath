@@ -32,6 +32,17 @@ func (o *Outbound) dialRecovery(ctx context.Context, destination M.Socksaddr) (n
 	if err != nil {
 		return nil, err
 	}
+	// Publish ownership before any transport can create the server session,
+	// including an early-write hello. Keep it until the logical core terminates.
+	if err = o.recovery.registerTCP(session); err != nil {
+		return nil, err
+	}
+	retainedSession := false
+	defer func() {
+		if !retainedSession {
+			o.recovery.unregisterTCP(session)
+		}
+	}()
 	var conn net.Conn
 	var message helloMessage
 	var lazyCancel context.CancelFunc
@@ -105,7 +116,12 @@ func (o *Outbound) dialRecovery(ctx context.Context, destination M.Socksaddr) (n
 	}
 	status := o.registerStatusSession(session, destination.String(), core, leg1PhaseWaiting)
 	stop := context.AfterFunc(o.recovery.ctx, func() { core.Close() })
-	go func() { <-core.Done(); stop() }()
+	retainedSession = true
+	go func() {
+		<-core.Done()
+		stop()
+		o.recovery.unregisterTCP(session)
+	}()
 	// Joining before the first write would defeat lazy TFO. After it starts,
 	// either path may complete session creation; a server tombstone prevents a
 	// late retry from creating a second target connection for the same ID.

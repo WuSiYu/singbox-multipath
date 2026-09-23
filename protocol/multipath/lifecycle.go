@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const applicationCloseIdleTimeout = 2 * time.Minute
+
 func (c *mpCore) startWorkers(workers ...func()) bool {
 	c.workerMu.Lock()
 	defer c.workerMu.Unlock()
@@ -68,8 +70,26 @@ func (c *mpCore) closeApplication() error {
 }
 
 func (c *mpCore) finishApplicationClose() {
-	if c.localClosing.Load() && c.ackedFIN.Load() {
+	if !c.localClosing.Load() {
+		return
+	}
+	if c.ackedFIN.Load() {
 		c.terminate(io.EOF, frameTypeSessionClose)
+		return
+	}
+	// Full Close has relinquished the application handle. Permit buffered TX
+	// to drain while Data ACKs advance, but do not keep abandoned sessions
+	// forever after a lost FIN/ACK or both data paths disappearing. CloseWrite
+	// and an open idle connection never enter this timer.
+	now := time.Now()
+	c.stateMu.Lock()
+	if c.closeProgressAt.IsZero() || c.tx.Una > c.closeProgressACK {
+		c.closeProgressAt, c.closeProgressACK = now, c.tx.Una
+	}
+	expired := now.Sub(c.closeProgressAt) >= applicationCloseIdleTimeout
+	c.stateMu.Unlock()
+	if expired {
+		c.fail(errors.New("multipath application close drain timed out"))
 	}
 }
 

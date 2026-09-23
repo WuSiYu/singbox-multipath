@@ -1,6 +1,7 @@
 package multipath
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"io"
@@ -25,6 +26,7 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type serverSession struct {
 	group         *recoveryServerGroup
+	recoveryEntry *list.Element
 	id            [16]byte
 	destination   M.Socksaddr
 	frameSize     uint32
@@ -97,10 +99,10 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 	if err := i.listener.Start(); err != nil {
 		return err
 	}
-	i.cfg.Memory.startLogging(i.ctx, i.logger, "server")
-	go i.senderStatusLoop()
 	ctx, cancel := context.WithCancel(i.ctx)
 	i.recoveryCancel = cancel
+	i.cfg.Memory.startLogging(ctx, i.logger, "server")
+	go i.senderStatusLoop(ctx)
 	go i.recoveryMaintenance(ctx)
 	return nil
 }
@@ -109,6 +111,7 @@ func (i *Inbound) Close() error {
 	if i.recoveryCancel != nil {
 		i.recoveryCancel()
 	}
+	i.cfg.Memory.stopLogging()
 	i.recoveryMu.Lock()
 	i.recoveryClosed = true
 	var groups []*recoveryServerGroup
@@ -282,6 +285,13 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		return
 	}
 	i.sessions[hello.Session] = session
+	if group != nil {
+		group.mu.Lock()
+		if !group.closed {
+			session.recoveryEntry = group.tcpSessions.PushBack(hello.Session)
+		}
+		group.mu.Unlock()
+	}
 	i.access.Unlock()
 	if err = writeHelloResponse(conn, helloResponse{Status: helloStatusOK, FrameSize: session.frameSize, PolicyDigest: session.policy.digest()}); err != nil {
 		core.cancelLegReservation(hello.LegID)
@@ -331,6 +341,10 @@ func (i *Inbound) removeSession(id [16]byte, session *serverSession) {
 		delete(i.sessions, id)
 		if session.group != nil {
 			session.group.mu.Lock()
+			if session.recoveryEntry != nil {
+				session.group.tcpSessions.Remove(session.recoveryEntry)
+				session.recoveryEntry = nil
+			}
 			if !session.group.closed {
 				session.group.closedTCP[id] = time.Now()
 			}
@@ -359,19 +373,19 @@ func (i *Inbound) sendSenderStatus(now time.Time, force bool) {
 	}
 }
 
-func (i *Inbound) senderStatusLoop() {
+func (i *Inbound) senderStatusLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-i.ctx.Done():
+		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
 			i.sendSenderStatus(now, false)
 		case <-i.statusWake:
 			timer := time.NewTimer(100 * time.Millisecond)
 			select {
-			case <-i.ctx.Done():
+			case <-ctx.Done():
 				timer.Stop()
 				return
 			case <-timer.C:

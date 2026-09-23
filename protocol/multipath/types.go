@@ -243,6 +243,9 @@ type mpCore struct {
 	mappings        []dataMapping
 	mappingHead     int
 	feedbackDirty   bool
+
+	closeProgressAt  time.Time // stateMu; full Close drain only, never CloseWrite
+	closeProgressACK uint64
 }
 
 type dataMapping struct {

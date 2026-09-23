@@ -1,10 +1,10 @@
 package multipath
 
 import (
+	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -27,6 +27,7 @@ type recoveryServerGroup struct {
 	packets        map[[16]byte]*recoveryPacketConn
 	closedPackets  map[[16]byte]time.Time
 	closedTCP      map[[16]byte]time.Time
+	tcpSessions    list.List // round-robin ownership queries; protected by mu
 	lastSeen       time.Time
 	lease          time.Duration
 	closed         bool
@@ -81,13 +82,14 @@ func (i *Inbound) serveRecoveryControl(conn net.Conn, h helloMessage, onClose N.
 	if err := writeHelloResponse(conn, helloResponse{Status: helloStatusOK, FrameSize: 1, PolicyDigest: h.Policy.digest()}); err != nil {
 		return
 	}
+	var queries recoverySessionQueries
 	for {
 		g.mu.Lock()
 		lease := g.lease
 		g.mu.Unlock()
 		_ = conn.SetDeadline(time.Now().Add(lease))
-		var message [recoveryControlSize]byte
-		if _, err := io.ReadFull(conn, message[:]); err != nil {
+		message, absent, err := readRecoveryRequest(conn)
+		if err != nil || (queries.count < 64 && absent>>queries.count != 0) {
 			return
 		}
 		lease = time.Duration(binary.BigEndian.Uint64(message[18:26]))
@@ -99,7 +101,9 @@ func (i *Inbound) serveRecoveryControl(conn net.Conn, h helloMessage, onClose N.
 		g.lastSeen = time.Now()
 		g.mu.Unlock()
 		g.policy.update(binary.BigEndian.Uint64(message[8:16]), message[16], message[17])
-		if err := writeAll(conn, message[:]); err != nil {
+		g.releaseAbsentSessions(queries, absent)
+		queries = g.sessionQueries()
+		if err := writeRecoveryResponse(conn, message, queries); err != nil {
 			return
 		}
 	}

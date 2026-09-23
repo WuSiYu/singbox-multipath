@@ -65,6 +65,9 @@ type memoryBudget struct {
 	changed       chan struct{}
 	events        chan memoryPressureEvent
 	logOnce       sync.Once
+	logMu         sync.Mutex
+	logCancel     context.CancelFunc
+	logDone       chan struct{}
 }
 
 func resolveMemoryLimit(configured uint64) (int64, bool, error) {
@@ -75,7 +78,7 @@ func resolveMemoryLimit(configured uint64) (int64, bool, error) {
 		return int64(configured), false, nil
 	}
 	available, err := availableMemory()
-	if err != nil || available < 2 {
+	if err != nil {
 		return automaticMemoryLimitFallback, true, err
 	}
 	return automaticMemoryLimit(available), true, nil
@@ -119,14 +122,7 @@ func sessionMemoryReservation(cfg coreConfig) int64 {
 func (b *memoryBudget) tryAcquirePrimary(size int) ([]byte, <-chan struct{}) {
 	b.access.Lock()
 	defer b.access.Unlock()
-	if buffers := b.cache[size]; len(buffers) > 0 {
-		buffer := buffers[len(buffers)-1]
-		if len(buffers) == 1 {
-			delete(b.cache, size)
-		} else {
-			b.cache[size] = buffers[:len(buffers)-1]
-		}
-		b.cached -= int64(size)
+	if buffer := b.popCacheLocked(size); buffer != nil {
 		return buffer[:size], nil
 	}
 	if b.used+int64(size) > b.limit && b.cached > 0 {
@@ -143,14 +139,7 @@ func (b *memoryBudget) tryAcquirePrimary(size int) ([]byte, <-chan struct{}) {
 // The caller has already charged a reusable session scratch/TX reservation.
 func (b *memoryBudget) takeReservedBuffer(size int) []byte {
 	b.access.Lock()
-	if buffers := b.cache[size]; len(buffers) > 0 {
-		buffer := buffers[len(buffers)-1]
-		if len(buffers) == 1 {
-			delete(b.cache, size)
-		} else {
-			b.cache[size] = buffers[:len(buffers)-1]
-		}
-		b.cached -= int64(size)
+	if buffer := b.popCacheLocked(size); buffer != nil {
 		b.used -= int64(size)
 		b.updatePressureLocked(time.Now())
 		b.access.Unlock()
@@ -158,6 +147,28 @@ func (b *memoryBudget) takeReservedBuffer(size int) []byte {
 	}
 	b.access.Unlock()
 	return make([]byte, size)
+}
+
+// A slice's unused capacity is still scanned by GC. Clear checked-out entries
+// and shrink sparse indexes so neither payloads nor historical size-class peaks
+// can remain reachable outside the cache's byte accounting.
+func (b *memoryBudget) popCacheLocked(size int) []byte {
+	buffers := b.cache[size]
+	if len(buffers) == 0 {
+		return nil
+	}
+	last := len(buffers) - 1
+	buffer := buffers[last]
+	buffers[last] = nil
+	if last == 0 {
+		delete(b.cache, size)
+	} else if cap(buffers) > 16 && last <= cap(buffers)/4 {
+		b.cache[size] = append([][]byte(nil), buffers[:last]...)
+	} else {
+		b.cache[size] = buffers[:last]
+	}
+	b.cached -= int64(size)
+	return buffer
 }
 
 // Returning a reserved buffer does not release its session reservation. Cache
@@ -329,6 +340,21 @@ func (b *memoryBudget) startLogging(ctx context.Context, logger log.ContextLogge
 		return
 	}
 	b.logOnce.Do(func() {
+		ctx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		b.logMu.Lock()
+		b.logCancel, b.logDone = cancel, done
+		b.logMu.Unlock()
+		runtimeLimit, runtimeAutomatic, releaseGuard, runtimeErr := processMemoryGuard.acquire()
+		if runtimeErr != nil {
+			logger.WarnContext(ctx, "detect available memory for Go runtime guard: ", runtimeErr)
+		} else {
+			source := "configured"
+			if runtimeAutomatic {
+				source = "automatic"
+			}
+			logger.InfoContext(ctx, "Go runtime soft memory limit: limit=", byteformats.FormatMemoryBytes(uint64(runtimeLimit)), " source=", source, " scope=process (not RSS)")
+		}
 		snapshot := b.snapshot()
 		source := "configured"
 		if snapshot.Automatic {
@@ -344,6 +370,8 @@ func (b *memoryBudget) startLogging(ctx context.Context, logger log.ContextLogge
 			" cache_limit=", byteformats.FormatMemoryBytes(uint64(b.cacheLimit)),
 		)
 		go func() {
+			defer close(done)
+			defer releaseGuard()
 			for {
 				select {
 				case <-ctx.Done():
@@ -370,6 +398,19 @@ func (b *memoryBudget) startLogging(ctx context.Context, logger log.ContextLogge
 			}
 		}()
 	})
+}
+
+func (b *memoryBudget) stopLogging() {
+	if b == nil {
+		return
+	}
+	b.logMu.Lock()
+	cancel, done := b.logCancel, b.logDone
+	b.logMu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
 }
 
 func (b *memoryBudget) dropCacheLocked() {

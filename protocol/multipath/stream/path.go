@@ -121,6 +121,9 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 	}
 	if p.head == len(p.flights) {
 		p.flights = p.flights[:0]
+		if cap(p.flights) > 128 {
+			p.flights = nil
+		}
 		p.head = 0
 	} else if p.head >= 256 && p.head*2 >= len(p.flights) {
 		n := copy(p.flights, p.flights[p.head:])

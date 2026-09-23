@@ -14,7 +14,7 @@ var (
 )
 
 const (
-	helloVersion      byte = 11
+	helloVersion      byte = 12
 	helloFlagStatus   byte = 1 << 0
 	helloFlagRecovery byte = 1 << 1
 	helloFlagControl  byte = 1 << 2
@@ -178,7 +178,7 @@ func readHello(conn net.Conn) (helloMessage, error) {
 		return message, err
 	}
 	if string(header[0:4]) != string(helloMagic[:]) || header[4] != helloVersion {
-		return message, errors.New("invalid multipath hello (requires protocol v11)")
+		return message, errors.New("invalid multipath hello (requires protocol v12)")
 	}
 	if _, err := io.ReadFull(conn, header[7:]); err != nil {
 		return message, err
@@ -261,7 +261,7 @@ func readHelloResponse(conn net.Conn) (helloResponse, error) {
 		return response, err
 	}
 	if string(header[0:4]) != string(responseMagic[:]) || header[4] != helloVersion {
-		return response, errors.New("invalid multipath hello response (requires protocol v11)")
+		return response, errors.New("invalid multipath hello response (requires protocol v12)")
 	}
 	if _, err := io.ReadFull(conn, header[7:]); err != nil {
 		return response, err

@@ -17,6 +17,84 @@ func TestAutomaticMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestCacheCheckoutReleasesReferencesAndSparseIndex(t *testing.T) {
+	for _, reserved := range []bool{false, true} {
+		budget := newMemoryBudget(32<<20, false)
+		var buffers [][]byte
+		for range 1024 {
+			buffers = append(buffers, acquireTestMemory(t, budget, 1200))
+		}
+		for _, p := range buffers {
+			budget.release(p)
+		}
+		original := budget.cache[1200]
+		for range len(original) - 1 {
+			if reserved {
+				_ = budget.takeReservedBuffer(1200)
+			} else {
+				_ = acquireTestMemory(t, budget, 1200)
+			}
+		}
+		cached := budget.cache[1200]
+		if len(cached) != 1 || cap(cached) > 16 {
+			t.Fatalf("sparse cache index retained: reserved=%v len=%d cap=%d", reserved, len(cached), cap(cached))
+		}
+		for _, list := range [][][]byte{original, cached} {
+			// Original indexes may retain the entries copied during compaction,
+			// but every slot beyond their old logical end must have been cleared.
+			for _, p := range list[len(list):cap(list)] {
+				if p != nil {
+					t.Fatal("hidden payload reference")
+				}
+			}
+		}
+		if original[len(original)-1] != nil {
+			t.Fatal("popped slot still owns payload")
+		}
+		if budget.snapshot().CachedBytes != 1200 {
+			t.Fatal("cache accounting")
+		}
+	}
+}
+
+func TestCacheChangingSizesRemainBounded(t *testing.T) {
+	budget := newMemoryBudget(2<<20, false)
+	var held [][]byte
+	for round := range 128 {
+		size := 1200 + round*16
+		count := int((budget.cacheLimit - budget.snapshot().CachedBytes) / int64(size))
+		var fresh [][]byte
+		for range count {
+			fresh = append(fresh, acquireTestMemory(t, budget, size))
+		}
+		for _, p := range fresh {
+			budget.release(p)
+		}
+		for _, p := range held {
+			budget.release(p)
+		}
+		held = nil
+		var reachable int64
+		for _, list := range budget.cache {
+			for index, p := range list[:cap(list)] {
+				if index >= len(list) && p != nil {
+					t.Fatal("cache hidden tail reference")
+				}
+				reachable += int64(cap(p))
+			}
+			if cap(list) > 16 && cap(list) >= len(list)*4 {
+				t.Fatal("unbounded sparse cache index")
+			}
+		}
+		if reachable != budget.snapshot().CachedBytes {
+			t.Fatal("reachable payload is not accounted")
+		}
+		for range count - 1 {
+			held = append(held, acquireTestMemory(t, budget, size))
+		}
+	}
+}
+
 func TestIdleSessionsDoNotAllocateAdvertisedWindows(t *testing.T) {
 	cfg := testCoreConfig()
 	cfg.FrameSize, cfg.QueueFrames, cfg.QueueBytes = 65536, 256, 16<<20

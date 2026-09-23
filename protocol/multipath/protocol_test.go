@@ -206,7 +206,7 @@ func TestHelloRejectsBoosterStatus(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionElevenHello(t *testing.T) {
+func TestProtocolVersionTwelveHello(t *testing.T) {
 	encoded, err := encodeHello(helloMessage{
 		LegID:       0,
 		FrameSize:   64 * 1024,
@@ -215,12 +215,12 @@ func TestProtocolVersionElevenHello(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded[:4]) != "SMPA" || encoded[4] != 11 {
+	if string(encoded[:4]) != "SMPA" || encoded[4] != 12 {
 		t.Fatalf("unexpected multipath protocol header: %q version=%d", encoded[:4], encoded[4])
 	}
 }
 
-func TestWriteHelloResponseRejectsInvalidV11Values(t *testing.T) {
+func TestWriteHelloResponseRejectsInvalidValues(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -229,12 +229,12 @@ func TestWriteHelloResponseRejectsInvalidV11Values(t *testing.T) {
 		{Status: 2, FrameSize: 64 * 1024},
 	} {
 		if err := writeHelloResponse(client, response); err == nil {
-			t.Fatalf("accepted invalid v11 hello response: %+v", response)
+			t.Fatalf("accepted invalid hello response: %+v", response)
 		}
 	}
 }
 
-func TestReadHelloResponseRejectsInvalidV11Values(t *testing.T) {
+func TestReadHelloResponseRejectsInvalidValues(t *testing.T) {
 	tests := []struct {
 		name    string
 		version byte
@@ -248,6 +248,7 @@ func TestReadHelloResponseRejectsInvalidV11Values(t *testing.T) {
 		{"v8 response", 8, helloStatusOK, 64 * 1024},
 		{"v9 response", 9, helloStatusOK, 64 * 1024},
 		{"v10 response", 10, helloStatusOK, 64 * 1024},
+		{"v11 response", 11, helloStatusOK, 64 * 1024},
 		{"unknown status", helloVersion, 2, 64 * 1024},
 		{"missing rejection reason", helloVersion, helloStatusRejected, 0},
 		{"unknown rejection reason", helloVersion, helloStatusRejected, 255},
@@ -267,7 +268,7 @@ func TestReadHelloResponseRejectsInvalidV11Values(t *testing.T) {
 				writeDone <- writeAll(server, header[:])
 			}()
 			if _, err := readHelloResponse(client); err == nil {
-				t.Fatal("accepted invalid v11 hello response")
+				t.Fatal("accepted invalid hello response")
 			}
 			client.Close()
 			if err := <-writeDone; err != nil && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
@@ -278,7 +279,7 @@ func TestReadHelloResponseRejectsInvalidV11Values(t *testing.T) {
 }
 
 func TestReadHelloRejectsOldProtocolVersions(t *testing.T) {
-	for _, version := range []byte{4, 5, 6, 7, 8, 9, 10} {
+	for _, version := range []byte{4, 5, 6, 7, 8, 9, 10, 11} {
 		header, err := encodeHelloHeader(helloMessage{LegID: 0, FrameSize: 64 * 1024, Destination: "example.com:443"})
 		if err != nil {
 			t.Fatal(err)
