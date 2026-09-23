@@ -128,7 +128,7 @@ func (o *Outbound) dialRecovery(ctx context.Context, destination M.Socksaddr) (n
 	if early != nil {
 		retainDialContext = true
 	}
-	go func() {
+	if !core.startWorkers(func() {
 		if early != nil {
 			_ = early.waitStarted()
 			lazyCancel()
@@ -136,9 +136,12 @@ func (o *Outbound) dialRecovery(ctx context.Context, destination M.Socksaddr) (n
 		}
 		createDeadline := time.Now().Add(o.handshakeTimeout)
 		for id := byte(0); id < 2; id++ {
-			go o.rejoinRecovery(core, session, id, destination.String(), &confirmed, createDeadline, status)
+			core.startWorkers(func() { o.rejoinRecovery(core, session, id, destination.String(), &confirmed, createDeadline, status) })
 		}
-	}()
+	}) && early != nil {
+		lazyCancel()
+		cancel()
+	}
 	if early != nil {
 		return &earlyLogicalConn{Conn: app, core: core, primary: early}, nil
 	}

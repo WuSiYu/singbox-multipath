@@ -239,6 +239,9 @@ two minutes without cumulative Data ACK progress ends the remaining session.
 This bounds abandoned FIN/ACK waits even if all control paths are unavailable.
 It does not apply to `CloseWrite`, `CloseRead`, or an open idle connection. Normal
 FIN acknowledgement completes the close immediately.
+Pending child handshakes are interrupted when their context is canceled. Session
+cleanup waits for secondary-join and recovery-rejoin workers before returning
+their memory reservation.
 
 The server's listening port must be reachable over **both TCP and UDP** through both
 children. The server's normal routing rules determine the final TCP and UDP exit.

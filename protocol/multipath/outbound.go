@@ -261,7 +261,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	}
 	statusSession := o.registerStatusSession(sessionID, destinationString, core, leg1PhaseConnecting)
 	o.logger.InfoContext(ctx, "multipath connection to ", destination, " via preferred ", o.tags[0])
-	go o.joinSecondary(core, sessionID, uint32(cfg.FrameSize), destinationString, statusSession)
+	core.startWorkers(func() { o.joinSecondary(core, sessionID, uint32(cfg.FrameSize), destinationString, statusSession) })
 	return appConn, nil
 }
 
@@ -314,11 +314,11 @@ func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr)
 	}
 	statusSession := o.registerStatusSession(sessionID, destinationString, core, leg1PhaseWaiting)
 	o.logger.InfoContext(ctx, "multipath fast-open connection to ", destination, " via preferred ", o.tags[0])
-	go func() {
+	core.startWorkers(func() {
 		if startErr := fastOpenConn.waitStarted(); startErr == nil {
 			o.joinSecondary(core, sessionID, uint32(cfg.FrameSize), destinationString, statusSession)
 		}
-	}()
+	})
 	return &earlyLogicalConn{
 		Conn:    appConn,
 		core:    core,
@@ -355,7 +355,24 @@ func (o *Outbound) registerStatusSession(sessionID [16]byte, destination string,
 	return o.status.addSession(sessionID, destination, core, phase)
 }
 
-func (o *Outbound) clientHandshake(ctx context.Context, conn net.Conn, message helloMessage) error {
+func (o *Outbound) clientHandshake(ctx context.Context, conn net.Conn, message helloMessage) (err error) {
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	// A socket deadline does not observe early context cancellation. Close a
+	// pending hello immediately when its owner disappears, but detach the
+	// callback before handing an established connection back to the caller.
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		close(canceled)
+	})
+	defer func() {
+		if !stop() {
+			<-canceled
+			err = ctx.Err()
+		}
+	}()
 	deadline := o.clientHandshakeDeadline(ctx)
 	deadlineSet, err := setClientHandshakeDeadline(conn, deadline)
 	if err != nil {
