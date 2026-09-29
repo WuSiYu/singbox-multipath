@@ -722,6 +722,15 @@ func activationStatus(info activationInfo, at time.Time) *statusActivation {
 	}
 }
 
+func attachedDataMode(mode uint64, boosterPresent bool) string {
+	if (mode == 2 || mode == 3) && !boosterPresent {
+		// Local absence invalidates an active remote mode but does not prove
+		// which fallback policy the peer has selected in the meantime.
+		return "unknown"
+	}
+	return dataModeName(mode)
+}
+
 func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	s.sampleAccess.Lock()
 	defer s.sampleAccess.Unlock()
@@ -906,12 +915,17 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	var latestRemoteFailure [2]time.Time
 	for _, item := range snapshots {
 		snapshot := item.snapshot
-		logical.UploadStates[dataModeName(snapshot.dataMode)]++
-		if snapshot.peerSender.status.Sequence > 0 && now.Sub(snapshot.peerSender.receivedAt) <= 3*time.Second {
-			logical.DownloadStates[dataModeName(snapshot.peerSender.status.DataMode)]++
-		} else {
-			logical.DownloadStates["unknown"]++
+		// A mode sample may predate a local path detach. Validate it against
+		// this session, not another flow's attached booster or nonzero speed.
+		uploadMode := attachedDataMode(snapshot.dataMode, snapshot.legPresent[1])
+		remote := snapshot.peerSender
+		remoteFresh := remote.status.Sequence > 0 && now.Sub(remote.receivedAt) <= 3*time.Second
+		downloadMode := "unknown"
+		if remoteFresh {
+			downloadMode = attachedDataMode(remote.status.DataMode, snapshot.legPresent[1])
 		}
+		logical.UploadStates[uploadMode]++
+		logical.DownloadStates[downloadMode]++
 		logical.SendBufferBytes += snapshot.replayBytes
 		logical.LocalSender.SendBufferBytes += snapshot.replayBytes
 		s.peakReplayLocal = max(s.peakReplayLocal, snapshot.replayPeak)
@@ -919,7 +933,6 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		logical.ReorderFrames += snapshot.reorderFrames
 		logical.ReorderPeakBytes = max(logical.ReorderPeakBytes, snapshot.reorderPeak)
 		logical.ReorderPeakFrames = max(logical.ReorderPeakFrames, snapshot.reorderFPeak)
-		remote := snapshot.peerSender
 		if remote.status.Sequence > 0 {
 			logical.RemoteSender.Available = true
 			logical.RemoteSender.SendBufferBytes += int64(remote.status.SendBufferBytes)
@@ -940,15 +953,16 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 				logical.RemoteSender.MemoryBackpressureEvents = remote.status.MemoryBackpressureEvents
 			}
 		}
-		if snapshot.dataMode == 2 {
+		if uploadMode == "aggregate" {
 			logical.TXAggregatingConnections++
-		} else if snapshot.dataMode == 1 {
+		} else if uploadMode == "leg0" {
 			logical.PreferredOnlyConnections++
 		}
-		if remote.status.Sequence > 0 && now.Sub(remote.receivedAt) <= 3*time.Second && remote.status.DataMode == 2 {
+		if downloadMode == "aggregate" {
 			logical.RXAggregatingConnections++
 		}
-		if snapshot.active && !snapshot.legPresent[1] {
+		remoteActive := remoteFresh && (remote.status.Flags&senderStatusFlagActive != 0 || remote.status.DataMode >= 2 && remote.status.DataMode <= 4)
+		if (snapshot.active || remoteActive) && !snapshot.legPresent[1] {
 			logical.BoosterDegraded++
 		}
 		if snapshot.activationAt.After(latestActivation) {

@@ -158,6 +158,11 @@ func TestMultipathRecoveryClientDisabledHasNoProbes(t *testing.T) {
 
 func recoveryTestInstance(t *testing.T, fast, secondaryUDP, startDown bool, useHY2 ...bool) (*box.Box, *atomic.Bool, string) {
 	t.Helper()
+	return recoveryTestInstanceWithDelay(t, fast, secondaryUDP, startDown, 2*time.Second, useHY2...)
+}
+
+func recoveryTestInstanceWithDelay(t *testing.T, fast, secondaryUDP, startDown bool, failbackDelay time.Duration, useHY2 ...bool) (*box.Box, *atomic.Bool, string) {
+	t.Helper()
 	down := new(atomic.Bool)
 	down.Store(startDown)
 	registry := include.OutboundRegistry()
@@ -203,7 +208,7 @@ func recoveryTestInstance(t *testing.T, fast, secondaryUDP, startDown bool, useH
 	out := opts.Outbounds[len(opts.Outbounds)-1].Options.(*option.MultipathOutboundOptions)
 	out.FailoverEnabled = true
 	out.FailoverTimeout = badoption.Duration(time.Second)
-	out.FailbackDelay = badoption.Duration(2 * time.Second)
+	out.FailbackDelay = badoption.Duration(failbackDelay)
 	disabled := false
 	out.Upload.AggregationEnabled = &disabled
 	out.Download.AggregationEnabled = &disabled
@@ -398,6 +403,27 @@ func testMultipathRecoveryBlackhole(t *testing.T, hy2 bool, saving ...bool) {
 				ln.Close()
 				targets.Wait()
 			})
+		}
+	}
+}
+
+func TestMultipathRecoveryFirstHealthyReturn(t *testing.T) {
+	for _, hy2 := range []bool{false, true} {
+		for _, fast := range []bool{false, true} {
+			for _, secondaryUDP := range []bool{false, true} {
+				t.Run(fmt.Sprintf("hy2=%t/tfo=%t/udp_leg1=%t", hy2, fast, secondaryUDP), func(t *testing.T) {
+					_, down, status := recoveryTestInstanceWithDelay(t, fast, secondaryUDP, true, 30*time.Second, hy2)
+					recoveryWaitStatus(t, status, 1, 1)
+					down.Store(false)
+					udp := 0
+					if secondaryUDP {
+						udp = 1
+					}
+					// The helper allows 8s for actual probing/reconnect and status
+					// publication, well below the configured 30s recovery hold.
+					recoveryWaitStatus(t, status, 0, udp)
+				})
+			}
 		}
 	}
 }

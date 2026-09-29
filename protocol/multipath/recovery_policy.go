@@ -50,6 +50,7 @@ type recoveryHealth struct {
 	lastTCP, lastUDP time.Time
 	since            time.Time
 	healthy          bool
+	hadFailure       bool
 }
 
 // Each reply proves a recently issued challenge. Time spent behind a stalled
@@ -60,6 +61,11 @@ func (h *recoveryHealth) refresh(now time.Time, timeout time.Duration) {
 		h.since = now
 	}
 	if !good {
+		// An unanswered startup probe is not a recovered-path failure. Once
+		// a confirmed healthy path fails, all later returns use the hold.
+		if h.healthy {
+			h.hadFailure = true
+		}
 		h.since = time.Time{}
 	}
 	h.healthy = good
@@ -75,7 +81,7 @@ func recoveryChoice(current, preferred byte, health [2]recoveryHealth, now time.
 		}
 		return current
 	}
-	if health[preferred].healthy && now.Sub(health[preferred].since) >= delay {
+	if health[preferred].healthy && (!health[preferred].hadFailure || now.Sub(health[preferred].since) >= delay) {
 		return preferred
 	}
 	return current

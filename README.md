@@ -196,6 +196,10 @@ transports have fresh challenge replies from the multipath server. A full failur
 timeout declares it unavailable; a delayed old reply does not establish recovery.
 Checks normally run once per second. Detection and session reattachment add time
 to the configured timeout; it is not a bound on application-visible interruption.
+At startup, either confirmed healthy path can carry traffic immediately. The
+preferred path is selected as soon as it first becomes healthy, without a failback
+hold. Once that path has been healthy and then failed, subsequent returns require
+the configured stability period. This applies separately to TCP and UDP preference.
 
 When leg 0 fails, existing TCP sessions retain their target connections, byte
 sequence numbers, receive windows and unacknowledged send history. Data, cumulative
@@ -326,6 +330,12 @@ increment leg failure/event counters; other events, including unattributed and
 harmless closures, retain their existing counting semantics. Protocol v12 requires
 updating both endpoints.
 
+Current aggregate and traffic-saving modes require an attached leg 1 on the same
+client connection. A fresh remote mode cannot override local path absence; the
+direction becomes unknown and an activated connection with no booster is reported
+as degraded. An attached idle connection remains eligible regardless of its current
+transfer rate. Remote modes older than three seconds are unknown.
+
 Remote scheduler rate estimates are not one-second throughput or physical link
 capacity. DATA-feedback RTT follows the selected data leg outward and leg0 for
 the return feedback. Stall detection need not result in reinjection, and sender
@@ -452,7 +462,7 @@ override the owning host's shared memory budget.
 | `status_file` | Client-local output path; hello requests peer sender telemetry. | Disabled when empty. One-second JSON status including policies, effective buffer ceilings and directional modes. | `"/var/run/multipath.json"` |
 | `failover_enabled` | Client-only shared TCP/UDP recovery; server always supports it. | False; no shared recovery probes/UDP relay associations when off. Independent of activation and traffic-saving. | `true`, `false` |
 | `failover_timeout` | Client path failure detection; sent to recovery group. | 5 seconds; requires failover enabled. | `"5s"`, `"10s"` |
-| `failback_delay` | Client preferred-path stability hold; synchronized with server. | 30 seconds; requires failover enabled. It restores normal policy, not forced leg 0 DATA in an activated saving direction. | `"30s"`, `"1m"` |
+| `failback_delay` | Client preferred-path stability hold after a previously healthy path fails; synchronized with server. | 30 seconds; requires failover enabled. First healthy discovery at startup has no hold. It restores normal policy, not forced leg 0 DATA in an activated saving direction. | `"30s"`, `"1m"` |
 
 ### Fields inside upload and download
 
