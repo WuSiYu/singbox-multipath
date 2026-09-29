@@ -1,356 +1,33 @@
-# sing-box
+# singbox-multipath
 
-The universal proxy platform.
+[中文](#中文) · [English](#english)
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/sing-box.svg)](https://repology.org/project/sing-box/versions)
+## 中文
 
-## Experimental multipath
+singbox-multipath 基于 sing-box，在代理层把两条已有路径组合成一条可靠 TCP 字节流，让**单条 TCP 连接**也能利用多条路径的带宽，而不只是把不同连接分配给不同节点。应用和中间代理节点无需支持 MPTCP；客户端和聚合服务端需要运行本项目。
 
-This branch adds an experimental `multipath` inbound and outbound. It carries one
-logical TCP byte stream over exactly two existing reliable outbounds. Traffic starts
-on the preferred, stable low-latency leg (leg 0); the secondary leg (leg 1) joins the
-data path after the configured traffic or queue threshold is reached. This is an
-application-layer aggregation protocol, not kernel MPTCP. UDP is not aggregated.
-By default it uses one child directly; optional failover relays it through the
-same multipath server on either child while retaining the server's UDP socket.
+### 机制概览
 
-The multipath protocol does not provide authentication or encryption by itself. The
-aggregation listener should only be reachable through trusted or authenticated child
-paths, such as a private WireGuard path and a Hysteria2 path.
+- **leg0：首选路径。** 适合稳定、低延迟的线路，负责常规建连、控制消息和激活前的数据传输。
+- **leg1：扩容路径（booster）。** 达到触发条件后参与传输；调度依据实际交付反馈动态分配数据，不需要手工设置带宽比例。两端按统一字节序号重组数据，应用看到的仍是有序字节流。
+- **聚合或切换。** 默认激活后同时使用两条路径；启用 `leg0_traffic_saving` 后改为主要使用 leg1 发送新数据，节省 leg0 流量。控制、补发和故障回退仍可能使用 leg0。
+- **可选故障接管。** `failover_enabled` 允许 leg0 失效时由 leg1 承接 TCP 和 UDP，恢复后回到各自首选路径；默认关闭。UDP 不做聚合，也不封装进 MP 的可靠 TCP 字节流。
 
-Both endpoints must use multipath protocol **v12** (beta9). Older protocol versions are
-rejected; there is no compatibility mode.
+上传和下载分别配置、分别激活。慢 leg1 不会直接堵住 leg0 的发送线程，但有序交付仍可能等待缺失字节；聚合不保证任何网络下都比单 leg0 更快。本项目借鉴 MPTCP 的连接级机制，并不是内核 MPTCP，也不兼容其线协议。
 
-### Data path and leg roles
+详细说明：[中文机制文档](docs/multipath.zh-CN.md) · [English mechanism guide](docs/multipath.md)。
 
-Leg 0 is the session anchor and preferred path. It creates the session, carries
-cumulative acknowledgements and stream control, and carries all application data
-before aggregation activates. This keeps connection setup and small transfers on the
-configured low-latency path. With recovery disabled, losing leg 0 closes the logical
-connection. Optional recovery permits session creation, control and data on leg 1.
+OpenWrt 用户可配合 [luci-app-homeproxy-multipath](https://github.com/WuSiYu/luci-app-homeproxy-multipath)，在 LuCI 中配置 Multipath，并查看路径、连接和流量状态。
 
-Leg 1 is a capacity booster. It can attach while the connection is still using only
-leg 0, but it does not carry application data until a local activation trigger fires
-or optional failover takes over from leg 0.
-Each direction makes that decision independently from its own accepted-byte count,
-measured rate, and leg 0 backlog. After activation, the scheduler compares outstanding
-path bytes divided by observed delivery rate. Receipt feedback comes from the far
-multipath endpoint, so outstanding bytes include buffering inside a local proxy and
-its remote transport. Completing a local socket write is not delivery confirmation.
-There are no configured bandwidth weights or rate limits.
+### 部署与配置示例
 
-An unmeasured path starts with a bounded probe. Feedback establishes its observed
-delivery rate and timing, not a guaranteed estimate of unused capacity. Once sampled,
-the shared receive window, send-history budget and child write backpressure bound
-assignment; there is no second per-path congestion window. Busy or stalled writers
-do not block assignment to another eligible path. The preferred-only phase uses
-normal child backpressure without the discovery-probe limit. Packet-level congestion
-control, pacing, and retransmission remain in the child: this protocol does not
-replace Hysteria2's congestion controller with an outer TCP one.
+两条 child outbound 都必须能够到达同一个 Multipath 服务端。中间可以使用普通 sing-box 节点或其他兼容代理，无需修改中间节点；服务端再通过自己的路由访问目标。
 
-The client configures separate `upload` and `download` policies and sends both
-during session establishment. Upload applies to the client sender and server
-receiver; download applies to the server sender and client receiver. The server
-accepts the exact session policy, subject to protocol validation and its own memory
-budget. Joins and recovery reattachments must carry the same policy.
+**Multipath 本身不提供认证或加密，监听端口不能直接暴露给不可信网络。** 使用私有链路、带认证的代理和访问控制保护它。双端须使用协议 v12（beta9）；旧协议会被拒绝。
 
-Each direction has an `aggregation_enabled` master switch. When false, new data
-uses leg 0 except during optional failover. The other direction can still activate
-leg 1. With `leg0_traffic_saving: true`, activation switches new data to leg 1
-instead of using both legs. Before activation and while leg 1 is connecting,
-data still uses leg 0. Healthy leg 1 writer backpressure or exhausted discovery
-credit causes waiting, not spillover onto leg 0. A missing or stalled leg 1, or
-local/peer memory pressure, permits leg 0 fallback; once eligible again, leg 1
-resumes exclusive new-data transmission. Existing leg 0 assignments finish normally.
-Reinjection and control traffic may still use leg 0, so this is not a zero-byte
-guarantee. UDP preference and failover are separate from this switch.
+以下是配置片段，需合并到现有 sing-box 配置。客户端仍需配置本地入站，并把需要聚合的流量路由到 `mp-out`。示例用系统 `wg1` 作为 leg0、Hysteria2 作为 leg1；请替换接口、地址、凭据和 TLS 域名，并确保 Hy2 服务端能够访问 `10.66.67.1:39000`。
 
-With aggregation enabled, the following triggers are independent alternatives
-(OR), evaluated separately for each connection and sending direction:
-
-- Queue: `activation_on_queue` is enabled and leg 0 in-flight plus local unsent
-  bytes stay at least 80% of `queue_frames * frame_size` for `activation_window`.
-- Rate: `activation_threshold_mbps` is greater than zero and the average local
-  ingress rate over `activation_window` reaches it.
-- Bytes: `activation_after_bytes` is greater than zero and the local TX accepted-byte
-  count reaches it. If `activation_after_bytes_min_mbps` is non-zero, this trigger
-  also requires that average rate over a complete `activation_window`.
-
-The minimum byte-trigger rate does not gate the queue or rate triggers. Disabling
-all three triggers keeps local TX on leg 0; zero thresholds never imply immediate
-activation. Once activated, aggregation does not automatically deactivate when
-traffic drops. Explicit zero disables a numeric trigger. An omitted rate threshold
-retains the default of 150 Mbps when the byte trigger is disabled, or zero when a
-non-zero byte trigger is configured.
-
-### Byte stream, receive window, and recovery
-
-Both paths carry mappings into one 64-bit **byte** sequence space. Each path also
-has a separate sequence space and incarnation ID. A receiver deduplicates overlapping
-mappings and returns a cumulative Data ACK for the contiguous received prefix.
-That ACK means the receiver owns the bytes, not that the application has read them.
-DATA mappings are processed incrementally: an arriving prefix can be delivered and
-acknowledged before the remaining payload of the same mapping reaches the receiver.
-Only Data ACK releases the sender's connection-level history, which retains data
-from **both** paths. An original or recovery writer holds an independent reference,
-so acknowledgement cannot free a buffer while a blocked child still uses it.
-
-The receiver advertises one monotonic byte-window right edge shared by both paths.
-Application reads move the window; individual path receipts do not. Short writes
-consume their actual byte length, not a whole frame credit. Local unsent capacity,
-whole-path in-flight bytes, retained send history, and receive storage are separate
-states. There are no idle-credit epochs, weight-based quotas, or separate leg 1
-replay ownership rules.
-
-Receive storage uses sparse 16 KiB pages, allocated only for arriving bytes. Under
-memory pressure, a receiver may decline speculative data or prune wholly
-unacknowledged out-of-order pages. It never discards Data-ACKed bytes waiting for the
-application. Path receipts still report transport delivery; they do not release the
-connection history. If a received mapping still covers the missing connection head,
-the sender can reinject it from that history. Each admitted session has reserved
-reader scratch, one head receive page, and a reusable primary TX buffer, so a missing
-head is not dependent on leg 1 releasing speculative storage.
-
-### Weak leg 1 and fallback
-
-Each path has an independent writer. A blocked leg 1 write does not hold the state
-lock, prevent leg 0 writes, or stop receive/control processing. Recovery reuses the
-same immutable byte history, does not consume new connection-window space, and does
-not need another payload allocation. Late originals are harmless duplicates.
-
-Whole-path receipts drive delivery-rate and timing estimates. A leg without progress
-is marked stale and pauses new assignments; retained mappings can be reinjected on
-another available path. Receipt progress clears the stale state. A stall is not an
-automatic disconnect/reconnect, and a hard secondary failure does not close the
-logical stream. An individual leg receipt above a missing global byte is ordinary
-reordering, not evidence that the missing byte was lost.
-
-The adaptive no-progress interval is smoothed delivery RTT plus four times its
-variation, at least 200 ms, initially one second before measurements are available.
-An explicit `path_stall_timeout_min` supplies an additional lower bound. Buffering in
-child transports is included in timing measurements. Control/window updates take
-priority over DATA not yet submitted to the primary child; they cannot overtake an
-already blocked child write or bytes already queued inside a reliable transport.
-
-These mechanisms preserve a usable leg 0 through secondary stalls and failures.
-They cannot guarantee the same latency as leg 0 alone after data have already been
-assigned to a slow path: detecting and recovering an earlier missing byte takes
-time and bandwidth. Aggregation also cannot exceed shared physical bottlenecks.
-
-Payload storage, path/mapping metadata, reserved progress buffers, cache, and estimated
-session overhead share one budget per multipath inbound or outbound. The default is
-`min(512 MiB, available memory * 0.5)`. On Linux, available memory is the smaller of
-`MemAvailable` and the remaining capacity of visible cgroup v1/v2 memory limits,
-including ancestor groups. Explicit limits are not automatically reduced. New booster assignments and ordinary receive-window
-growth pause at 7/8 and resume below 3/4; head progress remains reserved. Advertised
-but unused window space is not an allocation. This budget is not process RSS and
-does not include child TCP/QUIC buffers.
-
-Checked-out cache entries release their old references immediately; sparse cache
-indexes shrink, and large sender/path indexes are released when fully acknowledged.
-Returning a buffer to the budget makes it reusable or collectible; it does not
-force Go to return physical pages to the OS immediately. No periodic forced GC is
-used. A high RSS alone is therefore not evidence of retained live buffers.
-
-On a 1 GiB host, a conservative starting point is `"memory_limit": "256MB"`, with
-headroom for child protocols, other processes and the OS. Multiple multipath
-instances have separate budgets. Large QUIC windows can add substantial memory
-outside them. If neither `GOMEMLIMIT` nor an existing runtime limit (including
-sing-box's `debug.memory_limit`) is set, starting the first multipath instance
-sets a process-wide Go **soft** limit to its current Go footprint plus 80% of
-detected available memory. All multipath instances share it. Stopping the last
-instance restores the previous setting unless it was subsequently overridden.
-The startup log reports the effective value and its source. There is no periodic
-memory polling or forced collection; normal Go GC uses this limit when needed.
-Explicit `GOMEMLIMIT`, including `GOMEMLIMIT=off`, takes precedence. A soft limit
-controls transient GC headroom, not RSS, and cannot fit a larger live working set
-into RAM; see the [Go GC guide](https://go.dev/doc/gc-guide#Memory_limit).
-
-Omitted receive/send-history ceilings are derived from the node budget: half of
-its ordinary allocation region (7/16 of the total, capped at 512 MiB and at least
-one frame). With a 512 MiB budget this is 224 MiB per direction. These are ceilings,
-not allocations or per-session reservations; concurrent sessions still share the
-same global allocator. Explicit byte limits remain hard caps. There is no frame-count receive limit; only the byte window and shared memory budget apply.
-
-The byte-sequence, Data ACK, shared-window, reinjection, and DATA_FIN model follows
-[RFC 8684](https://www.rfc-editor.org/rfc/rfc8684.html). The delivery-based scheduling
-basis follows [Linux MPTCP](https://github.com/torvalds/linux/blob/587858367581b9c55c3690f4e63382ad622719d4/net/mptcp/protocol.c).
-This is an independent implementation over reliable proxy streams, not MPTCP wire
-compatibility, native subflow TCP congestion control, or an implementation of every
-optional MPTCP path-management/security mechanism.
-
-### Optional path failover
-
-`failover_enabled` is a **client-only** option and defaults to `false`. Disabled
-outbounds create no shared recovery probes or UDP relay sockets; their existing
-aggregation and direct child UDP forwarding remain unchanged. The server always
-listens on TCP and UDP and accepts both ordinary and recovery-enabled sessions.
-It creates recovery groups only when requested by a client and has no
-`failover_enabled` configuration field.
-
-Enable the flag on the client outbound. The client also sets `failover_timeout`
-(default `"5s"`) and `failback_delay` (default `"30s"`). Each
-outbound maintains one TCP control connection and one native UDP association per
-child, shared across all business connections. A path is healthy only while both
-transports have fresh challenge replies from the multipath server. A full failure
-timeout declares it unavailable; a delayed old reply does not establish recovery.
-Checks normally run once per second. Detection and session reattachment add time
-to the configured timeout; it is not a bound on application-visible interruption.
-At startup, either confirmed healthy path can carry traffic immediately. The
-preferred path is selected as soon as it first becomes healthy, without a failback
-hold. Once that path has been healthy and then failed, subsequent returns require
-the configured stability period. This applies separately to TCP and UDP preference.
-
-When leg 0 fails, existing TCP sessions retain their target connections, byte
-sequence numbers, receive windows and unacknowledged send history. Data, cumulative
-ACKs and FIN can use leg 1 without enabling aggregation. New sessions can also start
-on leg 1. The client reconnects lost transports; the server does not redial the
-target. A recovered leg 0 must remain healthy for the failback delay before normal
-leg roles resume. One missed probe does not reset that period; a full failure
-timeout does. If the fallback fails while the preferred path is available, the
-stability hold is bypassed. Explicit application closure, server restart, or loss
-of both paths beyond the recovery-group lease can still terminate a connection.
-
-With recovery enabled, `udp_outbound` is the **preferred UDP leg**, independently
-of TCP's leg 0 preference, and must name one of the two children. Both children must
-support TCP and UDP. UDP uses the server relay from the first packet, so switching
-paths does not replace the target-facing socket or its source port. Choosing leg 1
-for UDP keeps it on leg 1 when leg 0 fails and recovers; only a failure of the UDP
-preferred path triggers its own fallback. The same failure and return durations
-apply. Client-selected path epochs also direct server replies, including one-way
-application traffic; delayed messages cannot revert a newer selection.
-
-UDP payloads remain unreliable datagrams, not UDP-over-TCP. The relay fragments
-large packets into small outer datagrams and reassembles each independently, without
-retransmission. Missing fragments expire after five seconds. Buffers use the shared
-memory budget; pressure drops UDP packets rather than accumulating reliable queues.
-UDP associations expire after five minutes without application packets. Closed session
-IDs are retained for two minutes to reject delayed packets and joins; these records
-also consume the shared budget. Group state expires after no control or UDP
-traffic for `max(2 minutes, 4 * failover_timeout + failback_delay)`.
-
-Recovery control heartbeats also verify TCP session ownership. The server rotates
-through at most 64 IDs per heartbeat; the client reports which IDs it no longer
-owns in the next request on that control connection. Only an explicit absence
-releases a server session. Lost control connections discard their outstanding
-query batch and retry through fresh queries, without accumulating a close queue.
-Client ownership begins before sending the first hello, including fast open, and
-ends when the logical core terminates. A connection still owned by the client is
-not removed merely because both data legs are temporarily unavailable.
-
-After the application calls full `Close`, buffered TX is allowed to drain, but
-two minutes without cumulative Data ACK progress ends the remaining session.
-This bounds abandoned FIN/ACK waits even if all control paths are unavailable.
-It does not apply to `CloseWrite`, `CloseRead`, or an open idle connection. Normal
-FIN acknowledgement completes the close immediately.
-Pending child handshakes are interrupted when their context is canceled. Session
-cleanup waits for secondary-join and recovery-rejoin workers before returning
-their memory reservation.
-
-The server's listening port must be reachable over **both TCP and UDP** through both
-children. The server's normal routing rules determine the final TCP and UDP exit.
-The protocol adds no authentication or encryption; keep this listener on trusted
-paths. Failover cannot prevent a game from disconnecting if its own timeout expires
-during detection, or preserve a socket across server restart.
-
-Client additions (independent of directional aggregation switches):
-
-```json
-{
-  "failover_enabled": true,
-  "failover_timeout": "5s",
-  "failback_delay": "30s"
-}
-```
-
-No server-side recovery option is required or accepted. All three fields above
-are client-only; the client synchronizes its path selection and group lease to
-the server. Remove `failover_enabled` from existing inbound configurations.
-
-### Connection shutdown
-
-DATA_FIN occupies one byte-sequence position at the end of each sending direction.
-A cumulative Data ACK covers it only after all preceding bytes have been received. An application
-close rejects further local I/O but drains accepted TX in the background; session-close
-is sent only after the peer acknowledges that final sequence. Half-closing one
-direction leaves the reverse direction usable, including through connection wrappers.
-
-If FIN and all its preceding data have arrived, a subsequent session-close or control
-leg transport failure preserves buffered RX until the application reads it. Receipt ACKs therefore
-remain valid even when the application is slow. Session accounting is finalized after
-that drain and buffer release. Errors, resets, and service shutdown can still abort
-immediately; a local application close may discard its own unread RX. Normal draining
-uses protocol confirmation rather than a fixed delay and remains subject to peer
-backpressure and child transport failure. Service shutdown can interrupt a drain.
-
-Application read/write deadlines also cover the initial fast-open write wait.
-An application timeout does not reset the session; the accepted prefix remains
-queued and the caller can resume with the unwritten suffix after clearing or
-extending the deadline. An incomplete stream terminated without FIN reports an
-error rather than a clean EOF, while local close interrupts pending application I/O.
-
-### Runtime telemetry
-
-When the client enables `status_file`, protocol v12 requests a compact sender-status
-frame from the server on the control path (leg 0 normally, leg 1 during failover).
-It reports the server-side downlink queues, replay and fallback counters,
-write stalls, and memory pressure for the matching logical session. Status frames
-are coalesced and do not consume data sequence numbers, replay space, or the payload
-memory budget. The client marks remote status stale when updates stop rather than
-interpreting missing telemetry as zero.
-
-Active paths send low-rate PING/PONG probes independently of `status_file` for
-observability. Data reinjection timing uses DATA receipt samples, not probe success alone.
-An idle unused secondary does not receive per-flow probes just because it is attached.
-Optional failover separately uses shared TCP/UDP health probes on both children.
-Reported RTT is the effective application-layer round trip and
-therefore includes transport and proxy queueing. Probe timeouts and reinjection/stall
-counters describe multipath-visible events; they are not raw IP or UDP packet-loss
-measurements. Traffic peaks are the highest one-second averages since process start,
-while memory peaks are updated directly by the allocator.
-
-Leg joins count successfully attached transports independently of local TX
-activation. Joins, attempts and reported remote failures retain closed-session
-totals; probe statistics cover active connections only. With failover enabled, attempts
-count business TCP dials on each leg, excluding shared health connections. Without it,
-leg 0 attempts count created logical connections. A lazy primary transport
-can be attached before its deferred handshake finishes. Remote failure totals
-include only events actually reported by the peer.
-
-Leg events include `last_error_source`: `local_endpoint`, `remote_endpoint`,
-`transport`, `shutdown`, or `unknown`. Closing a healthy logical connection marks
-an application-endpoint shutdown; a preceding multipath failure keeps its original
-source. Session-close frames carry this provenance to the peer on both legs.
-Only close-related I/O errors inherit endpoint attribution; timeouts and protocol
-errors remain visible. A missing close marker leaves the source unknown rather
-than guessing from EOF, reset or QUIC cancellation text. The marker is diagnostic
-only: it does not change FIN handling, scheduling, recovery or close timing.
-Status schema 4 includes error provenance, directional policies and sender modes. Confirmed endpoint-close events do not
-increment leg failure/event counters; other events, including unattributed and
-harmless closures, retain their existing counting semantics. Protocol v12 requires
-updating both endpoints.
-
-Current aggregate and traffic-saving modes require an attached leg 1 on the same
-client connection. A fresh remote mode cannot override local path absence; the
-direction becomes unknown and an activated connection with no booster is reported
-as degraded. An attached idle connection remains eligible regardless of its current
-transfer rate. Remote modes older than three seconds are unknown.
-
-Remote scheduler rate estimates are not one-second throughput or physical link
-capacity. DATA-feedback RTT follows the selected data leg outward and leg0 for
-the return feedback. Stall detection need not result in reinjection, and sender
-backpressure duration is accumulated across connections, not a single pause.
-
-At startup, each multipath inbound or outbound logs its resolved memory limit, high
-and resume watermarks, and cache limit. Crossing the high watermark and recovering
-below the resume watermark each emit one informational transition log.
-
-### Client outbound example
-
-The preferred leg can use a system WireGuard interface; the second leg can be an
-existing Hysteria2 outbound. Upload stays on leg 0 in this example. Download switches
-to leg 1 after any enabled trigger fires. Set `download.leg0_traffic_saving` to
-`false` to aggregate instead.
+客户端：上传只走 leg0，下载触发后聚合。将 `download.leg0_traffic_saving` 改为 `true` 可切换为节省 leg0 流量的模式。
 
 ```json
 {
@@ -367,46 +44,43 @@ to leg 1 after any enabled trigger fires. Set `download.leg0_traffic_saving` to
       "server": "hy2.example.com",
       "server_port": 443,
       "password": "change-me",
-      "tls": { "enabled": true, "server_name": "hy2.example.com" }
+      "tls": {
+        "enabled": true,
+        "server_name": "hy2.example.com"
+      }
     },
     {
       "type": "multipath",
       "tag": "mp-out",
-      "outbounds": ["wg-dedicated", "hy2-public"],
+      "outbounds": [
+        "wg-dedicated",
+        "hy2-public"
+      ],
       "preferred": "wg-dedicated",
       "udp_outbound": "wg-dedicated",
       "server": "10.66.67.1",
       "server_port": 39000,
       "tcp_fast_open": true,
       "frame_size": "64KB",
-      "upload": { "aggregation_enabled": false },
+      "upload": {
+        "aggregation_enabled": false
+      },
       "download": {
         "aggregation_enabled": true,
-        "leg0_traffic_saving": true,
+        "leg0_traffic_saving": false,
         "activation_on_queue": true,
         "activation_threshold_mbps": 120,
         "activation_after_bytes": "2MB",
         "activation_after_bytes_min_mbps": 120,
-        "activation_window": "1s",
-        "queue_frames": 256,
-        "send_buffer_bytes": 0,
-        "receive_window_bytes": 0,
-        "path_stall_timeout_min": "0s"
+        "activation_window": "1s"
       },
-      "memory_limit": "512MB"
+      "memory_limit": 0
     }
   ]
 }
 ```
 
-Multipath `tcp_fast_open` combines the hello and first DATA write; it does not
-enable TCP Fast Open inside a child. To carry that write in a TCP SYN, **also
-enable the child's `tcp_fast_open`**, and enable it on the multipath server
-listener. A child without TCP TFO still supports multipath early-write after
-establishing its transport. With multipath TFO false or omitted, Dial waits for
-the multipath hello response before returning the logical connection.
-
-### Server inbound example
+服务端：只设置监听和本机资源参数，上传/下载策略由客户端传入。
 
 ```json
 {
@@ -417,12 +91,213 @@ the multipath hello response before returning the logical connection.
       "listen": "10.66.67.1",
       "listen_port": 39000,
       "tcp_fast_open": true,
-      "memory_limit": "512MB",
+      "memory_limit": 0,
       "handshake_timeout": "10s"
     }
   ]
 }
 ```
+
+`tcp_fast_open: true` 允许 Multipath 合并 hello 与首次 DATA 写入；它不会替 child 开启 TCP Fast Open。若希望首批数据进入 TCP SYN，**还要打开 TCP child 的 `tcp_fast_open` 和服务端监听的 TFO**。不支持 TCP TFO 的 child 仍可在其传输建立后使用 MP early-write。MP 的该选项为 false 或省略时，拨号会等待 hello 响应。
+
+需要故障接管时，在客户端的 Multipath outbound 中加入：
+
+```json
+{
+  "failover_enabled": true,
+  "failover_timeout": "5s",
+  "failback_delay": "30s"
+}
+```
+
+这三个字段仅属于客户端，服务端不要填写。开启后，两条 child 均须支持 TCP 和 UDP，且都能到达聚合端口的 TCP/UDP 监听。首次确认首选路径健康时立即选用；已经健康过的路径发生故障后，再次恢复须经过稳定期。UDP 保留 `udp_outbound` 指定的独立首选路径。
+
+### 参数归属
+
+“客户端”指 Multipath outbound，“服务端”指 Multipath inbound；以下方向均从客户端视角命名。
+
+| 客户端策略 | 发送端 | 接收端 |
+| --- | --- | --- |
+| `upload` | 客户端 | 服务端 |
+| `download` | 服务端 | 客户端 |
+
+客户端在握手中提交两份方向策略和共同的 `frame_size`，服务端校验并确认，**不会用自己的方向默认值替换，也不另行协商较小的帧尺寸**。两条 leg 及重连必须保持同一策略；配置非法或服务端会话资源不足时拒绝连接。各主机的 `memory_limit` 独立生效，不被对端覆盖。
+
+自动缓冲上限在拥有该缓冲的主机上解析：例如 `upload.receive_window_bytes: 0` 根据服务端预算确定，`download.receive_window_bytes: 0` 根据客户端预算确定。这里的 0 是自动，不是零容量。方向参数不调整 child 的 TCP/QUIC 缓冲、拥塞控制或 UDP 转发。
+
+### 客户端字段
+
+| 字段 | 作用范围与默认语义 | 可接受格式实例 |
+| --- | --- | --- |
+| `outbounds` | 客户端本地的两个 child tag，构成双向路径；必须恰好两个，且支持 TCP。 | `["leg0", "leg1"]` |
+| `preferred` | 指定 leg0，默认第一个 child；承担初始、控制和首选路径角色。 | `"leg0"` |
+| `udp_outbound` | 默认首选 child；关闭故障接管时直接经该 outbound 发 UDP，也可指定第三个 outbound；开启时必须为两个 leg 之一，并同步服务端回包路径。 | `"leg0"`、`"leg1"` |
+| `server`、`server_port` | 两个 child 都要访问的聚合服务端地址和端口，必填。 | `"10.66.67.1"`、`39000` |
+| `tcp_fast_open` | 客户端逻辑连接 early-write，默认 false；child 和服务端 TCP socket 的 TFO 另行配置。 | `true`、`false` |
+| `frame_size` | 客户端选定、服务端确认，双向共用的最大 DATA 载荷；不含帧头。省略/0 为 64 KiB，非零范围 1 KiB–1 MiB；可以发送短帧。 | `65536`、`"64KB"`、`"16 KB"` |
+| `upload`、`download` | 客户端提交的每连接方向策略；默认开启聚合、关闭流量节省。 | `{"aggregation_enabled": false}` |
+| `status_file` | 客户端本地 JSON 状态文件，默认关闭；每秒更新，包含服务端下行遥测、方向策略和实际缓冲上限。 | `"/var/run/multipath.json"` |
+| `failover_enabled` | 客户端 TCP/UDP 接管总开关，默认 false；关闭时不增加共享恢复探测或 UDP 中继。与聚合和流量节省开关独立。 | `true`、`false` |
+| `failover_timeout` | 客户端判定路径失效的时限，影响同步给服务端的恢复组租期；默认 5 秒，范围 1 秒–5 分钟。 | `"5s"`、`"10s"` |
+| `failback_delay` | 客户端在已发生故障后回到首选路径的连续健康期；默认 30 秒，范围 1 秒–1 小时。首次健康确认不等待；备用也失效时可立即选用健康首选路径。 | `"30s"`、`"1m"` |
+
+### upload / download 字段
+
+这些字段**只在客户端配置**，随后在对应方向的发送端或接收端执行。缓冲上限按每个逻辑连接、每个方向计算。
+
+| 字段 | 作用位置与默认语义 | 可接受格式实例 |
+| --- | --- | --- |
+| `aggregation_enabled` | 发送端总开关，默认 true；false 时新数据保持 leg0，独立的故障接管仍可使用 leg1。 | `true`、`false` |
+| `leg0_traffic_saving` | 发送端选路，默认 false；true 时激活后改为 leg1 独占新数据，而非双路径聚合；本字段不独立触发激活。 | `true`、`false` |
+| `activation_on_queue` | 发送端**条件 1**，默认 true：leg0 在途量与本地待发送量之和连续一个窗口达到 `queue_frames * frame_size` 的 80%。 | `true`、`false` |
+| `activation_threshold_mbps` | 发送端**条件 2**：窗口内平均接收应用数据的速率达到阈值。省略时默认 150 Mbps；若已启用累计字节触发，则省略时为 0。显式 0 关闭。 | `0`、`120` |
+| `activation_after_bytes` | 发送端**条件 3**：累计接收应用字节数达到阈值，并满足下一项的最低速率；省略/0 关闭。 | `0`、`2097152`、`"2MB"` |
+| `activation_after_bytes_min_mbps` | 仅作为条件 3 内部的“且”条件，默认 0；非零时还要求完整采样窗口内的平均速率达标，不限制条件 1、2。 | `0`、`5`、`120` |
+| `activation_window` | 发送端的排队持续期和速率采样窗口，省略/0 为 1 秒。 | `"1s"`、`"500ms"` |
+| `queue_frames` | 发送端待发送容量，以 `frame_size` 为单位；省略/0 为 256，非零范围 8–4096，乘积不超过 64 MiB。这部分容量包含在 `send_buffer_bytes` 内，不是接收帧数或在途上限。 | `64`、`256` |
+| `send_buffer_bytes` | 发送端两条路径共用的连接发送历史，包含待发送字节；收到累计 Data ACK 后才可释放。省略/0 在发送端自动解析，非零范围为 `frame_size`–512 MiB。 | `0`、`67108864`、`"64MB"` |
+| `receive_window_bytes` | 接收端连接字节窗口，约束该方向发送量，包含按序但尚未被应用读取的数据。省略/0 在接收端自动解析，非零范围为 `frame_size`–512 MiB；没有帧数限制。 | `0`、`134217728`、`"128MB"` |
+| `path_stall_timeout_min` | 发送端对任一 leg 的无进展检测下限。省略/0 使用自适应值；非零范围 100 ms–5 分钟。不是固定重传间隔或断连倒计时。 | `"0s"`、`"500ms"`、`"2s"` |
+
+激活逻辑是 **总开关开启，且（条件 1 或条件 2 或条件 3）**，按每条连接、每个方向独立判断。三个条件全部关闭就不会激活；数值触发器为 0 不代表立即激活。激活后不会因速率下降而自动退回未激活状态。流量节省模式中的故障回退和恢复不改变这一点。
+
+### 本机资源与服务端监听
+
+| 字段 | 作用范围与默认语义 | 可接受格式实例 |
+| --- | --- | --- |
+| `memory_limit` | 本机每个 MP inbound/outbound 的共享预算，涵盖其 TCP 和恢复 UDP 会话；不协商、不被对端覆盖。省略/0 为 `min(512 MiB, 可用内存 × 0.5)`。Linux 同时考虑 MemAvailable 和可见 cgroup 剩余额度；不是 RSS 或 child 缓冲上限。 | `0`、`268435456`、`"256MB"` |
+| `handshake_timeout` | 各主机独立的 leg 握手时限；默认 10 秒，正值范围 1–60 秒。 | `"10s"`、`"5s"` |
+| `listen`、`listen_port` | 仅服务端，标准 sing-box TCP/UDP 监听字段；开启故障接管时须让两个 child 均能访问 TCP 和 UDP。 | `"10.66.67.1"`、`39000` |
+| 服务端 `tcp_fast_open` | 服务端 TCP socket 选项，不属于客户端下发的方向策略。 | `true`、`false` |
+
+容量字符串使用整数和二进制单位：`"2MB"`、`"2 MB"` 都是 2,097,152 字节；支持不区分大小写的 `B`、`K/KB`、`M/MB` 至 `E/EB`，**不接受 `KiB/MiB` 或小数**。速率单位 Mbps 则是每秒 1,000,000 bit。
+
+自动缓冲值是上限，不会预分配对应大小；所有连接仍共享本机预算。1 GiB 主机可从 `"memory_limit": "256MB"` 起步，为 child 协议、其他进程和内核留出空间。自动 Go 软限制及其边界见[内存机制](docs/multipath.zh-CN.md#内存与反压)。
+
+### 旧配置迁移
+
+旧版平铺的 `aggregation_enabled`、全部 `activation_*` 和 `queue_frames` 只告警并忽略，需移入客户端的 `upload` / `download`；服务端不再配置方向策略。以下旧字段同样只告警并忽略，不会自动迁移或作为新字段默认值：
+
+| 旧字段 | 当前写法 |
+| --- | --- |
+| `chunk_size` | 客户端顶层 `frame_size` |
+| `leg1_replay_bytes` | 方向内的 `send_buffer_bytes`，两条路径共用 |
+| `max_reorder_bytes` | 方向内的 `receive_window_bytes`，由该方向接收端执行 |
+| `leg1_replay_timeout` | 方向内的 `path_stall_timeout_min`，可作用于任一 leg |
+| `bandwidth_mbps` | 删除；调度自动测量，没有带宽比例或限速替代项 |
+| `max_reorder_frames` | 删除；不提供 `receive_window_frames` |
+
+旧帧尺寸、重排、replay 和带宽字段即使放进方向对象也无效。未知字段或非法的新字段值仍会报错；服务端的 `failover_enabled` 也应删除。原生 sing-box 功能见[上游文档](https://sing-box.sagernet.org/)。
+
+## English
+
+singbox-multipath extends sing-box with application-layer aggregation over two existing paths, allowing **a single TCP connection** to use their combined capacity instead of merely distributing separate connections between nodes. Applications and intermediate proxies do not need MPTCP support; the client and aggregation server run this project.
+
+### Overview
+
+- **leg0 is the preferred path:** normally a stable, low-latency link for session setup, control traffic and data before activation.
+- **leg1 is the capacity booster:** it carries data after activation. Scheduling follows measured end-to-end delivery rather than configured bandwidth weights; both endpoints reconstruct one ordered byte stream.
+- **Aggregate or switch:** the default is aggregation after activation. `leg0_traffic_saving` instead assigns new data to leg1 when eligible, saving leg0 traffic. Control, reinjection and fallback can still use leg0.
+- **Optional failover:** `failover_enabled` lets leg1 take over TCP and UDP during a leg0 outage, then restores each protocol's preferred path. It is off by default. UDP is not aggregated or carried inside the MP reliable TCP stream.
+
+Upload and download activate independently. A blocked leg1 writer does not directly block the leg0 writer, but ordered delivery can still wait for missing bytes; aggregation is not guaranteed to outperform leg0 alone on every network. This is inspired by MPTCP's connection-level mechanisms, not kernel MPTCP or its wire protocol.
+
+Details: [English mechanism guide](docs/multipath.md) · [中文机制文档](docs/multipath.zh-CN.md).
+
+On OpenWrt, [luci-app-homeproxy-multipath](https://github.com/WuSiYu/luci-app-homeproxy-multipath) provides LuCI configuration and a dashboard for Multipath paths, connections and traffic.
+
+### Deployment and examples
+
+Both child outbounds must reach the same Multipath server, which uses its own routing to reach application destinations. Intermediate nodes may be ordinary, unmodified proxy nodes.
+
+**Multipath provides no authentication or encryption of its own. Do not expose its listener to untrusted networks.** Protect it with private paths, authenticated proxies and access controls. Both endpoints must use protocol v12 (beta9); older versions are rejected.
+
+These are configuration fragments to merge into an existing sing-box configuration. Add a client inbound and route the desired traffic to `mp-out`. Replace the interface, addresses, credentials and TLS name; the Hy2 server must be able to reach `10.66.67.1:39000`.
+
+Client: a system `wg1` interface is leg0 and Hysteria2 is leg1. Upload stays on leg0; download aggregates after activation. Set `download.leg0_traffic_saving` to `true` to switch to leg1 instead.
+
+```json
+{
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "wg-dedicated",
+      "bind_interface": "wg1",
+      "tcp_fast_open": true
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-public",
+      "server": "hy2.example.com",
+      "server_port": 443,
+      "password": "change-me",
+      "tls": {
+        "enabled": true,
+        "server_name": "hy2.example.com"
+      }
+    },
+    {
+      "type": "multipath",
+      "tag": "mp-out",
+      "outbounds": [
+        "wg-dedicated",
+        "hy2-public"
+      ],
+      "preferred": "wg-dedicated",
+      "udp_outbound": "wg-dedicated",
+      "server": "10.66.67.1",
+      "server_port": 39000,
+      "tcp_fast_open": true,
+      "frame_size": "64KB",
+      "upload": {
+        "aggregation_enabled": false
+      },
+      "download": {
+        "aggregation_enabled": true,
+        "leg0_traffic_saving": false,
+        "activation_on_queue": true,
+        "activation_threshold_mbps": 120,
+        "activation_after_bytes": "2MB",
+        "activation_after_bytes_min_mbps": 120,
+        "activation_window": "1s"
+      },
+      "memory_limit": 0
+    }
+  ]
+}
+```
+
+Server: configure only the listener and host-local resource limits; directional policies arrive from the client.
+
+```json
+{
+  "inbounds": [
+    {
+      "type": "multipath",
+      "tag": "mp-in",
+      "listen": "10.66.67.1",
+      "listen_port": 39000,
+      "tcp_fast_open": true,
+      "memory_limit": 0,
+      "handshake_timeout": "10s"
+    }
+  ]
+}
+```
+
+Multipath `tcp_fast_open` combines hello with the first DATA write; it does not enable TFO inside a child. For payload in a TCP SYN, **also enable the TCP child's `tcp_fast_open` and the server listener's TFO**. A child without TCP TFO can still carry MP early-write after establishing its transport. With MP TFO false or omitted, Dial waits for the hello response.
+
+For failover, add these fields to the client Multipath outbound:
+
+```json
+{
+  "failover_enabled": true,
+  "failover_timeout": "5s",
+  "failback_delay": "30s"
+}
+```
+
+Do not put these fields on the server. Both children must support TCP and UDP and reach both transports on the aggregation port. First healthy discovery selects the preferred path without a return delay; after a previously healthy path fails, later recovery uses the stability hold. UDP retains the independent preference set by `udp_outbound`.
 
 ### Parameter ownership
 
@@ -461,8 +336,8 @@ override the owning host's shared memory budget.
 | `upload`, `download` | Client sends immutable directional policies to server. | Both default to aggregation enabled, traffic-saving disabled. Fields below. | `{"aggregation_enabled": false}` |
 | `status_file` | Client-local output path; hello requests peer sender telemetry. | Disabled when empty. One-second JSON status including policies, effective buffer ceilings and directional modes. | `"/var/run/multipath.json"` |
 | `failover_enabled` | Client-only shared TCP/UDP recovery; server always supports it. | False; no shared recovery probes/UDP relay associations when off. Independent of activation and traffic-saving. | `true`, `false` |
-| `failover_timeout` | Client path failure detection; sent to recovery group. | 5 seconds; requires failover enabled. | `"5s"`, `"10s"` |
-| `failback_delay` | Client preferred-path stability hold after a previously healthy path fails; synchronized with server. | 30 seconds; requires failover enabled. First healthy discovery at startup has no hold. It restores normal policy, not forced leg 0 DATA in an activated saving direction. | `"30s"`, `"1m"` |
+| `failover_timeout` | Client path failure detection; sent to recovery group. | 5 seconds, range 1 second–5 minutes; requires failover enabled. | `"5s"`, `"10s"` |
+| `failback_delay` | Client preferred-path stability hold after a previously healthy path fails; synchronized with server. | 30 seconds, range 1 second–1 hour; requires failover enabled. First healthy discovery at startup has no hold. It restores normal policy, not forced leg 0 DATA in an activated saving direction. | `"30s"`, `"1m"` |
 
 ### Fields inside upload and download
 
@@ -493,19 +368,22 @@ activated for the connection lifetime; no low-rate switchback is performed.
 | Field | Scope and peer interaction | Default / meaning | Accepted format examples |
 | --- | --- | --- | --- |
 | `memory_limit` | Local inbound/outbound shared budget across TCP and recovery UDP sessions. Never negotiated or overridden by peer policy. | `min(512 MiB, available memory * 0.5)`; omitted/0 automatic. Linux uses the smaller of MemAvailable and visible cgroup remaining capacity. Does not cap child transport buffers or process RSS. | `0`, `268435456`, `"256MB"` |
-| `handshake_timeout` | Local leg-handshake deadline, independent on each host. | 10 seconds; omitted/zero default. | `"10s"`, `"5s"` |
+| `handshake_timeout` | Local leg-handshake deadline, independent on each host. | 10 seconds; omitted/zero default, positive range 1–60 seconds. | `"10s"`, `"5s"` |
 | `listen`, `listen_port` | Server-local TCP and UDP listener. | Standard sing-box listen fields; reachable through both children when failover is used. | `"10.66.67.1"`, `39000` |
 | Server `tcp_fast_open` | Server TCP socket option, not a directional policy. | Standard listener option. | `true`, `false` |
 
 Memory strings use binary units: `"2MB"` and `"2 MB"` both mean 2,097,152 bytes.
 Suffixes are case-insensitive `B`, `K`/`KB`, `M`/`MB`, through `E`/`EB`.
 The memory parser does not accept `KiB`/`MiB` suffixes or fractional quantities.
+Rates in Mbps use 1,000,000 bits per second.
 Automatic buffer limits are ceilings, not preallocations. A smaller shared budget
-can apply backpressure before any one connection reaches its ceiling.
+can apply backpressure before any one connection reaches its ceiling. On a 1 GiB
+host, `"memory_limit": "256MB"` is a conservative starting point. The automatic Go
+soft limit and its boundaries are described in [Memory and backpressure](docs/multipath.md#memory-and-backpressure).
 
-### Beta8 field removal
+### Legacy configuration
 
-Beta8 recognizes the following **old flat fields only to warn and ignore them**:
+The parser recognizes the following **old flat fields only to warn and ignore them**:
 `aggregation_enabled`, all five `activation_*` fields, `queue_frames`,
 `chunk_size`, `max_reorder_frames`, `max_reorder_bytes`,
 `leg1_replay_bytes`, `leg1_replay_timeout`, and `bandwidth_mbps`.
@@ -513,17 +391,22 @@ The old names for frame/reorder/replay/weights are also ignored with a warning i
 placed inside a direction object. They are not migrated, used as defaults, or
 allowed to override new fields. Even an invalid legacy value is ignored.
 
-Reconfigure both directions on the client. Remove all directional tuning from
-the server. Replace chunk_size with frame_size, leg1_replay_bytes with
-send_buffer_bytes, max_reorder_bytes with receive_window_bytes, and
-leg1_replay_timeout with path_stall_timeout_min. There is no replacement frame-count
-receive limit and no `receive_window_frames` option. Unknown fields and invalid
-new-field values are errors. Upgrade both endpoints together; old wire versions
-are rejected immediately.
+Reconfigure both directions on the client and remove directional tuning from the server.
 
-## Documentation
+| Old field | Current configuration |
+| --- | --- |
+| `chunk_size` | Client top-level `frame_size` |
+| `leg1_replay_bytes` | Directional `send_buffer_bytes`, shared by both paths |
+| `max_reorder_bytes` | Directional `receive_window_bytes`, enforced by that direction's receiver |
+| `leg1_replay_timeout` | Directional `path_stall_timeout_min`, applicable to either leg |
+| `bandwidth_mbps` | Remove; scheduling is automatic, with no replacement weight or rate cap |
+| `max_reorder_frames` | Remove; there is no `receive_window_frames` option |
 
-https://sing-box.sagernet.org
+Unknown fields and invalid new-field values are errors. Remove server-side
+`failover_enabled` as well. Upgrade both endpoints together when changing wire
+versions; old protocols are rejected immediately.
+
+Upstream features: [sing-box documentation](https://sing-box.sagernet.org/).
 
 ## License
 
