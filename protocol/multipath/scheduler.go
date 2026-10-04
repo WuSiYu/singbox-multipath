@@ -91,8 +91,9 @@ func (c *mpCore) pumpLoop() {
 				c.replayTO.Add(1)
 			}
 			// A leg without any progress for this long is closed so its
-			// manager can redial; the session keeps running elsewhere.
-			if leg.path.Stale && leg.path.Stalled(now, deadLegTimeout) {
+			// manager can redial, but only while the session keeps running
+			// on the other leg; a sole leg is left to the session timeouts.
+			if leg.path.Stale && leg.path.Stalled(now, deadLegTimeout) && c.otherUsableLeg(leg.id) != nil {
 				dead = append(dead, leg)
 			}
 			if leg.path.Outstanding() != 0 {

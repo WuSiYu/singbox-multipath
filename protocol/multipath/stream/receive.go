@@ -135,11 +135,20 @@ type Receiver struct {
 	memory    PageMemory
 }
 
+// InitialWindow is a memory-accounted receiver's window before its first
+// advertisement. The right edge never retracts, so it must start small and
+// only grow to the share the node can actually store.
+const InitialWindow = 256 << 10
+
 func NewReceiver(capacity uint64, memory PageMemory) *Receiver {
 	if capacity == 0 {
 		capacity = PageSize
 	}
-	return &Receiver{WindowEnd: capacity, Capacity: capacity, pages: make(map[uint64]*receivePage), memory: memory}
+	window := capacity
+	if memory != nil {
+		window = min(capacity, InitialWindow)
+	}
+	return &Receiver{WindowEnd: window, Capacity: capacity, pages: make(map[uint64]*receivePage), memory: memory}
 }
 
 func (r *Receiver) Ack() uint64 {

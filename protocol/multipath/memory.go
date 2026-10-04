@@ -443,7 +443,15 @@ func (b *memoryBudget) receiveShare(key any, now time.Time) int64 {
 		// floor until applications drain it.
 		return receiveWindowFloor
 	}
-	share := b.rxRegionLocked() / int64(max(1, b.receivers.count(nanos)))
+	return b.receiveShareLocked(nanos)
+}
+
+// receiveShareLocked divides three quarters of the receive region among the
+// active receivers. The remaining quarter absorbs page-granularity overhead
+// and arrivals beyond a window edge, so a slow application can fill its own
+// window without pushing out-of-order data elsewhere into the drop path.
+func (b *memoryBudget) receiveShareLocked(nanos int64) int64 {
+	share := b.rxRegionLocked() / 4 * 3 / int64(max(1, b.receivers.count(nanos)))
 	return max(receiveWindowFloor, share/stream.PageCharge*stream.PageSize)
 }
 
@@ -500,7 +508,7 @@ func (b *memoryBudget) snapshotLocked(now time.Time) memorySnapshot {
 		PressureThreshold:  b.poolLocked(),
 		ActiveSenders:      b.senders.count(nanos),
 		ActiveReceivers:    receivers,
-		ReceiveShareBytes:  max(receiveWindowFloor, b.rxRegionLocked()/int64(max(1, receivers))/stream.PageCharge*stream.PageSize),
+		ReceiveShareBytes:  b.receiveShareLocked(nanos),
 		Automatic:          b.automatic,
 		Pressure:           b.pressure,
 		PressureSince:      b.pressureSince,

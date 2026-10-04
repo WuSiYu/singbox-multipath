@@ -107,6 +107,10 @@ func TestPressureKeepsAcknowledgedBytesAndAdmitsHead(t *testing.T) {
 	memory := &testMemory{limit: 2}
 	far := uint64(NearHeadPages + 5)
 	r := NewReceiver((far+2)*PageSize, memory)
+	if r.WindowEnd != InitialWindow {
+		t.Fatal("accounted receiver must start with a small window")
+	}
+	r.Advertise(r.Capacity)
 	payload := bytes.Repeat([]byte{9}, PageSize)
 	_, _ = r.Insert(0, payload)
 	_, _ = r.Insert(far*PageSize, payload)
