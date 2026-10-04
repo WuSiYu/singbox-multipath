@@ -1,11 +1,15 @@
 package multipath
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"time"
 )
 
 var (
@@ -14,11 +18,17 @@ var (
 )
 
 const (
-	helloVersion      byte = 12
+	helloVersion      byte = 13
 	helloFlagStatus   byte = 1 << 0
 	helloFlagRecovery byte = 1 << 1
 	helloFlagControl  byte = 1 << 2
 	helloFlagCreate   byte = 1 << 3
+	helloFlagAuth     byte = 1 << 4
+
+	// An authenticated hello appends a Unix time, a random nonce and an
+	// HMAC-SHA256 over everything before the MAC, keyed by the shared PSK.
+	helloAuthSize = 8 + 16 + sha256.Size
+	helloAuthSkew = 2 * time.Minute
 
 	helloStatusOK       byte = 0
 	helloStatusRejected byte = 1
@@ -41,6 +51,16 @@ type helloMessage struct {
 	RecoveryEpoch uint64
 	RecoveryMask  byte
 	RecoveryUDP   byte
+	// PSK authenticates an outgoing hello; it is never sent.
+	PSK string
+}
+
+// helloAuth is the authentication carried by a received hello.
+type helloAuth struct {
+	signed []byte
+	mac    []byte
+	time   time.Time
+	nonce  [16]byte
 }
 
 type helloResponse struct {
@@ -76,10 +96,24 @@ const (
 	helloRejectLegUnavailable
 	helloRejectSessionUnavailable
 	helloRejectPolicy
+	helloRejectVersion
+	helloRejectAuthentication
 )
 
 func (r helloRejectReason) valid() bool {
-	return r >= helloRejectInvalidLegID && r <= helloRejectPolicy
+	return r >= helloRejectInvalidLegID && r <= helloRejectAuthentication
+}
+
+// fatal reports a rejection that no retry on any leg can overcome.
+func (r helloRejectReason) fatal(confirmed bool) bool {
+	switch r {
+	case helloRejectLegUnavailable:
+		return false
+	case helloRejectSessionUnavailable:
+		return confirmed
+	default:
+		return true
+	}
 }
 
 func (r helloRejectReason) String() string {
@@ -98,6 +132,10 @@ func (r helloRejectReason) String() string {
 		return "control session is not established yet or is already closed"
 	case helloRejectPolicy:
 		return "invalid multipath session policy"
+	case helloRejectVersion:
+		return "unsupported protocol version (both endpoints must use v13)"
+	case helloRejectAuthentication:
+		return "authentication failed (check psk on both endpoints)"
 	default:
 		return "invalid rejection reason"
 	}
@@ -141,6 +179,9 @@ func encodeHelloHeader(message helloMessage) ([helloHeaderSize]byte, error) {
 	if message.Create {
 		header[6] |= helloFlagCreate
 	}
+	if message.PSK != "" {
+		header[6] |= helloFlagAuth
+	}
 	copy(header[29:45], message.Group[:])
 	binary.BigEndian.PutUint64(header[45:53], message.RecoveryEpoch)
 	header[53], header[54] = message.RecoveryMask, message.RecoveryUDP
@@ -155,41 +196,70 @@ func encodeHello(message helloMessage) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	encoded := make([]byte, 0, helloHeaderSize+len(message.Destination))
+	encoded := make([]byte, 0, helloHeaderSize+len(message.Destination)+helloAuthSize)
 	encoded = append(encoded, header[:]...)
 	encoded = append(encoded, message.Destination...)
+	if message.PSK != "" {
+		var auth [8 + 16]byte
+		binary.BigEndian.PutUint64(auth[:8], uint64(time.Now().Unix()))
+		if _, err = rand.Read(auth[8:]); err != nil {
+			return nil, err
+		}
+		encoded = append(encoded, auth[:]...)
+		encoded = helloMAC(message.PSK, encoded).Sum(encoded)
+	}
 	return encoded, nil
 }
 
+func helloMAC(psk string, signed []byte) interface{ Sum([]byte) []byte } {
+	mac := hmac.New(sha256.New, []byte(psk))
+	mac.Write(signed)
+	return mac
+}
+
 func writeHello(conn net.Conn, message helloMessage) error {
-	header, err := encodeHelloHeader(message)
+	encoded, err := encodeHello(message)
 	if err != nil {
 		return err
 	}
-	buffers := net.Buffers{header[:], []byte(message.Destination)}
-	_, err = buffers.WriteTo(conn)
-	return err
+	return writeAll(conn, encoded)
+}
+
+// helloVersionError reports a peer speaking another protocol version.
+type helloVersionError struct{ version byte }
+
+func (e *helloVersionError) Error() string {
+	return fmt.Sprintf("multipath peer uses protocol v%d; this endpoint requires v%d (upgrade both endpoints)", e.version, helloVersion)
 }
 
 func readHello(conn net.Conn) (helloMessage, error) {
+	message, _, err := readHelloWithAuth(conn)
+	return message, err
+}
+
+func readHelloWithAuth(conn net.Conn) (helloMessage, *helloAuth, error) {
 	var message helloMessage
+	var auth *helloAuth
 	var header [helloHeaderSize]byte
 	if _, err := io.ReadFull(conn, header[:7]); err != nil {
-		return message, err
+		return message, nil, err
 	}
-	if string(header[0:4]) != string(helloMagic[:]) || header[4] != helloVersion {
-		return message, errors.New("invalid multipath hello (requires protocol v12)")
+	if string(header[0:4]) != string(helloMagic[:]) {
+		return message, nil, errors.New("invalid multipath hello")
+	}
+	if header[4] != helloVersion {
+		return message, nil, &helloVersionError{version: header[4]}
 	}
 	if _, err := io.ReadFull(conn, header[7:]); err != nil {
-		return message, err
+		return message, nil, err
 	}
 	var policyErr error
 	message.Policy, policyErr = decodeSessionPolicy(header[55:])
 	if policyErr != nil {
-		return message, policyErr
+		return message, nil, policyErr
 	}
-	if header[6]&^(helloFlagStatus|helloFlagRecovery|helloFlagControl|helloFlagCreate) != 0 {
-		return message, errors.New("invalid multipath hello flags")
+	if header[6]&^(helloFlagStatus|helloFlagRecovery|helloFlagControl|helloFlagCreate|helloFlagAuth) != 0 {
+		return message, nil, errors.New("invalid multipath hello flags")
 	}
 	message.LegID = header[5]
 	message.RequestStatus = header[6]&helloFlagStatus != 0
@@ -200,33 +270,62 @@ func readHello(conn net.Conn) (helloMessage, error) {
 	message.RecoveryEpoch = binary.BigEndian.Uint64(header[45:53])
 	message.RecoveryMask, message.RecoveryUDP = header[53], header[54]
 	if message.RecoveryMask > 3 || message.RecoveryUDP > 1 {
-		return message, errors.New("invalid recovery policy")
+		return message, nil, errors.New("invalid recovery policy")
 	}
-	if !message.Recovery && (message.Control || message.Create || message.Group != [16]byte{} || message.RecoveryEpoch != 0 || message.RecoveryMask != 0 || message.RecoveryUDP != 0) {
-		return message, errors.New("invalid multipath recovery flags")
+	if !message.Recovery && (message.Control || message.Group != [16]byte{} || message.RecoveryEpoch != 0 || message.RecoveryMask != 0 || message.RecoveryUDP != 0) {
+		return message, nil, errors.New("invalid multipath recovery flags")
 	}
 	copy(message.Session[:], header[7:23])
 	message.FrameSize = binary.BigEndian.Uint32(header[23:27])
 	if message.FrameSize == 0 || message.FrameSize > maxFramePayload {
-		return message, errors.New("invalid multipath hello frame size")
+		return message, nil, errors.New("invalid multipath hello frame size")
 	}
 	if message.Control {
 		if message.Policy != (sessionPolicy{}) || message.FrameSize != 1 {
-			return message, errors.New("invalid control policy")
+			return message, nil, errors.New("invalid control policy")
 		}
 	} else if err := message.Policy.validate(int(message.FrameSize)); err != nil {
-		return message, err
+		return message, nil, err
 	}
 	length := int(binary.BigEndian.Uint16(header[27:29]))
 	if length <= 0 {
-		return message, errors.New("empty multipath destination")
+		return message, nil, errors.New("empty multipath destination")
 	}
-	buffer := make([]byte, length)
-	if _, err := io.ReadFull(conn, buffer); err != nil {
-		return message, err
+	authenticated := header[6]&helloFlagAuth != 0
+	size := length
+	if authenticated {
+		size += helloAuthSize
 	}
-	message.Destination = string(buffer)
-	return message, nil
+	buffer := make([]byte, helloHeaderSize+size)
+	copy(buffer, header[:])
+	if _, err := io.ReadFull(conn, buffer[helloHeaderSize:]); err != nil {
+		return message, nil, err
+	}
+	message.Destination = string(buffer[helloHeaderSize : helloHeaderSize+length])
+	if authenticated {
+		raw := buffer[helloHeaderSize+length:]
+		auth = &helloAuth{signed: buffer[:len(buffer)-sha256.Size], mac: raw[24:], time: time.Unix(int64(binary.BigEndian.Uint64(raw[:8])), 0)}
+		copy(auth.nonce[:], raw[8:24])
+	}
+	return message, auth, nil
+}
+
+// verifyHelloAuth checks the MAC, clock skew and replay of an authenticated
+// hello against psk. seen records nonces for the skew period.
+func verifyHelloAuth(auth *helloAuth, psk string, now time.Time, seen func([16]byte, time.Time) bool) error {
+	if auth == nil {
+		return errors.New("multipath hello is not authenticated")
+	}
+	if !hmac.Equal(helloMAC(psk, auth.signed).Sum(nil), auth.mac) {
+		return errors.New("multipath hello authentication failed")
+	}
+	if skew := now.Sub(auth.time); skew > helloAuthSkew || skew < -helloAuthSkew {
+		return errors.New("multipath hello timestamp outside the allowed clock skew")
+	}
+	if !seen(auth.nonce, now) {
+		return errors.New("multipath hello replayed")
+	}
+	return nil
 }
 
 func writeHelloResponse(conn net.Conn, response helloResponse) error {
@@ -260,8 +359,11 @@ func readHelloResponse(conn net.Conn) (helloResponse, error) {
 	if _, err := io.ReadFull(conn, header[:7]); err != nil {
 		return response, err
 	}
-	if string(header[0:4]) != string(responseMagic[:]) || header[4] != helloVersion {
-		return response, errors.New("invalid multipath hello response (requires protocol v12)")
+	if string(header[0:4]) != string(responseMagic[:]) {
+		return response, errors.New("invalid multipath hello response")
+	}
+	if header[4] != helloVersion {
+		return response, &helloVersionError{version: header[4]}
 	}
 	if _, err := io.ReadFull(conn, header[7:]); err != nil {
 		return response, err

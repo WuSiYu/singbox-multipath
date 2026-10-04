@@ -206,7 +206,7 @@ func TestHelloRejectsBoosterStatus(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionTwelveHello(t *testing.T) {
+func TestProtocolVersionThirteenHello(t *testing.T) {
 	encoded, err := encodeHello(helloMessage{
 		LegID:       0,
 		FrameSize:   64 * 1024,
@@ -215,7 +215,7 @@ func TestProtocolVersionTwelveHello(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded[:4]) != "SMPA" || encoded[4] != 12 {
+	if string(encoded[:4]) != "SMPA" || encoded[4] != 13 {
 		t.Fatalf("unexpected multipath protocol header: %q version=%d", encoded[:4], encoded[4])
 	}
 }

@@ -31,6 +31,9 @@ type coreConfig struct {
 	OnStatusEvent                  func()
 	OnProtocolError                func(error)
 	SendStatus                     bool
+	HandshakeTimeout               time.Duration
+	// LegAbsentTimeout ends a session that has had no attached leg this long.
+	LegAbsentTimeout time.Duration
 }
 
 type legFailureStage string
@@ -153,12 +156,17 @@ type mpLeg struct {
 	received              stream.Receipt
 	inflight              atomic.Int64
 	prepaidFlights        int
+	feedbackAt            time.Time // stateMu; last feedback queued on this leg
 	peerTerminal          atomic.Bool
 }
 
 type mpCore struct {
-	finPath         *mpLeg // stateMu; retransmit FIN after a control path change
-	peerPressure    bool   // stateMu; suppress speculative secondary assignments
+	finPath         *mpLeg    // stateMu; leg that carried the latest DATA_FIN copy
+	finSentAt       time.Time // stateMu
+	legsAbsentSince time.Time // stateMu; zero while any leg is attached or joining
+	feedbackSeq     uint64    // stateMu; sequence of the feedback this side sends
+	peerFeedbackSeq uint64    // stateMu; newest feedback sequence received
+	peerPressure    bool      // stateMu; suppress speculative secondary assignments
 	cfg             coreConfig
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -282,6 +290,28 @@ func (l *mpLeg) requestShutdown(err error, frameType byte, status *senderStatus)
 	case l.shutdown <- legShutdownRequest{err: err, frameType: frameType, status: status}:
 	default:
 		l.close(err)
+	}
+}
+
+// blockedFor reports how long the current transport write has been pending.
+func (l *mpLeg) blockedFor(now time.Time) time.Duration {
+	started := l.transportWriteStarted.Load()
+	if started <= 0 {
+		return 0
+	}
+	return max(0, now.Sub(time.Unix(0, started)))
+}
+
+// queueFeedback replaces any feedback still waiting for this leg's writer.
+func (l *mpLeg) queueFeedback(frame wireFrame, now time.Time) {
+	select {
+	case <-l.feedback:
+	default:
+	}
+	select {
+	case l.feedback <- frame:
+		l.feedbackAt = now
+	default:
 	}
 }
 

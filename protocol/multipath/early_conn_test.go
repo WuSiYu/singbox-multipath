@@ -154,7 +154,8 @@ func TestClientFastOpenSupportsOpaqueLazyChild(t *testing.T) {
 	}
 }
 
-func TestWriteHelloWithoutMultipathTFOUsesSeparateWrites(t *testing.T) {
+// A hello leaves in a single write so it fits one segment with its header.
+func TestWriteHelloWithoutMultipathTFOIsOneWrite(t *testing.T) {
 	message := helloMessage{
 		Session:     [16]byte{2, 4, 6, 8},
 		LegID:       0,
@@ -166,7 +167,7 @@ func TestWriteHelloWithoutMultipathTFOUsesSeparateWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	writes := spy.snapshotWrites()
-	if len(writes) != 2 {
+	if len(writes) != 1 {
 		t.Fatalf("non-fast-open hello path changed its physical write count: got %d", len(writes))
 	}
 	hello, err := encodeHello(message)

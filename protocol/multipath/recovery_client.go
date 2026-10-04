@@ -138,7 +138,7 @@ func (r *recoveryClient) runControl(id byte) {
 			}
 			r.control[id] = conn
 			r.mu.Unlock()
-			err = r.o.clientHandshake(ctx, conn, helloMessage{Session: r.id, Group: r.id, Recovery: true, Control: true, LegID: id, FrameSize: 1, Destination: r.o.aggregation.String()})
+			err = r.o.clientHandshake(ctx, conn, helloMessage{Session: r.id, Group: r.id, Recovery: true, Control: true, LegID: id, FrameSize: 1, Destination: r.o.aggregation.String(), PSK: r.o.psk})
 		}
 		cancel()
 		if err == nil {
@@ -301,7 +301,7 @@ func (r *recoveryClient) runPolicy() {
 		now := time.Now()
 		r.mu.Lock()
 		for id := range r.health {
-			r.health[id].refresh(now, r.timeout)
+			r.health[id].refresh(now, r.timeout, r.delay)
 		}
 		r.tcpChoice = recoveryChoice(r.tcpChoice, 0, r.health, now, r.delay)
 		r.udpChoice = recoveryChoice(r.udpChoice, r.preferredUDP, r.health, now, r.delay)

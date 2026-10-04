@@ -31,6 +31,12 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 	if cfg.ActivationWindow <= 0 {
 		cfg.ActivationWindow = defaultActivationWindow
 	}
+	if cfg.HandshakeTimeout <= 0 {
+		cfg.HandshakeTimeout = 10 * time.Second
+	}
+	if cfg.LegAbsentTimeout <= 0 {
+		cfg.LegAbsentTimeout = legAbsentTimeout(cfg.HandshakeTimeout)
+	}
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -163,8 +169,7 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 	if id == 0 || c.cfg.Recovery != nil {
 		initial := wireFrame{typ: frameTypeWindow, flow: c.feedbackLockedWithoutLegs()}
 		if early, ok := conn.(*clientFastOpenConn); ok {
-			encoded := encodeFlow(initial)
-			early.initialWindow = encoded[:]
+			early.initialWindow = encodeFlow(initial)
 		} else if preamble == nil {
 			leg.startupFeedback = &initial
 		}
@@ -270,8 +275,9 @@ const (
 func (c *mpCore) carryingRateLocked() (float64, time.Duration) {
 	rate, rtt := float64(0), time.Duration(0)
 	saving := c.trafficSavingSecondaryLocked()
+	preferred := c.preferredDataLeg()
 	for _, leg := range c.availableLegs() {
-		if !c.active.Load() && leg.id != 0 && c.controlLeg() != leg {
+		if !c.active.Load() && leg != preferred {
 			continue
 		}
 		if saving != nil && leg != saving {

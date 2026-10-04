@@ -358,7 +358,7 @@ func classifyStatusError(err error) (category string, transient bool, harmless b
 		harmless = reason == helloRejectSessionUnavailable || reason == helloRejectLegUnavailable
 		return "hello_rejected", harmless, harmless
 	}
-	if errors.Is(err, errLeg1Stalled) {
+	if errors.Is(err, errLegStalled) {
 		return "replay_timeout", true, false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(message, "timeout") {

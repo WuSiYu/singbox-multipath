@@ -35,31 +35,56 @@ func (c *mpCore) pumpLoop() {
 			return
 		}
 		wait := time.Second
-		primary := c.controlLeg()
+		primary := c.pickControlLeg(now)
 		if c.cfg.Recovery != nil && now.Sub(lastFeedback) >= time.Second {
 			c.feedbackDirty = true
 		}
-		if primary != nil && primary.ready.Load() && c.feedbackDirty {
+		if primary != nil && c.feedbackDirty {
 			if now.Sub(lastFeedback) >= 5*time.Millisecond || c.rx.Complete() {
 				c.legsMu.RLock()
 				feedback := c.feedbackLockedWithoutLegs()
 				c.legsMu.RUnlock()
 				frame := wireFrame{typ: frameTypeWindow, flow: feedback}
-				select {
-				case <-primary.feedback:
-				default:
+				blocked := primary.blockedFor(now)
+				for _, leg := range c.availableLegs() {
+					// Feedback goes on the least blocked leg. The other leg
+					// carries a copy at least every 20 ms, or immediately when
+					// the chosen leg's writer is stuck, so ACKs, windows and
+					// path receipts never depend on a single path.
+					if leg == primary || leg.ready.Load() && (now.Sub(leg.feedbackAt) >= feedbackCopyInterval || blocked >= max(10*time.Millisecond, leg.path.SRTT/2)) {
+						leg.queueFeedback(frame, now)
+					}
 				}
-				primary.feedback <- frame
 				c.feedbackDirty = false
 				lastFeedback = now
 			} else {
 				wait = 5*time.Millisecond - now.Sub(lastFeedback)
 			}
 		}
-		for _, leg := range c.availableLegs() {
+		legs := c.availableLegs()
+		// Failover sessions are owned through the shared control channel and
+		// its lease instead; others end after a bounded leg-less period.
+		if c.cfg.Recovery == nil && len(legs) == 0 && !c.joiningLegs() {
+			if c.legsAbsentSince.IsZero() {
+				c.legsAbsentSince = now
+			} else if now.Sub(c.legsAbsentSince) >= c.cfg.LegAbsentTimeout {
+				c.stateMu.Unlock()
+				c.fail(errNoLegs)
+				return
+			}
+		} else {
+			c.legsAbsentSince = time.Time{}
+		}
+		var dead []*mpLeg
+		for _, leg := range legs {
 			if leg.path.Stalled(now, c.cfg.PathStallTimeoutMin) && !leg.path.Stale {
 				leg.path.Stale = true
 				c.replayTO.Add(1)
+			}
+			// A leg without any progress for this long is closed so its
+			// manager can redial; the session keeps running elsewhere.
+			if leg.path.Stale && leg.path.Stalled(now, deadLegTimeout) {
+				dead = append(dead, leg)
 			}
 			if leg.path.Outstanding() != 0 {
 				wait = min(wait, 50*time.Millisecond)
@@ -91,16 +116,33 @@ func (c *mpCore) pumpLoop() {
 				c.tx.FINSent = false
 				c.tx.Next--
 			} else {
-				c.finPath = primary
+				c.finPath, c.finSentAt = primary, now
 			}
 		}
-		if c.cfg.Recovery != nil && primary != nil && c.finPath != primary && c.tx.FINSent && !c.tx.FINAcked {
-			if primary.tryQueueControl(wireFrame{typ: frameTypeFIN, seq: c.tx.FIN}) {
-				c.finPath = primary
+		// DATA_FIN carries its sequence number, so any leg may repeat it. Resend
+		// when its leg disappeared or it stayed unacknowledged for an RTO.
+		if primary != nil && c.tx.FINSent && !c.tx.FINAcked && c.finPath != nil {
+			gone := c.getLeg(c.finPath.id) != c.finPath
+			if gone || now.Sub(c.finSentAt) >= c.finPath.path.RTO(c.cfg.PathStallTimeoutMin) {
+				target := primary
+				if !gone && primary == c.finPath {
+					for _, leg := range c.availableLegs() {
+						if leg != c.finPath && leg.ready.Load() {
+							target = leg
+						}
+					}
+				}
+				if target.tryQueueControl(wireFrame{typ: frameTypeFIN, seq: c.tx.FIN}) {
+					c.finPath, c.finSentAt = target, now
+				}
 			}
+			wait = min(wait, 50*time.Millisecond)
 		}
 		c.updateStateCountersLocked()
 		c.stateMu.Unlock()
+		for _, leg := range dead {
+			c.legFailed(leg, legFailureReplay, errLegStalled)
+		}
 		if errors.Is(pumpErr, errMemoryLimit) {
 			pumpErr = nil
 			wait = min(wait, 50*time.Millisecond)
@@ -124,11 +166,38 @@ func (c *mpCore) pumpLoop() {
 	}
 }
 
+const (
+	feedbackCopyInterval = 20 * time.Millisecond
+	deadLegTimeout       = 15 * time.Second
+)
+
+var (
+	errNoLegs     = errors.New("multipath session lost every leg")
+	errLegStalled = errors.New("multipath leg made no progress")
+)
+
+// pickControlLeg chooses the ready leg whose writer is least blocked for
+// connection-level control (feedback, FIN, status). Ties prefer leg0.
+func (c *mpCore) pickControlLeg(now time.Time) *mpLeg {
+	var best *mpLeg
+	var bestBlocked time.Duration
+	for _, leg := range c.availableLegs() {
+		if !leg.ready.Load() || c.cfg.Recovery != nil && !c.cfg.Recovery.allows(leg.id) {
+			continue
+		}
+		if blocked := leg.blockedFor(now); best == nil || blocked < bestBlocked {
+			best, bestBlocked = leg, blocked
+		}
+	}
+	return best
+}
+
 // Caller holds both stateMu and legsMu. Feedback contains whole-path receipt
 // frontiers, not local transport send completions and not application reads.
 func (c *mpCore) feedbackLockedWithoutLegs() flowMessage {
 	target := c.receiveTargetLocked(time.Now())
-	message := flowMessage{Next: c.rx.Ack(), Limit: c.rx.Advertise(target)}
+	c.feedbackSeq++
+	message := flowMessage{Next: c.rx.Ack(), Limit: c.rx.Advertise(target), Seq: c.feedbackSeq}
 	// Informational only: the receiver's node is using its emergency margin.
 	if c.memory.underPressure() {
 		message.Flags |= flowFlagPressure
@@ -155,7 +224,12 @@ func (c *mpCore) handleWindow(message flowMessage) error {
 	if err := c.tx.Acknowledge(message.Next, message.Limit); err != nil {
 		return err
 	}
-	c.peerPressure = message.Flags&flowFlagPressure != 0
+	// Copies of feedback travel on both legs and may arrive out of order.
+	// Monotonic fields merge above; the rest only applies when newer.
+	if message.Seq > c.peerFeedbackSeq {
+		c.peerFeedbackSeq = message.Seq
+		c.peerPressure = message.Flags&flowFlagPressure != 0
+	}
 	now := time.Now()
 	for _, leg := range c.availableLegs() {
 		if err := leg.path.Feedback(message.Paths[leg.id], now); err != nil {
@@ -224,12 +298,12 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 		if leg.path.Stale {
 			continue
 		}
-		emergency := c.cfg.Recovery != nil && c.controlLeg() == leg && leg.id == 1
-		if (!c.active.Load() && leg.id == 0) || emergency {
-			if leg.busy {
-				continue
+		if !c.active.Load() {
+			// Before activation only the preferred data leg carries data.
+			if preferred := c.preferredDataLeg(); preferred != nil && !preferred.busy {
+				return preferred
 			}
-			return leg
+			return nil
 		}
 		// Data are already retained in the send history and receive storage
 		// is accounted by the receiver, so memory never gates a path.
@@ -256,7 +330,7 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 
 func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, now time.Time) error {
 	prepaid := false
-	essential := leg.id == 0 || (c.cfg.Recovery != nil && c.controlLeg() == leg)
+	essential := leg.id == 0 || leg == c.preferredDataLeg()
 	if !c.memory.reservePage(128, essential) {
 		if !essential || leg.prepaidFlights >= 16 {
 			return errMemoryLimit
@@ -316,9 +390,12 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 		if pruned && !stale && now.Sub(mapping.sentAt) < owner.path.RTO(c.cfg.PathStallTimeoutMin) {
 			continue
 		}
-		target := c.controlLeg()
-		if mapping.path == 0 && stale && c.active.Load() {
-			target = c.getLeg(1)
+		target := c.preferredDataLeg()
+		if lost || stale {
+			// Repair on a different, healthy path whenever one exists.
+			if other := c.otherUsableLeg(mapping.path); other != nil {
+				target = other
+			}
 		}
 		if c.cfg.Recovery != nil && target != nil && !c.cfg.Recovery.allows(target.id) {
 			continue
@@ -360,10 +437,8 @@ func (c *mpCore) trafficSavingSecondaryLocked() *mpLeg {
 }
 
 func (c *mpCore) dataModeLocked() uint64 {
-	if c.cfg.Recovery != nil {
-		if leg := c.controlLeg(); leg != nil && leg.id == 1 {
-			return 5
-		}
+	if leg := c.preferredDataLeg(); leg != nil && leg.id == 1 && (!c.active.Load() || c.getLeg(0) == nil || !c.usableLeg(c.getLeg(0))) {
+		return 5
 	}
 	if !c.active.Load() {
 		return 1

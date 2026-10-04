@@ -23,7 +23,7 @@ type finAckGate struct {
 
 func (g *finAckGate) Close() error { g.once.Do(func() { close(g.stopped) }); return g.Conn.Close() }
 func (g *finAckGate) Write(p []byte) (int, error) {
-	if !g.blocked && len(p) == 1+flowPayloadSize && p[0] == frameTypeWindow && binary.BigEndian.Uint64(p[2:10]) == (32<<10)+1 {
+	if !g.blocked && len(p) >= flowFixedSize && p[0] == frameTypeWindow && binary.BigEndian.Uint64(p[2:10]) == (32<<10)+1 {
 		g.blocked = true
 		close(g.started)
 		select {

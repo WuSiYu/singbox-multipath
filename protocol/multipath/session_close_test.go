@@ -58,7 +58,10 @@ func TestCoreCloseWritesSessionCloseOnEveryLeg(t *testing.T) {
 	}
 }
 
-func TestSessionCloseOnBoosterCannotOvertakePrimary(t *testing.T) {
+// Session close is sent only when the peer terminates, after its DATA_FIN was
+// acknowledged on a normal close, so it is ordered by the byte stream and ends
+// the session from any leg.
+func TestSessionCloseOnAnyLegEndsSession(t *testing.T) {
 	core, appConn := newCore(context.Background(), testCoreConfig())
 	t.Cleanup(func() { core.Close() })
 	t.Cleanup(func() { appConn.Close() })
@@ -71,25 +74,20 @@ func TestSessionCloseOnBoosterCannotOvertakePrimary(t *testing.T) {
 		peers = append(peers, peerConn)
 		t.Cleanup(func() { peerConn.Close() })
 	}
-
-	writeResult := make(chan error, 1)
-	go func() {
-		writeResult <- writeWireFrame(peers[1], wireFrame{typ: frameTypeSessionClose})
-	}()
-	select {
-	case <-core.Done():
-		t.Fatal("secondary terminal event overtook primary")
-	case <-time.After(50 * time.Millisecond):
-	}
-	if err := <-writeResult; err != nil {
+	go func() { _, _ = io.Copy(io.Discard, peers[0]) }()
+	if err := writeWireFrame(peers[1], wireFrame{typ: frameTypeSessionClose}); err != nil {
 		t.Fatal(err)
 	}
-	if core.isDone() || core.getLeg(0) == nil {
-		t.Fatal("secondary terminal event terminated the logical stream")
+	select {
+	case <-core.Done():
+	case <-time.After(time.Second):
+		t.Fatal("session close on leg1 was ignored")
 	}
 }
 
-func TestJoinSecondaryDefersSessionNotFound(t *testing.T) {
+// A confirmed session that the server reports as unavailable has ended there;
+// the leg manager closes the local session instead of retrying forever.
+func TestMaintainLegEndsSessionClosedByServer(t *testing.T) {
 	core, appConn := newCore(context.Background(), testCoreConfig())
 	t.Cleanup(func() { appConn.Close() })
 	primaryConn, primaryPeer := net.Pipe()
@@ -97,9 +95,9 @@ func TestJoinSecondaryDefersSessionNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { primaryPeer.Close() })
+	go func() { _, _ = io.Copy(io.Discard, primaryPeer) }()
 
 	var dialCount atomic.Uint64
-	serverResult := make(chan error, 1)
 	secondary := &tfoMatrixChild{
 		tag: "secondary",
 		dial: func(context.Context) (net.Conn, error) {
@@ -107,51 +105,53 @@ func TestJoinSecondaryDefersSessionNotFound(t *testing.T) {
 			clientConn, serverConn := net.Pipe()
 			go func() {
 				defer serverConn.Close()
-				_, err := readHello(serverConn)
-				if err == nil {
-					err = writeHelloResponse(serverConn, helloResponse{
-						Status:       helloStatusRejected,
-						RejectReason: helloRejectSessionUnavailable,
-					})
+				if _, err := readHello(serverConn); err == nil {
+					_ = writeHelloResponse(serverConn, helloResponse{Status: helloStatusRejected, RejectReason: helloRejectSessionUnavailable})
 				}
-				serverResult <- err
 			}()
 			return clientConn, nil
 		},
 	}
 	outbound := &Outbound{
+		ctx:              context.Background(),
 		logger:           L.NOP(),
 		tags:             []string{"primary", secondary.tag},
 		children:         []adapter.Outbound{nil, secondary},
 		handshakeTimeout: time.Second,
+		cfg:              testCoreConfig(),
 	}
-	var sessionID [16]byte
-	joinDone := make(chan struct{})
+	var confirmed atomic.Bool
+	confirmed.Store(true)
+	done := make(chan struct{})
 	go func() {
-		outbound.joinSecondary(core, sessionID, uint32(testCoreConfig().FrameSize), "example.com:443", nil)
-		close(joinDone)
+		outbound.maintainLeg(core, [16]byte{1}, 1, "example.com:443", &confirmed, time.Now().Add(time.Second), nil)
+		close(done)
 	}()
-
-	if err := <-serverResult; err != nil {
-		t.Fatal(err)
-	}
 	select {
-	case <-joinDone:
-		t.Fatal("session-not-found incorrectly terminated the secondary join")
-	case <-time.After(100 * time.Millisecond):
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leg manager kept retrying a closed session")
 	}
-	if count := dialCount.Load(); count != 1 {
-		t.Fatalf("session-not-found caused an immediate retry: %d dials", count)
+	if !core.isDone() || dialCount.Load() != 1 {
+		t.Fatalf("closed session: done=%v dials=%d", core.isDone(), dialCount.Load())
 	}
-	if core.isDone() {
-		t.Fatal("session-not-found incorrectly closed the local core")
-	}
+}
 
-	core.peerSessionClosed(io.EOF)
-	select {
-	case <-joinDone:
-	case <-time.After(time.Second):
-		t.Fatal("explicit peer session close did not stop the secondary join")
+func TestLegBackoff(t *testing.T) {
+	backoff := time.Duration(0)
+	var got []time.Duration
+	for range 7 {
+		backoff = nextLegBackoff(backoff, false)
+		got = append(got, backoff)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backoff %v, want %v", got, want)
+		}
+	}
+	if nextLegBackoff(time.Minute, true) != 250*time.Millisecond {
+		t.Fatal("failover sessions rely on shared health checks and retry quickly")
 	}
 }
 

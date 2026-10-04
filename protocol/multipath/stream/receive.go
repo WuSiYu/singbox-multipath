@@ -16,6 +16,9 @@ const (
 	PageCharge = PageSize + PageSize/8 + 256
 )
 
+// Range is a half-open byte interval of the connection sequence space.
+type Range struct{ Start, End uint64 }
+
 var (
 	ErrSequence = errors.New("invalid multipath byte sequence")
 	ErrWindow   = errors.New("multipath data exceeds receive window")

@@ -44,7 +44,7 @@ func (c *auditDelayConn) Write(p []byte) (int, error) {
 	isData := len(p) == dataFrameHeaderSize && p[0] == frameTypeData
 	isPayload := c.payload
 	c.payload = isData
-	match := c.mode == "all" || c.mode == "header" && isData || c.mode == "payload" && isPayload || c.mode == "window" && len(p) == 1+flowPayloadSize && p[0] == frameTypeWindow
+	match := c.mode == "all" || c.mode == "header" && isData || c.mode == "payload" && isPayload || c.mode == "window" && len(p) >= flowFixedSize && p[0] == frameTypeWindow
 	if match {
 		c.count++
 		if c.count%c.every == 0 {

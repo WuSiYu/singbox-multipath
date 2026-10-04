@@ -269,6 +269,7 @@ func (g *recoveryServerGroup) close() {
 func (i *Inbound) recoveryMaintenance(ctx context.Context) {
 	for recoveryWait(ctx, time.Second) {
 		now := time.Now()
+		i.expireClosedSessions(now)
 		i.recoveryMu.Lock()
 		var expired []*recoveryServerGroup
 		var live []*recoveryServerGroup

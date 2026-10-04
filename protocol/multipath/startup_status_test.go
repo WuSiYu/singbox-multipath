@@ -16,43 +16,43 @@ func TestRecoveryFirstHealthyPreference(t *testing.T) {
 			var health [2]recoveryHealth
 			other := 1 - preferred
 			health[other].lastTCP, health[other].lastUDP = now, now
-			health[other].refresh(now, 5*time.Second)
+			health[other].refresh(now, 5*time.Second, 30*time.Second)
 			choice := recoveryChoice(preferred, preferred, health, now, 30*time.Second)
 			if choice != other {
 				t.Fatal("startup must use the available fallback")
 			}
 			// TCP alone is not enough; both challenge replies remain required.
 			health[preferred].lastTCP = now
-			health[preferred].refresh(now, 5*time.Second)
+			health[preferred].refresh(now, 5*time.Second, 30*time.Second)
 			if recoveryChoice(choice, preferred, health, now, 30*time.Second) != other {
 				t.Fatal("selected an unconfirmed path")
 			}
 			health[preferred].lastUDP = now.Add(100 * time.Millisecond)
-			health[preferred].refresh(now.Add(100*time.Millisecond), 5*time.Second)
+			health[preferred].refresh(now.Add(100*time.Millisecond), 5*time.Second, 30*time.Second)
 			choice = recoveryChoice(choice, preferred, health, now.Add(100*time.Millisecond), 30*time.Second)
 			if choice != preferred {
 				t.Fatal("first healthy preference incorrectly waits for failback_delay")
 			}
 			// A real outage after initial health must still enable the full hold.
 			failed := now.Add(6 * time.Second)
-			health[preferred].refresh(failed, 5*time.Second)
+			health[preferred].refresh(failed, 5*time.Second, 30*time.Second)
 			health[other].lastTCP, health[other].lastUDP = failed, failed
-			health[other].refresh(failed, 5*time.Second)
+			health[other].refresh(failed, 5*time.Second, 30*time.Second)
 			choice = recoveryChoice(choice, preferred, health, failed, 30*time.Second)
 			if choice != other {
 				t.Fatal("failed to leave the unavailable preferred path")
 			}
 			recovered := failed.Add(time.Second)
 			health[preferred].lastTCP, health[preferred].lastUDP = recovered, recovered
-			health[preferred].refresh(recovered, 5*time.Second)
-			for second := 0; second <= 30; second++ {
+			health[preferred].refresh(recovered, 5*time.Second, 30*time.Second)
+			for second := 0; second <= 3; second++ {
 				at := recovered.Add(time.Duration(second) * time.Second)
 				for id := range health {
 					health[id].lastTCP, health[id].lastUDP = at, at
-					health[id].refresh(at, 5*time.Second)
+					health[id].refresh(at, 5*time.Second, 30*time.Second)
 				}
 				want := other
-				if second == 30 {
+				if second >= 3 {
 					want = preferred
 				}
 				if got := recoveryChoice(choice, preferred, health, at, 30*time.Second); got != want {

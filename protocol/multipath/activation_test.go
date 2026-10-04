@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/protocol/multipath/stream"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 	"github.com/sagernet/sing/common/json"
 )
 

@@ -139,8 +139,7 @@ func (c *clientFastOpenConn) Close() error {
 func encodeWireFrame(frame wireFrame) ([]byte, error) {
 	switch frame.typ {
 	case frameTypeWindow:
-		encoded := encodeFlow(frame)
-		return encoded[:], nil
+		return encodeFlow(frame), nil
 	case frameTypeData:
 		if len(frame.data) == 0 || len(frame.data) > maxFramePayload {
 			return nil, errors.New("invalid multipath data frame")
@@ -200,13 +199,10 @@ func (c *earlyLogicalConn) Write(payload []byte) (int, error) {
 		c.helloOnce.Do(func() {
 			c.core.startWorkers(func() {
 				if err := c.primary.writeHelloOnly(); err != nil {
-					if c.core.cfg.Recovery == nil {
-						c.core.fail(err)
-					} else {
-						for _, leg := range c.core.availableLegs() {
-							if leg.conn == c.primary {
-								c.core.legFailed(leg, legFailureHandshake, err)
-							}
+					// The session can still be created on the other leg.
+					for _, leg := range c.core.availableLegs() {
+						if leg.conn == c.primary {
+							c.core.legFailed(leg, legFailureHandshake, err)
 						}
 					}
 				}
@@ -227,7 +223,9 @@ func (c *earlyLogicalConn) Write(payload []byte) (int, error) {
 func (c *earlyLogicalConn) waitInitialWrite() error {
 	select {
 	case <-c.primary.startDone:
-		if c.core.cfg.Recovery != nil && !c.core.isDone() {
+		// A failed first write leaves the session to the other leg; only a
+		// terminated session is an application error.
+		if !c.core.isDone() {
 			return nil
 		}
 		return c.primary.startErr

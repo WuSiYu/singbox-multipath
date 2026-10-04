@@ -32,30 +32,32 @@ func TestRecoveryHealthAndHold(t *testing.T) {
 	var health [2]recoveryHealth
 	for id := range health {
 		health[id] = recoveryHealth{lastTCP: now, lastUDP: now}
-		health[id].refresh(now, 5*time.Second)
+		health[id].refresh(now, 5*time.Second, 30*time.Second)
 	}
 	if got := recoveryChoice(0, 0, health, now, 30*time.Second); got != 0 {
 		t.Fatal(got)
 	}
-	health[0].refresh(now.Add(5*time.Second), 5*time.Second)
+	health[0].refresh(now.Add(5*time.Second), 5*time.Second, 30*time.Second)
 	health[1].lastTCP = now.Add(5 * time.Second)
 	health[1].lastUDP = health[1].lastTCP
-	health[1].refresh(health[1].lastTCP, 5*time.Second)
+	health[1].refresh(health[1].lastTCP, 5*time.Second, 30*time.Second)
 	if got := recoveryChoice(0, 0, health, now.Add(5*time.Second), 30*time.Second); got != 1 {
 		t.Fatal(got)
 	}
 	recovered := now.Add(6 * time.Second)
 	health[0].lastTCP = recovered
 	health[0].lastUDP = recovered
-	health[0].refresh(recovered, 5*time.Second)
-	if got := recoveryChoice(1, 0, health, recovered.Add(29*time.Second), 30*time.Second); got != 1 {
+	health[0].refresh(recovered, 5*time.Second, 30*time.Second)
+	// An isolated failure holds the return for three seconds, not the full
+	// failback_delay, so a short blip does not cost half a minute.
+	if got := recoveryChoice(1, 0, health, recovered.Add(2*time.Second), 30*time.Second); got != 1 {
 		t.Fatal("early failback", got)
 	}
-	if got := recoveryChoice(1, 0, health, recovered.Add(30*time.Second), 30*time.Second); got != 0 {
+	if got := recoveryChoice(1, 0, health, recovered.Add(3*time.Second), 30*time.Second); got != 0 {
 		t.Fatal("missing failback", got)
 	}
 	// One missed probe does not restart the hold period.
-	health[0].refresh(recovered.Add(3*time.Second), 5*time.Second)
+	health[0].refresh(recovered.Add(3*time.Second), 5*time.Second, 30*time.Second)
 	if health[0].since != recovered {
 		t.Fatal("hold restarted after a missed probe")
 	}
@@ -67,6 +69,33 @@ func TestRecoveryHealthAndHold(t *testing.T) {
 	health[1].healthy = true
 	if got := recoveryChoice(1, 1, health, recovered, 30*time.Second); got != 1 {
 		t.Fatal("UDP preference changed")
+	}
+}
+
+func TestRecoveryFailbackHoldBacksOff(t *testing.T) {
+	now := time.Now()
+	h := recoveryHealth{lastTCP: now, lastUDP: now}
+	h.refresh(now, 5*time.Second, 30*time.Second)
+	var holds []time.Duration
+	for flap := 0; flap < 5; flap++ {
+		down := now.Add(time.Duration(flap*10+6) * time.Second)
+		h.refresh(down, 5*time.Second, 30*time.Second)
+		up := down.Add(time.Second)
+		h.lastTCP, h.lastUDP = up, up
+		h.refresh(up, 5*time.Second, 30*time.Second)
+		holds = append(holds, h.hold(30*time.Second))
+	}
+	want := []time.Duration{3 * time.Second, 6 * time.Second, 12 * time.Second, 24 * time.Second, 30 * time.Second}
+	for i := range want {
+		if holds[i] != want[i] {
+			t.Fatalf("holds %v, want %v", holds, want)
+		}
+	}
+	// A path that stayed healthy for the whole failback window starts over.
+	later := now.Add(10 * time.Minute)
+	h.refresh(later, 5*time.Second, 30*time.Second)
+	if h.hold(30*time.Second) != 3*time.Second {
+		t.Fatal("hold did not reset after a quiet window")
 	}
 }
 

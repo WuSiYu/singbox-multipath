@@ -443,7 +443,7 @@ func TestClassifyStatusError(t *testing.T) {
 		{"unexpected eof", io.ErrUnexpectedEOF, "peer_closed", true, false},
 		{"unavailable session", &helloRejectedError{reason: helloRejectSessionUnavailable}, "hello_rejected", true, true},
 		{"leg unavailable", &helloRejectedError{reason: helloRejectLegUnavailable}, "hello_rejected", true, true},
-		{"replay timeout", errLeg1Stalled, "replay_timeout", true, false},
+		{"replay timeout", errLegStalled, "replay_timeout", true, false},
 		{"dial timeout", errors.New("dial tcp: i/o timeout"), "timeout", true, false},
 		{"transport", errors.New("connection reset by peer"), "transport_error", false, false},
 	}

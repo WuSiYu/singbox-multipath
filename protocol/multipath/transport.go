@@ -117,6 +117,11 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 		if err := leg.readPreamble(leg.conn); err != nil {
 			if !c.isDone() {
 				c.legFailed(leg, legFailureHandshake, err)
+				// An explicit rejection (policy, authentication, version)
+				// would repeat on every leg: end the session.
+				if reason, rejected := helloRejectReasonFromError(err); rejected && reason.fatal(false) || errors.Is(err, errPolicyNotConfirmed) {
+					c.fail(err)
+				}
 			}
 			return
 		}
@@ -141,37 +146,20 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 		}
 		switch frame.typ {
 		case frameTypeWindow:
-			if leg.id != 0 && c.cfg.Recovery == nil {
-				err = errors.New("multipath feedback requires the primary path")
-			} else {
-				err = c.handleWindow(frame.flow)
-			}
+			err = c.handleWindow(frame.flow)
 		case frameTypePing:
 			leg.tryQueueControl(wireFrame{typ: frameTypePong, seq: frame.seq})
 		case frameTypePong:
 			c.handlePong(leg.id, frame.seq, time.Now())
 		case frameTypeSenderStatus:
-			if leg.id != 0 && c.cfg.Recovery == nil {
-				err = errors.New("multipath sender status requires the primary path")
-			} else {
-				c.handlePeerSenderStatus(frame.status, time.Now())
-			}
+			c.handlePeerSenderStatus(frame.status, time.Now())
 		case frameTypeReset:
-			if leg.id == 1 && c.cfg.Recovery == nil {
-				c.legFailed(leg, legFailureReadData, errors.New("multipath secondary reset"))
-			} else {
-				c.peerSessionClosed(errors.New("multipath peer reset"))
-			}
+			c.peerSessionClosed(errors.New("multipath peer reset"))
 			return
 		case frameTypeSessionClose:
+			// Session close follows the acknowledged DATA_FIN, so it is
+			// ordered by the byte stream and valid on any leg.
 			c.notePeerCloseReason(frame.closeReason)
-			if leg.id != 0 && c.cfg.Recovery == nil {
-				// A delayed secondary terminal frame cannot close the logical
-				// stream before the primary's ordered terminal event arrives.
-				leg.peerTerminal.Store(true)
-				c.legFailed(leg, legFailureReadData, io.EOF)
-				return
-			}
 			c.peerSessionClosed(io.EOF)
 			return
 		case frameTypeFIN:
@@ -198,9 +186,6 @@ func (c *mpCore) receiveMapping(leg *mpLeg, frame wireFrame) error {
 	}
 	var err error
 	if frame.typ == frameTypeFIN {
-		if leg.id != 0 && c.cfg.Recovery == nil {
-			return errors.New("multipath data FIN requires the primary path")
-		}
 		err = c.rx.SetFIN(frame.seq)
 	} else {
 		if frame.pathSeq != leg.received.Next || uint64(len(frame.data)) > math.MaxUint64-frame.pathSeq {
@@ -256,11 +241,6 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 		wakeFlow(c.pumpWake)
 		return
 	}
-	if leg.id == 0 && c.cfg.Recovery == nil {
-		// Freeze a primary transport failure before it can make the relay
-		// close the logical connection; that cleanup is not an endpoint fault.
-		c.noteCloseSource(closeSourceTransport)
-	}
 	eventErr := c.sourcedLegError(err)
 	if !isEndpointLegError(eventErr) {
 		c.legFailureMu.Lock()
@@ -275,13 +255,7 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 	if c.cfg.OnLegFailure != nil {
 		c.cfg.OnLegFailure(leg.id, stage, eventErr)
 	}
-	if leg.id == 0 && c.cfg.Recovery == nil {
-		if c.receiveComplete() {
-			c.terminateWithReceiveDrain(err, 0, true)
-		} else {
-			c.fail(err)
-		}
-		return
-	}
+	// No single leg is essential: the session continues on the other leg
+	// and the client redials this one (see maintainLeg).
 	wakeFlow(c.pumpWake)
 }

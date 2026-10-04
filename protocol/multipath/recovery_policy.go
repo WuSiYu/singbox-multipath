@@ -34,14 +34,29 @@ func (p *recoveryPolicy) update(epoch uint64, mask, udp byte) bool {
 	return true
 }
 
-func (c *mpCore) controlLeg() *mpLeg {
-	if c.cfg.Recovery == nil {
-		return c.getLeg(0)
-	}
+// usableLeg reports whether leg can carry new data now. Leg0 may carry the
+// first bytes of a lazy fast-open session before its hello is answered.
+func (c *mpCore) usableLeg(leg *mpLeg) bool {
+	return leg != nil && (leg.id == 0 || leg.ready.Load()) && !leg.path.Stale &&
+		(c.cfg.Recovery == nil || c.cfg.Recovery.allows(leg.id))
+}
+
+// preferredDataLeg carries new data before activation (and all data when
+// aggregation is off): leg0 while usable, otherwise leg1. Losing or stalling
+// leg0 therefore moves the session to leg1 without the failover option.
+func (c *mpCore) preferredDataLeg() *mpLeg {
 	for id := uint8(0); id < 2; id++ {
-		if leg := c.getLeg(id); leg != nil && c.cfg.Recovery.allows(id) {
+		if leg := c.getLeg(id); c.usableLeg(leg) {
 			return leg
 		}
+	}
+	return nil
+}
+
+// otherUsableLeg returns a usable leg other than id, if any.
+func (c *mpCore) otherUsableLeg(id uint8) *mpLeg {
+	if leg := c.getLeg(1 - id); c.usableLeg(leg) {
+		return leg
 	}
 	return nil
 }
@@ -51,11 +66,26 @@ type recoveryHealth struct {
 	since            time.Time
 	healthy          bool
 	hadFailure       bool
+	// failures counts recent losses of a healthy path; the return hold
+	// doubles with each one inside the failback window.
+	failures    int
+	lastFailure time.Time
+}
+
+const failbackHoldMin = 3 * time.Second
+
+// hold is the stability period before returning to this path: three seconds
+// after an isolated failure, doubling for repeated failures, up to delay.
+func (h *recoveryHealth) hold(delay time.Duration) time.Duration {
+	if h.failures <= 1 {
+		return min(delay, failbackHoldMin)
+	}
+	return min(delay, failbackHoldMin<<min(h.failures-1, 16))
 }
 
 // Each reply proves a recently issued challenge. Time spent behind a stalled
 // reliable stream does not become fresh evidence when that stream unblocks.
-func (h *recoveryHealth) refresh(now time.Time, timeout time.Duration) {
+func (h *recoveryHealth) refresh(now time.Time, timeout, delay time.Duration) {
 	good := !h.lastTCP.IsZero() && !h.lastUDP.IsZero() && now.Sub(h.lastTCP) < timeout && now.Sub(h.lastUDP) < timeout
 	if good && !h.healthy {
 		h.since = now
@@ -65,6 +95,11 @@ func (h *recoveryHealth) refresh(now time.Time, timeout time.Duration) {
 		// a confirmed healthy path fails, all later returns use the hold.
 		if h.healthy {
 			h.hadFailure = true
+			if h.lastFailure.IsZero() || now.Sub(h.lastFailure) >= delay+timeout {
+				h.failures = 0
+			}
+			h.failures++
+			h.lastFailure = now
 		}
 		h.since = time.Time{}
 	}
@@ -81,7 +116,7 @@ func recoveryChoice(current, preferred byte, health [2]recoveryHealth, now time.
 		}
 		return current
 	}
-	if health[preferred].healthy && (!health[preferred].hadFailure || now.Sub(health[preferred].since) >= delay) {
+	if health[preferred].healthy && (!health[preferred].hadFailure || now.Sub(health[preferred].since) >= health[preferred].hold(delay)) {
 		return preferred
 	}
 	return current

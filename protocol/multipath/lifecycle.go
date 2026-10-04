@@ -225,6 +225,13 @@ func (c *mpCore) cancelLegReservation(id uint8) {
 	c.legsMu.Unlock()
 }
 
+// joiningLegs reports a leg reservation awaiting its handshake to complete.
+func (c *mpCore) joiningLegs() bool {
+	c.legsMu.RLock()
+	defer c.legsMu.RUnlock()
+	return len(c.reserved) > 0
+}
+
 func (c *mpCore) getLeg(id uint8) *mpLeg {
 	c.legsMu.RLock()
 	leg := c.legs[id]

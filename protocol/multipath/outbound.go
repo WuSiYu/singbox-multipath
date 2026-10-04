@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -45,6 +46,8 @@ type Outbound struct {
 	failoverTimeout  time.Duration
 	failbackDelay    time.Duration
 	recovery         *recoveryClient
+	psk              string
+	legAttempts      [2]atomic.Uint64
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathOutboundOptions) (adapter.Outbound, error) {
@@ -125,6 +128,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		failoverEnabled:  options.FailoverEnabled,
 		failoverTimeout:  failoverTimeout,
 		failbackDelay:    failbackDelay,
+		psk:              options.PSK,
 		cfg:              cfg,
 		policy:           policy}, nil
 }
@@ -218,116 +222,13 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	if len(o.children) != 2 {
 		return nil, E.New("multipath outbound is not started")
 	}
-	if o.recovery != nil {
-		return o.dialRecovery(ctx, destination)
-	}
-	if o.tcpFastOpen {
-		return o.dialTCPFastOpen(ctx, destination)
-	}
-	sessionID, err := newSessionID()
-	if err != nil {
-		return nil, E.Cause(err, "generate multipath session id")
-	}
-	destinationString := destination.String()
-	primaryConn, err := o.children[0].DialContext(ctx, N.NetworkTCP, o.aggregation)
-	if err != nil {
-		return nil, E.Cause(err, "dial multipath preferred leg ", o.tags[0])
-	}
-	err = o.clientHandshake(ctx, primaryConn, helloMessage{
-		Session:       sessionID,
-		LegID:         0,
-		RequestStatus: o.statusFile != "",
-		FrameSize:     uint32(o.cfg.FrameSize),
-		Policy:        o.policy,
-		Destination:   destinationString,
-	})
-	if err != nil {
-		if o.status != nil {
-			o.status.recordLegError(0, string(legFailureHandshake), destinationString, statusSessionID(sessionID), 0, err, time.Now())
-		}
-		primaryConn.Close()
-		return nil, E.Cause(err, "multipath preferred handshake")
-	}
-	cfg := o.connectionCoreConfig(ctx, destination, sessionID)
-	core, appConn, err := newCoreWithError(ctx, cfg)
-	if err != nil {
-		primaryConn.Close()
-		return nil, E.Cause(err, "create multipath session")
-	}
-	if _, err = core.addLeg(0, primaryConn, nil); err != nil {
-		appConn.Close()
-		primaryConn.Close()
-		return nil, err
-	}
-	statusSession := o.registerStatusSession(sessionID, destinationString, core, leg1PhaseConnecting)
-	o.logger.InfoContext(ctx, "multipath connection to ", destination, " via preferred ", o.tags[0])
-	core.startWorkers(func() { o.joinSecondary(core, sessionID, uint32(cfg.FrameSize), destinationString, statusSession) })
-	return appConn, nil
-}
-
-func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	sessionID, err := newSessionID()
-	if err != nil {
-		return nil, E.Cause(err, "generate multipath session id")
-	}
-	destinationString := destination.String()
-	primaryConn, err := o.children[0].DialContext(ctx, N.NetworkTCP, o.aggregation)
-	if err != nil {
-		return nil, E.Cause(err, "dial multipath preferred leg ", o.tags[0])
-	}
-	message := helloMessage{
-		Session:       sessionID,
-		LegID:         0,
-		RequestStatus: o.statusFile != "",
-		FrameSize:     uint32(o.cfg.FrameSize),
-		Policy:        o.policy,
-		Destination:   destinationString,
-	}
-	fastOpenConn, err := newClientFastOpenConn(primaryConn, message, o.clientHandshakeDeadline(ctx))
-	if err != nil {
-		primaryConn.Close()
-		return nil, E.Cause(err, "prepare multipath preferred fast open")
-	}
-	cfg := o.connectionCoreConfig(ctx, destination, sessionID)
-	core, appConn, err := newCoreWithError(ctx, cfg)
-	if err != nil {
-		fastOpenConn.Close()
-		return nil, E.Cause(err, "create multipath session")
-	}
-	readResponse := func(conn net.Conn) error {
-		if waitErr := fastOpenConn.waitStarted(); waitErr != nil {
-			return waitErr
-		}
-		response, responseErr := readHelloResponse(conn)
-		if responseErr != nil {
-			return responseErr
-		}
-		if response.FrameSize != message.FrameSize || response.PolicyDigest != message.Policy.digest() {
-			return E.New("multipath server did not confirm the requested frame size and directional policy")
-		}
-		return conn.SetDeadline(time.Time{})
-	}
-	if _, err = core.addLegWithReadPreamble(0, fastOpenConn, nil, readResponse); err != nil {
-		appConn.Close()
-		fastOpenConn.Close()
-		return nil, err
-	}
-	statusSession := o.registerStatusSession(sessionID, destinationString, core, leg1PhaseWaiting)
-	o.logger.InfoContext(ctx, "multipath fast-open connection to ", destination, " via preferred ", o.tags[0])
-	core.startWorkers(func() {
-		if startErr := fastOpenConn.waitStarted(); startErr == nil {
-			o.joinSecondary(core, sessionID, uint32(cfg.FrameSize), destinationString, statusSession)
-		}
-	})
-	return &earlyLogicalConn{
-		Conn:    appConn,
-		core:    core,
-		primary: fastOpenConn,
-	}, nil
+	return o.dialSession(ctx, destination)
 }
 
 func (o *Outbound) connectionCoreConfig(ctx context.Context, destination M.Socksaddr, sessionID [16]byte) coreConfig {
 	cfg := o.cfg
+	cfg.HandshakeTimeout = o.handshakeTimeout
+	cfg.LegAbsentTimeout = legAbsentTimeout(o.handshakeTimeout)
 	cfg.OnProtocolError = func(err error) {
 		o.logger.ErrorContext(ctx, "multipath protocol error for ", destination, ": ", err)
 	}
@@ -423,82 +324,6 @@ func needsHandshakeForWrite(conn net.Conn) bool {
 	// that method on the outer net.Conn but expose it through Upstream.
 	earlyConn, loaded := common.Cast[interface{ NeedHandshake() bool }](conn)
 	return loaded && earlyConn.NeedHandshake()
-}
-
-func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, frameSize uint32, destination string, statusSession *statusSession) {
-	ctx := core.Context()
-	for {
-		select {
-		case <-core.Done():
-			return
-		default:
-		}
-		statusSession.beginLeg1Attempt()
-		stage := "secondary_dial"
-		attemptCtx, cancel := context.WithTimeout(ctx, o.handshakeTimeout)
-		conn, err := o.children[1].DialContext(attemptCtx, N.NetworkTCP, o.aggregation)
-		if err == nil {
-			stage = "secondary_handshake"
-			err = o.clientHandshake(attemptCtx, conn, helloMessage{
-				Session:       sessionID,
-				LegID:         1,
-				RequestStatus: o.statusFile != "",
-				FrameSize:     frameSize,
-				Policy:        o.policy,
-				Destination:   destination,
-			})
-		}
-		var leg *mpLeg
-		if err == nil {
-			stage = "secondary_attach"
-			leg, err = core.addLeg(1, conn, nil)
-		}
-		cancel()
-		if err == nil {
-			statusSession.setLeg1Phase(leg1PhaseReady)
-			o.logger.InfoContext(ctx, "multipath secondary leg ready via ", o.tags[1])
-			select {
-			case <-core.Done():
-				return
-			case <-leg.Done():
-				if leg.peerTerminal.Load() {
-					<-core.Done()
-					return
-				}
-				select {
-				case <-core.Done():
-					return
-				default:
-				}
-				statusSession.setLeg1Phase(leg1PhaseRetrying)
-				o.logger.WarnContext(ctx, "multipath secondary leg lost; retrying via ", o.tags[1])
-			}
-			continue
-		}
-		if conn != nil {
-			conn.Close()
-		}
-		select {
-		case <-core.Done():
-			return
-		default:
-		}
-		statusSession.setLeg1Phase(leg1PhaseRetrying)
-		reason, rejected := helloRejectReasonFromError(err)
-		if rejected && (reason == helloRejectSessionUnavailable || reason == helloRejectLegUnavailable) {
-			o.logger.DebugContext(ctx, "multipath secondary leg deferred: ", err)
-		} else {
-			statusSession.recordLegError(1, stage, err)
-			o.logger.WarnContext(ctx, "multipath secondary leg failed: ", err)
-		}
-		retryTimer := time.NewTimer(2 * time.Second)
-		select {
-		case <-core.Done():
-			retryTimer.Stop()
-			return
-		case <-retryTimer.C:
-		}
-	}
 }
 
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

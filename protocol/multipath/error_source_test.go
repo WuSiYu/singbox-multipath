@@ -150,7 +150,7 @@ func TestLegFailureCountsExcludeConfirmedEndpointClose(t *testing.T) {
 	}
 }
 
-func TestPeerEndpointMarkerDoesNotClosePrimary(t *testing.T) {
+func TestPeerEndpointMarkerOnAnyLeg(t *testing.T) {
 	core, app := newCore(context.Background(), flowTestConfig())
 	defer core.Close()
 	defer app.Close()
@@ -159,15 +159,16 @@ func TestPeerEndpointMarkerDoesNotClosePrimary(t *testing.T) {
 	if _, err := core.addLeg(1, a, nil); err != nil {
 		t.Fatal(err)
 	}
+	go func() { _, _ = io.Copy(io.Discard, b) }()
 	if err := writeWireFrame(b, wireFrame{typ: frameTypeSessionClose, closeReason: closeReasonEndpoint}); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case <-core.Done():
-		t.Fatal("diagnostic marker closed the logical session")
-	case <-time.After(20 * time.Millisecond):
+	case <-time.After(time.Second):
+		t.Fatal("peer session close on leg1 was ignored")
 	}
 	if source := closeSource(core.closeSource.Load()); source != closeSourceRemoteEndpoint {
-		t.Fatalf("missing secondary close provenance: %v", source)
+		t.Fatalf("missing peer close provenance: %v", source)
 	}
 }

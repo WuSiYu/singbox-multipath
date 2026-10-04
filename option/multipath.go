@@ -1,6 +1,8 @@
 package option
 
 import (
+	"net/netip"
+
 	"github.com/sagernet/sing/common/byteformats"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -52,6 +54,7 @@ type MultipathOutboundOptions struct {
 	Server           string                    `json:"server"`
 	ServerPort       uint16                    `json:"server_port"`
 	TCPFastOpen      *bool                     `json:"tcp_fast_open,omitempty"`
+	PSK              string                    `json:"psk,omitempty"`
 	FailoverEnabled  bool                      `json:"failover_enabled,omitempty"`
 	FailoverTimeout  badoption.Duration        `json:"failover_timeout,omitempty"`
 	FailbackDelay    badoption.Duration        `json:"failback_delay,omitempty"`
@@ -66,7 +69,9 @@ type MultipathOutboundOptions struct {
 
 type MultipathInboundOptions struct {
 	ListenOptions
-	MemoryLimit      *byteformats.MemoryBytes `json:"memory_limit,omitempty"`
-	HandshakeTimeout badoption.Duration       `json:"handshake_timeout,omitempty"`
+	MemoryLimit      *byteformats.MemoryBytes         `json:"memory_limit,omitempty"`
+	HandshakeTimeout badoption.Duration               `json:"handshake_timeout,omitempty"`
+	PSK              string                           `json:"psk,omitempty"`
+	AllowedIPs       badoption.Listable[netip.Prefix] `json:"allowed_ips,omitempty"`
 	MultipathDeprecatedFlatOptions
 }

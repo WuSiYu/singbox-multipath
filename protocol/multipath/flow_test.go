@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -296,15 +297,17 @@ func TestFlowIdleReleasesStorageWithoutRetractingWindow(t *testing.T) {
 }
 
 func TestFlowMessageCodec(t *testing.T) {
-	message := flowMessage{Next: 5, Limit: 64, Paths: [2]stream.Receipt{{Generation: 1, Next: 1024, ReceivedAt: 12345}, {Generation: 2, Next: 4096, ReceivedAt: 78900}}, Flags: flowFlagPressure}
-	for _, typ := range []byte{frameTypeWindow} {
+	for _, message := range []flowMessage{
+		{Next: 5, Limit: 64, Seq: 9, Paths: [2]stream.Receipt{{Generation: 1, Next: 1024, ReceivedAt: 12345}, {Generation: 2, Next: 4096, ReceivedAt: 78900}}, Flags: flowFlagPressure},
+		{Next: 1 << 40, Limit: 1<<40 + 1<<29, Seq: 1, NACKs: []stream.Range{{Start: 1<<40 + 100, End: 1<<40 + 200}, {Start: 1<<40 + 1<<28, End: 1<<40 + 1<<28 + 65536}}},
+	} {
 		a, b := net.Pipe()
-		go func() { defer a.Close(); _ = writeWireFrame(a, wireFrame{typ: typ, flow: message}) }()
+		go func() { defer a.Close(); _ = writeWireFrame(a, wireFrame{typ: frameTypeWindow, flow: message}) }()
 		core, _ := newCore(context.Background(), testCoreConfig())
 		frame, err := readWireFrame(b, core)
 		b.Close()
 		core.Close()
-		if err != nil || frame.typ != typ || frame.flow != message {
+		if err != nil || frame.typ != frameTypeWindow || !reflect.DeepEqual(frame.flow, message) {
 			t.Fatalf("flow codec: %+v %v", frame, err)
 		}
 	}

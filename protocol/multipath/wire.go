@@ -22,7 +22,10 @@ const (
 	frameTypeWindow          byte = 9
 	dataFrameHeaderSize           = 29 // type, DSN, path sequence, incarnation, payload size
 	controlFrameHeaderSize        = 9
-	flowPayloadSize               = 97
+	flowFixedSize                 = 107 // type, flags, next, limit, seq, 2 path receipts, NACK count
+	flowNACKSize                  = 8   // start offset from next (u32), length (u32)
+	maxFlowNACKs                  = 4
+	maxFlowSize                   = flowFixedSize + maxFlowNACKs*flowNACKSize
 	maxFramePayload               = 1 << 20
 	maxQueueBytes                 = 64 << 20
 	maxReorderBytes               = 512 << 20
@@ -31,15 +34,17 @@ const (
 	flowFlagPressure         byte = 1
 )
 
-var (
-	errCoreClosed  = errors.New("multipath core closed")
-	errLeg1Stalled = errors.New("multipath booster leg stalled")
-)
+var errCoreClosed = errors.New("multipath core closed")
 
+// flowMessage is the receiver's feedback. Next, Limit and the path receipts
+// are monotonic and may be merged from any leg in any order; Flags and the
+// dropped ranges (NACKs) apply only when Seq is newer than any seen before.
 type flowMessage struct {
 	Next, Limit uint64
+	Seq         uint64
 	Paths       [2]stream.Receipt
 	Flags       byte
+	NACKs       []stream.Range
 }
 
 type wireFrame struct {
@@ -54,35 +59,62 @@ type wireFrame struct {
 	closeReason              byte
 }
 
-func encodeFlow(frame wireFrame) [1 + flowPayloadSize]byte {
-	var data [1 + flowPayloadSize]byte
+func encodeFlow(frame wireFrame) []byte {
+	nacks := frame.flow.NACKs[:min(len(frame.flow.NACKs), maxFlowNACKs)]
+	data := make([]byte, flowFixedSize+len(nacks)*flowNACKSize)
 	data[0], data[1] = frame.typ, frame.flow.Flags
-	values := []uint64{frame.flow.Next, frame.flow.Limit}
+	values := []uint64{frame.flow.Next, frame.flow.Limit, frame.flow.Seq}
 	for _, path := range frame.flow.Paths {
 		values = append(values, path.Generation, path.Next, path.ReceivedAt, path.FirstNext, path.FirstReceivedAt)
 	}
 	for i, value := range values {
 		binary.BigEndian.PutUint64(data[2+i*8:10+i*8], value)
 	}
+	data[flowFixedSize-1] = byte(len(nacks))
+	for i, r := range nacks {
+		offset := flowFixedSize + i*flowNACKSize
+		binary.BigEndian.PutUint32(data[offset:offset+4], uint32(r.Start-frame.flow.Next))
+		binary.BigEndian.PutUint32(data[offset+4:offset+8], uint32(r.End-r.Start))
+	}
 	return data
 }
 
 func readFlow(conn net.Conn) (flowMessage, error) {
-	var data [flowPayloadSize]byte
-	if _, err := io.ReadFull(conn, data[:]); err != nil {
+	var data [maxFlowSize - 1]byte
+	if _, err := io.ReadFull(conn, data[:flowFixedSize-1]); err != nil {
 		return flowMessage{}, err
 	}
 	message := flowMessage{Flags: data[0]}
 	if message.Flags & ^byte(flowFlagPressure) != 0 {
 		return message, errors.New("invalid multipath feedback flags")
 	}
-	values := []*uint64{&message.Next, &message.Limit}
+	values := []*uint64{&message.Next, &message.Limit, &message.Seq}
 	for i := range message.Paths {
 		p := &message.Paths[i]
 		values = append(values, &p.Generation, &p.Next, &p.ReceivedAt, &p.FirstNext, &p.FirstReceivedAt)
 	}
 	for i, value := range values {
 		*value = binary.BigEndian.Uint64(data[1+i*8 : 9+i*8])
+	}
+	count := int(data[flowFixedSize-2])
+	if count > maxFlowNACKs {
+		return message, errors.New("invalid multipath feedback NACK count")
+	}
+	if count == 0 {
+		return message, nil
+	}
+	nacks := data[flowFixedSize-1 : flowFixedSize-1+count*flowNACKSize]
+	if _, err := io.ReadFull(conn, nacks); err != nil {
+		return message, err
+	}
+	message.NACKs = make([]stream.Range, count)
+	for i := range message.NACKs {
+		offset := uint64(binary.BigEndian.Uint32(nacks[i*flowNACKSize : i*flowNACKSize+4]))
+		length := uint64(binary.BigEndian.Uint32(nacks[i*flowNACKSize+4 : i*flowNACKSize+8]))
+		if length == 0 || message.Next > math.MaxUint64-offset-length {
+			return message, errors.New("invalid multipath feedback NACK")
+		}
+		message.NACKs[i] = stream.Range{Start: message.Next + offset, End: message.Next + offset + length}
 	}
 	return message, nil
 }
@@ -97,8 +129,7 @@ func writeWireFrame(conn net.Conn, frame wireFrame) error {
 		return writeSenderStatus(conn, frame.status)
 	}
 	if frame.typ == frameTypeWindow {
-		data := encodeFlow(frame)
-		return writeAll(conn, data[:])
+		return writeAll(conn, encodeFlow(frame))
 	}
 	if frame.typ == frameTypeData {
 		if len(frame.data) == 0 || len(frame.data) > maxFramePayload {

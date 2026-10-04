@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -52,7 +53,21 @@ type Inbound struct {
 	recoveryGroups map[[16]byte]*recoveryServerGroup
 	recoveryClosed bool
 	recoveryCancel context.CancelFunc
+
+	psk        string
+	allowedIPs []netip.Prefix
+	// Closed session IDs (access) reject delayed creates and joins; seen
+	// nonces (nonceMu) reject replayed authenticated hellos.
+	closedSessions map[[16]byte]time.Time
+	nonceMu        sync.Mutex
+	nonces         map[[16]byte]time.Time
 }
+
+const (
+	closedSessionRetention = 2 * time.Minute
+	closedSessionCharge    = 128
+	maxHelloNonces         = 1 << 16
+)
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathInboundOptions) (adapter.Inbound, error) {
 	warnDeprecated(logger, options.MultipathDeprecatedFlatOptions, "")
@@ -80,7 +95,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		statusWake:       make(chan struct{}, 1),
 		handshakeTimeout: handshakeTimeout,
 		recoveryGroups:   make(map[[16]byte]*recoveryServerGroup),
-		cfg:              coreConfig{Memory: memory}}
+		psk:              options.PSK,
+		allowedIPs:       options.AllowedIPs,
+		closedSessions:   make(map[[16]byte]time.Time),
+		nonces:           make(map[[16]byte]time.Time),
+		cfg:              coreConfig{Memory: memory, HandshakeTimeout: handshakeTimeout}}
+	if i.psk == "" && len(i.allowedIPs) == 0 && !listenIsPrivate(options.ListenOptions) {
+		logger.Warn("multipath listener has neither psk nor allowed_ips and is not bound to a private address; anyone who can reach it can relay through this server")
+	}
 	i.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -138,11 +160,26 @@ func (i *Inbound) Close() error {
 }
 
 func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if !i.sourceAllowed(metadata.Source) {
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("multipath client ", metadata.Source, " is not in allowed_ips"))
+		return
+	}
 	_ = conn.SetDeadline(time.Now().Add(i.handshakeTimeout))
-	hello, err := readHello(conn)
+	hello, auth, err := readHelloWithAuth(conn)
 	if err != nil {
+		var versionErr *helloVersionError
+		if errors.As(err, &versionErr) {
+			i.rejectHello(conn, onClose, helloRejectVersion, err)
+			return
+		}
 		N.CloseOnHandshakeFailure(conn, onClose, E.Cause(err, "read multipath hello"))
 		return
+	}
+	if i.psk != "" {
+		if err = verifyHelloAuth(auth, i.psk, time.Now(), i.rememberNonce); err != nil {
+			i.rejectHello(conn, onClose, helloRejectAuthentication, err)
+			return
+		}
 	}
 	if hello.LegID > 1 {
 		i.rejectHello(conn, onClose, helloRejectInvalidLegID, E.New("invalid multipath leg id: ", hello.LegID))
@@ -175,11 +212,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			i.rejectHello(conn, onClose, helloRejectSessionMismatch, E.New("multipath session parameters mismatch"))
 			return
 		}
-		if hello.LegID != 1 && group == nil {
-			i.access.Unlock()
-			i.rejectHello(conn, onClose, helloRejectDuplicateControl, E.New("multipath session already has a control leg"))
-			return
-		}
+		// Any leg may (re)join while its slot is free.
 		err = session.core.reserveLeg(hello.LegID)
 		i.access.Unlock()
 		if err != nil {
@@ -199,9 +232,9 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		i.logger.InfoContext(ctx, "multipath leg ", hello.LegID, " joined session for ", destination)
 		return
 	}
-	if (group == nil && hello.LegID != 0) || (group != nil && !hello.Create) {
+	if _, closed := i.closedSessions[hello.Session]; !hello.Create || closed {
 		i.access.Unlock()
-		i.rejectHello(conn, onClose, helloRejectSessionUnavailable, E.New("multipath control leg must create the session"))
+		i.rejectHello(conn, onClose, helloRejectSessionUnavailable, E.New("multipath session is not established or already closed"))
 		return
 	}
 	if group != nil {
@@ -226,6 +259,8 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		i.rejectHello(conn, onClose, helloRejectPolicy, err)
 		return
 	}
+	cfg.HandshakeTimeout = i.handshakeTimeout
+	cfg.LegAbsentTimeout = legAbsentTimeout(i.handshakeTimeout)
 	if group != nil {
 		cfg.Recovery = &group.policy
 	}
@@ -339,6 +374,12 @@ func (i *Inbound) removeSession(id [16]byte, session *serverSession) {
 	i.access.Lock()
 	if current := i.sessions[id]; current == session {
 		delete(i.sessions, id)
+		if i.closedSessions == nil {
+			i.closedSessions = make(map[[16]byte]time.Time)
+		}
+		if _, exists := i.closedSessions[id]; !exists && i.cfg.Memory.reservePage(closedSessionCharge, true) {
+			i.closedSessions[id] = time.Now()
+		}
 		if session.group != nil {
 			session.group.mu.Lock()
 			if session.recoveryEntry != nil {
@@ -352,6 +393,70 @@ func (i *Inbound) removeSession(id [16]byte, session *serverSession) {
 		}
 	}
 	i.access.Unlock()
+}
+
+func (i *Inbound) sourceAllowed(source M.Socksaddr) bool {
+	if len(i.allowedIPs) == 0 {
+		return true
+	}
+	address := source.Addr.Unmap()
+	for _, prefix := range i.allowedIPs {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+// rememberNonce records a hello nonce; it reports false for a replay.
+func (i *Inbound) rememberNonce(nonce [16]byte, now time.Time) bool {
+	i.nonceMu.Lock()
+	defer i.nonceMu.Unlock()
+	if i.nonces == nil {
+		i.nonces = make(map[[16]byte]time.Time)
+	}
+	if _, seen := i.nonces[nonce]; seen {
+		return false
+	}
+	if len(i.nonces) >= maxHelloNonces {
+		i.pruneNoncesLocked(now)
+		if len(i.nonces) >= maxHelloNonces {
+			return false
+		}
+	}
+	i.nonces[nonce] = now
+	return true
+}
+
+func (i *Inbound) pruneNoncesLocked(now time.Time) {
+	for nonce, at := range i.nonces {
+		if now.Sub(at) >= 2*helloAuthSkew {
+			delete(i.nonces, nonce)
+		}
+	}
+}
+
+// expireClosedSessions forgets tombstones and nonces after their retention.
+func (i *Inbound) expireClosedSessions(now time.Time) {
+	i.access.Lock()
+	for id, at := range i.closedSessions {
+		if now.Sub(at) >= closedSessionRetention {
+			delete(i.closedSessions, id)
+			i.cfg.Memory.releaseSession(closedSessionCharge)
+		}
+	}
+	i.access.Unlock()
+	i.nonceMu.Lock()
+	i.pruneNoncesLocked(now)
+	i.nonceMu.Unlock()
+}
+
+func listenIsPrivate(options option.ListenOptions) bool {
+	if options.Listen == nil {
+		return false
+	}
+	address := netip.Addr(*options.Listen)
+	return address.IsLoopback() || address.IsPrivate() || address.IsLinkLocalUnicast()
 }
 
 func (i *Inbound) wakeSenderStatus() {
