@@ -51,7 +51,7 @@ type MultipathOutboundOptions struct {
 	UDPOutbound      string                    `json:"udp_outbound,omitempty" reference:"outbound"`
 	Server           string                    `json:"server"`
 	ServerPort       uint16                    `json:"server_port"`
-	TCPFastOpen      bool                      `json:"tcp_fast_open,omitempty"`
+	TCPFastOpen      *bool                     `json:"tcp_fast_open,omitempty"`
 	FailoverEnabled  bool                      `json:"failover_enabled,omitempty"`
 	FailoverTimeout  badoption.Duration        `json:"failover_timeout,omitempty"`
 	FailbackDelay    badoption.Duration        `json:"failback_delay,omitempty"`

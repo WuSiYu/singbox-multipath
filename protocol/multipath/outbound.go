@@ -119,7 +119,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		tags:             tags,
 		udpTag:           udpTag,
 		aggregation:      M.ParseSocksaddrHostPort(options.Server, options.ServerPort),
-		tcpFastOpen:      options.TCPFastOpen,
+		tcpFastOpen:      options.TCPFastOpen == nil || *options.TCPFastOpen,
 		handshakeTimeout: handshakeTimeout,
 		statusFile:       options.StatusFile,
 		failoverEnabled:  options.FailoverEnabled,

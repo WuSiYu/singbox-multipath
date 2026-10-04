@@ -2,15 +2,20 @@ package multipath
 
 import "time"
 
-func resolveActivationThreshold(threshold *uint32, afterBytes uint64) uint64 {
+// The rate trigger is opt-in: by default leg1 joins when leg0 is the
+// bottleneck (the queue trigger), not merely because a flow is fast.
+func resolveActivationThreshold(threshold *uint32, _ uint64) uint64 {
 	if threshold != nil {
 		return uint64(*threshold) * 1_000_000 / 8
 	}
-	if afterBytes == 0 {
-		return 150 * 1_000_000 / 8
-	}
 	return 0
 }
+
+const (
+	defaultActivationWindow = 200 * time.Millisecond
+	minActivationWindow     = 20 * time.Millisecond
+	maxActivationWindow     = 10 * time.Second
+)
 
 func (c *mpCore) activationLoop() {
 	if !c.cfg.AggregationEnabled || c.active.Load() ||
@@ -18,8 +23,8 @@ func (c *mpCore) activationLoop() {
 		return
 	}
 	interval := c.cfg.ActivationWindow / 10
-	if interval < 50*time.Millisecond {
-		interval = 50 * time.Millisecond
+	if interval < 20*time.Millisecond {
+		interval = 20 * time.Millisecond
 	}
 	if interval > 200*time.Millisecond {
 		interval = 200 * time.Millisecond

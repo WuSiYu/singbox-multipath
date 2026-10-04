@@ -3,13 +3,13 @@ package multipath
 import (
 	"context"
 	"fmt"
-	"github.com/sagernet/sing-box/protocol/multipath/stream"
 	"net"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 )
@@ -20,12 +20,13 @@ func TestActivationOptionsDefaultsAndExplicitZero(t *testing.T) {
 		enabled, queue bool
 		rate           uint64
 	}{
-		{"defaults", `{}`, true, true, 150_000_000 / 8},
+		// The rate trigger is opt-in; leg0 saturation (queue) is the default.
+		{"defaults", `{}`, true, true, 0},
 		{"explicit_zero", `{"activation_threshold_mbps":0}`, true, true, 0},
 		{"byte_default", `{"activation_after_bytes":"2MB"}`, true, true, 0},
-		{"byte_zero", `{"activation_after_bytes":0}`, true, true, 150_000_000 / 8},
+		{"byte_zero", `{"activation_after_bytes":0}`, true, true, 0},
 		{"all_triggers_off", `{"activation_on_queue":false,"activation_threshold_mbps":0,"activation_after_bytes":0}`, true, false, 0},
-		{"master_off", `{"aggregation_enabled":false}`, false, true, 150_000_000 / 8},
+		{"master_off", `{"aggregation_enabled":false}`, false, true, 0},
 		{"explicit_on", `{"aggregation_enabled":true,"activation_on_queue":true,"activation_threshold_mbps":120}`, true, true, 120_000_000 / 8},
 	} {
 		t.Run(test.name, func(t *testing.T) {

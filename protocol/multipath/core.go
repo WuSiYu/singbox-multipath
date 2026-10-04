@@ -29,7 +29,7 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 		cfg.QueueBytes = int64(cfg.FrameSize) * int64(cfg.QueueFrames)
 	}
 	if cfg.ActivationWindow <= 0 {
-		cfg.ActivationWindow = time.Second
+		cfg.ActivationWindow = defaultActivationWindow
 	}
 	if parent == nil {
 		parent = context.Background()

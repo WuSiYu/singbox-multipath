@@ -55,7 +55,7 @@ func (p directionPolicy) normalized() directionPolicy {
 		p.QueueFrames = 256
 	}
 	if p.ActivationWindow == 0 {
-		p.ActivationWindow = time.Second
+		p.ActivationWindow = defaultActivationWindow
 	}
 	return p
 }
@@ -65,8 +65,8 @@ func (p directionPolicy) validate(frameSize int) error {
 	if p.QueueFrames < 8 || p.QueueFrames > 4096 || uint64(p.QueueFrames)*uint64(frameSize) > maxQueueBytes {
 		return errors.New("invalid queue_frames or queue_frames * frame_size exceeds 64 MiB")
 	}
-	if p.ActivationWindow < 0 {
-		return errors.New("invalid activation_window")
+	if p.ActivationWindow < minActivationWindow || p.ActivationWindow > maxActivationWindow {
+		return errors.New("activation_window must be between 20ms and 10s")
 	}
 	// Rates originate as uint32 Mbps; validate the same range on the wire.
 	if p.ThresholdBytesPS > uint64(^uint32(0))*1_000_000/8 || p.ActivationAfterBytesMinBytesPS > uint64(^uint32(0))*1_000_000/8 {
