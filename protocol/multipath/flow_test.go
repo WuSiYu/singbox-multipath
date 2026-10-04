@@ -32,11 +32,16 @@ func (c *partialBoosterConn) Write(data []byte) (int, error) {
 		c.payload = true
 		return c.Conn.Write(data)
 	}
+	// A frame header may also arrive contiguously with its payload.
+	header := 0
+	if !c.payload && len(data) > dataFrameHeaderSize && data[0] == frameTypeData {
+		c.payload, header = true, dataFrameHeaderSize
+	}
 	if c.payload {
 		c.payload = false
 		if !c.blocked {
 			c.blocked = true
-			first := min(3, len(data))
+			first := min(header+3, len(data))
 			n, err := c.Conn.Write(data[:first])
 			if err != nil {
 				return n, err

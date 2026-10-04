@@ -212,9 +212,12 @@ func (c *mpCore) receiveMapping(leg *mpLeg, frame wireFrame) error {
 	if err != nil {
 		return err
 	}
+	if c.localReadClosed.Load() {
+		c.discardLocked()
+	}
 	c.feedbackDirty = true
 	c.updateStateCountersLocked()
-	wakeFlow(c.rxWake)
+	c.signalReadersLocked()
 	wakeFlow(c.pumpWake)
 	return nil
 }

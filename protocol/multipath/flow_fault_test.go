@@ -42,21 +42,27 @@ func (c *auditDelayConn) wait() error {
 
 func (c *auditDelayConn) Write(p []byte) (int, error) {
 	isData := len(p) == dataFrameHeaderSize && p[0] == frameTypeData
-	isPayload := c.payload
+	// A frame header may also arrive contiguously with its payload.
+	contiguous := !c.payload && len(p) > dataFrameHeaderSize && p[0] == frameTypeData
+	isPayload := c.payload || contiguous
 	c.payload = isData
-	match := c.mode == "all" || c.mode == "header" && isData || c.mode == "payload" && isPayload || c.mode == "window" && len(p) >= flowFixedSize && p[0] == frameTypeWindow
+	split := 3
+	if contiguous {
+		split += dataFrameHeaderSize
+	}
+	match := c.mode == "all" || c.mode == "header" && (isData || contiguous) || c.mode == "payload" && isPayload || c.mode == "window" && len(p) >= flowFixedSize && p[0] == frameTypeWindow
 	if match {
 		c.count++
 		if c.count%c.every == 0 {
-			if c.mode == "payload" && len(p) > 3 {
-				n, err := c.Conn.Write(p[:3])
+			if c.mode == "payload" && len(p) > split {
+				n, err := c.Conn.Write(p[:split])
 				if err != nil {
 					return n, err
 				}
 				if err = c.wait(); err != nil {
 					return n, err
 				}
-				m, err := c.Conn.Write(p[3:])
+				m, err := c.Conn.Write(p[split:])
 				return n + m, err
 			}
 			if err := c.wait(); err != nil {

@@ -59,7 +59,7 @@ func (c *mpCore) closeApplication() error {
 	// A Close on a still-healthy logical connection comes from its caller.
 	c.noteCloseSource(closeSourceLocalEndpoint)
 	c.localClosing.Store(true)
-	c.localReadClosed.Store(true)
+	c.discardReceive()
 	err, _ := c.appConn.closeInternal()
 	if c.getLeg(0) == nil && c.cfg.Recovery == nil {
 		c.fail(io.EOF)
@@ -67,6 +67,26 @@ func (c *mpCore) closeApplication() error {
 		c.finishApplicationClose()
 	}
 	return err
+}
+
+// closeApplicationRead discards buffered and future receive data so the
+// peer's window keeps moving after the application stops reading.
+func (c *mpCore) closeApplicationRead() error {
+	c.discardReceive()
+	c.appConn.closeReadSignal()
+	c.finishDrain()
+	return nil
+}
+
+func (c *mpCore) discardReceive() {
+	c.localReadClosed.Store(true)
+	c.stateMu.Lock()
+	if !c.rxClosed {
+		c.discardLocked()
+		c.updateStateCountersLocked()
+	}
+	c.stateMu.Unlock()
+	wakeFlow(c.pumpWake)
 }
 
 func (c *mpCore) finishApplicationClose() {
@@ -151,14 +171,12 @@ func (c *mpCore) terminateWithReceiveDrain(err error, terminalFrameType byte, dr
 			leg.requestShutdown(err, terminalFrameType, legStatus)
 		}
 		c.cancel()
-		_ = c.txPipe.Close()
-		if drainReceive {
-			// Receipt ACKs promise ownership, not application consumption. Keep
-			// the read half alive until rxLoop delivers all bytes preceding FIN.
-			_ = c.appConn.closeWriteInternal()
-		} else {
-			_ = c.rxPipe.Close()
-			_, _ = c.appConn.closeInternal()
+		// Receipt ACKs promise ownership, not application consumption. With a
+		// complete receive half the application may still read every byte
+		// preceding FIN; release waits for that drain.
+		c.appConn.terminate(drainReceive)
+		if !drainReceive {
+			c.finishDrain()
 		}
 		// Done promises that subsequent application writes are rejected.
 		// Publish it only after closing TX; complete RX may continue draining.

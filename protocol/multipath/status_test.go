@@ -98,8 +98,10 @@ func TestCoreStatusCounters(t *testing.T) {
 	if !bytes.Equal(received, payload) {
 		t.Fatal("payload mismatch")
 	}
+	// A leg counts its bytes after the child write returns, which may be
+	// after the peer has already read them.
 	waitForStatus(t, func() bool {
-		return right.statusSnapshot().counters.logicalRX == uint64(len(payload))
+		return right.statusSnapshot().counters.logicalRX == uint64(len(payload)) && left.statusSnapshot().counters.legTX[0] == uint64(len(payload))
 	})
 
 	leftSnapshot := left.statusSnapshot()

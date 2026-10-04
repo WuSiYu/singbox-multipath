@@ -417,3 +417,26 @@ func TestPathRateRestartsAfterIdle(t *testing.T) {
 		t.Fatalf("idle gap collapsed the delivery rate: %.0f -> %.0f", rate, p.Rate)
 	}
 }
+
+func TestBufferHeadroom(t *testing.T) {
+	buffer := NewBufferWithHeadroom(make([]byte, 64), 32, 16, nil)
+	copy(buffer.Data, "0123456789abcdef")
+	contiguous, ok := buffer.TakeHeadroom(buffer.Data[:8], 29)
+	if !ok || len(contiguous) != 37 || &contiguous[29] != &buffer.Data[0] {
+		t.Fatal("headroom does not directly precede the payload")
+	}
+	if _, ok = buffer.TakeHeadroom(buffer.Data, 29); ok {
+		t.Fatal("two writers shared one headroom")
+	}
+	buffer.ReturnHeadroom()
+	if _, ok = buffer.TakeHeadroom(buffer.Data[4:], 29); ok {
+		t.Fatal("headroom used for a payload that does not begin the buffer")
+	}
+	if _, ok = buffer.TakeHeadroom(buffer.Data, 33); ok {
+		t.Fatal("header larger than the headroom")
+	}
+	plain := NewBuffer(make([]byte, 8), nil)
+	if _, ok = plain.TakeHeadroom(plain.Data, 1); ok {
+		t.Fatal("buffer without headroom offered one")
+	}
+}

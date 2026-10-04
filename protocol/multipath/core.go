@@ -3,8 +3,8 @@ package multipath
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
+	"os"
 	"time"
 
 	"github.com/sagernet/sing-box/protocol/multipath/stream"
@@ -56,26 +56,31 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 	}
 	budget.sessions.Add(1)
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
-	app, txPipe, rxPipe := newLogicalPipe()
 	c := &mpCore{
-		cfg: cfg, ctx: ctx, cancel: cancel, appConn: app, txPipe: txPipe, rxPipe: rxPipe,
+		cfg: cfg, ctx: ctx, cancel: cancel,
 		legs: make(map[uint8]*mpLeg), reserved: make(map[uint8]bool), retiring: make(map[uint8]*mpLeg),
 		done: make(chan struct{}), released: make(chan struct{}), activeCh: make(chan struct{}),
 		memory: budget, sessionBytes: reservation, txReserve: make(chan []byte, 1),
-		pumpWake: make(chan struct{}, 1), txWake: make(chan struct{}, 1), rxWake: make(chan struct{}, 1),
+		pumpWake: make(chan struct{}, 1), txWake: make(chan struct{}, 1), drained: make(chan struct{}),
 		startedAt: time.Now(),
 	}
+	app := newLogicalConn(c)
+	c.appConn = app
 	// The first chunk is usable before feedback, preserving the early-write
 	// fast path. Advertised byte capacity is separate from allocated storage.
 	c.tx = stream.NewSender(uint64(cfg.FrameSize))
 	capacity := uint64(cfg.ReceiveWindowBytes)
 	c.rx = stream.NewReceiver(capacity, c)
-	c.txReserve <- budget.takeReservedBuffer(cfg.FrameSize)
+	c.txReserve <- budget.takeReservedBuffer(cfg.FrameSize + txHeadroom)
 	app.onClose = c.closeApplication
-	app.onCloseRead = func() error { c.localReadClosed.Store(true); return app.readConn.Close() }
-	c.startWorkers(c.txLoop, c.rxLoop, c.pumpLoop, c.activationLoop)
+	app.onCloseRead = c.closeApplicationRead
+	c.startWorkers(c.pumpLoop, c.activationLoop)
 	return c, app, nil
 }
+
+// txHeadroom precedes every transmit payload so a data frame header can be
+// written contiguously with it.
+const txHeadroom = 32
 
 func minimumSessionMemory(cfg coreConfig) int64 {
 	return sessionMemoryReservation(cfg)
@@ -111,12 +116,18 @@ func (c *mpCore) Release(head bool) {
 func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 	closeLegsAfterDrain(legs, err)
 	c.workerGroup.Wait()
+	// A peer close after FIN keeps the receive half readable until the
+	// application has taken every byte, reached EOF, or closed reading.
+	<-c.drained
+	c.appConn.terminate(false)
 	c.stateMu.Lock()
 	for _, leg := range legs {
 		leg.path.Close()
 	}
 	c.tx.Close()
 	c.rx.Close()
+	c.rxClosed = true
+	c.signalReadersLocked()
 	c.mappings = nil
 	c.replayMu.Lock()
 	c.replayBytes = 0
@@ -206,28 +217,46 @@ func (c *mpCore) addLegWithReadPreamble(id uint8, conn net.Conn, onClose func(er
 	return leg, err
 }
 
-func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
+// nextTXBuffer returns storage for length application bytes. Small writes
+// use a size class instead of charging a whole frame slab until Data ACK; a
+// small write is still sent at once, never held back to wait for more.
+func (c *mpCore) nextTXBuffer(app *logicalConn, length int) (*stream.Buffer, error) {
+	size := c.cfg.FrameSize
+	if length <= c.cfg.FrameSize/2 {
+		size = 256
+		for size < length {
+			size *= 2
+		}
+	}
+	// Charge fixed metadata as well as payload; one-byte application writes
+	// cannot create an unbounded list of uncharged send records. The charge
+	// also covers the frame-header headroom in front of the payload.
+	size += 512
 	for {
 		if c.isDone() {
-			return nil, errCoreClosed
+			return nil, app.terminalWriteError()
 		}
-		// Charge fixed metadata as well as payload; one-byte application writes
-		// cannot create an unbounded list of uncharged send records.
-		buffer, changed := c.memory.tryAcquireTX(c.cfg.FrameSize + 512)
+		buffer, changed := c.memory.tryAcquireTX(size)
 		if buffer != nil {
-			return stream.NewBuffer(buffer[:c.cfg.FrameSize], func() { c.memory.releaseTX(buffer) }), nil
+			return stream.NewBufferWithHeadroom(buffer, txHeadroom, length, func() { c.memory.releaseTX(buffer) }), nil
 		}
 		select {
 		case <-c.done:
-			return nil, errCoreClosed
+			return nil, app.terminalWriteError()
+		case <-app.writeClosed:
+			return nil, app.terminalWriteError()
+		case <-app.writeDeadline.Wait():
+			return nil, os.ErrDeadlineExceeded
 		case buffer = <-c.txReserve:
-			return stream.NewBuffer(buffer, func() { c.txReserve <- buffer }), nil
+			return stream.NewBufferWithHeadroom(buffer, txHeadroom, length, func() { c.txReserve <- buffer }), nil
 		case <-changed:
 		}
 	}
 }
 
-func (c *mpCore) waitTXSpace() bool {
+// waitTXSpace blocks a Write until the unsent queue and the send history both
+// have room for another frame.
+func (c *mpCore) waitTXSpace(app *logicalConn) error {
 	var blocked time.Time
 	defer func() {
 		if !blocked.IsZero() {
@@ -235,6 +264,13 @@ func (c *mpCore) waitTXSpace() bool {
 		}
 	}()
 	for {
+		select {
+		case <-app.writeClosed:
+			return app.terminalWriteError()
+		case <-app.writeDeadline.Wait():
+			return os.ErrDeadlineExceeded
+		default:
+		}
 		c.stateMu.Lock()
 		now := time.Now()
 		pending := c.tx.WriteNext - min(c.tx.Next, c.tx.WriteNext)
@@ -246,8 +282,11 @@ func (c *mpCore) waitTXSpace() bool {
 		}
 		available := unsentOK && historyOK
 		c.stateMu.Unlock()
+		if c.isDone() {
+			return app.terminalWriteError()
+		}
 		if available {
-			return !c.isDone()
+			return nil
 		}
 		if blocked.IsZero() {
 			blocked = time.Now()
@@ -255,7 +294,11 @@ func (c *mpCore) waitTXSpace() bool {
 		}
 		select {
 		case <-c.done:
-			return false
+			return app.terminalWriteError()
+		case <-app.writeClosed:
+			return app.terminalWriteError()
+		case <-app.writeDeadline.Wait():
+			return os.ErrDeadlineExceeded
 		case <-c.txWake:
 		}
 	}
@@ -333,108 +376,11 @@ func (c *mpCore) growHistoryLocked(now time.Time) {
 	}
 }
 
-func (c *mpCore) txLoop() {
-	for c.waitTXSpace() {
-		buffer, err := c.nextTXBuffer()
-		if err != nil {
-			return
-		}
-		n, readErr := c.txPipe.Read(buffer.Data)
-		if n > 0 && n <= c.cfg.FrameSize/2 {
-			// Retain small writes in a size class instead of charging an entire
-			// maximum-sized slab until Data ACK. This is copying, not batching:
-			// a small first write is never delayed waiting for more application data.
-			size := 256
-			for size < n {
-				size *= 2
-			}
-			compact, _ := c.memory.tryAcquireTX(size + 512)
-			if compact != nil {
-				copy(compact, buffer.Data[:n])
-				buffer.Release()
-				buffer = stream.NewBuffer(compact[:n], func() { c.memory.releaseTX(compact) })
-			}
-		}
-		c.stateMu.Lock()
-		if n > 0 && !c.isDone() {
-			buffer.Data = buffer.Data[:n]
-			err = c.tx.Append(buffer)
-			if err == nil {
-				c.ingressBytes.Add(uint64(n))
-			} else {
-				buffer.Release()
-			}
-		} else {
-			buffer.Release()
-		}
-		if errors.Is(readErr, io.EOF) && !c.isDone() {
-			c.tx.CloseWrite()
-			c.localFIN.Store(true)
-		}
-		c.updateStateCountersLocked()
-		c.stateMu.Unlock()
-		wakeFlow(c.pumpWake)
-		if err != nil {
-			c.protocolFail(err)
-			return
-		}
-		if readErr != nil {
-			if !errors.Is(readErr, io.EOF) && !c.isDone() {
-				c.fail(readErr)
-			}
-			return
-		}
-	}
-}
-
 func (c *mpCore) receiveComplete() bool {
 	c.stateMu.Lock()
 	complete := c.rx.Complete()
 	c.stateMu.Unlock()
 	return complete
-}
-
-func (c *mpCore) rxLoop() {
-	defer c.rxPipe.Close()
-	for {
-		c.stateMu.Lock()
-		data, finished := c.rx.Readable(), c.rx.EOF()
-		c.stateMu.Unlock()
-		if finished {
-			c.remoteFIN.Store(true)
-			return
-		}
-		if len(data) == 0 {
-			select {
-			case <-c.done:
-				return
-			case <-c.rxWake:
-			}
-			continue
-		}
-		n, err := len(data), error(nil)
-		discard := c.localReadClosed.Load()
-		if !discard {
-			n, err = c.rxPipe.Write(data)
-		}
-		if n > 0 {
-			c.stateMu.Lock()
-			c.rx.Consume(n)
-			c.feedbackDirty = true
-			c.updateStateCountersLocked()
-			c.stateMu.Unlock()
-			if !discard {
-				c.egressBytes.Add(uint64(n))
-			}
-			wakeFlow(c.pumpWake)
-		}
-		if err != nil && !c.localReadClosed.Load() {
-			if !c.isDone() {
-				c.fail(err)
-			}
-			return
-		}
-	}
 }
 
 func (c *mpCore) updateStateCountersLocked() {

@@ -180,8 +180,6 @@ type mpCore struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	appConn           *logicalConn
-	txPipe            net.Conn
-	rxPipe            net.Conn
 	legsMu            sync.RWMutex
 	legs              map[uint8]*mpLeg
 	reserved          map[uint8]bool
@@ -257,8 +255,11 @@ type mpCore struct {
 	historyGrownAt    time.Time // stateMu
 	nextGeneration    uint64
 	pumpWake          chan struct{}
-	rxWake            chan struct{}
 	txWake            chan struct{}
+	rxReady           chan struct{} // stateMu; closed by the next delivery to readers
+	rxClosed          bool          // stateMu; receive pages released
+	drained           chan struct{} // receive half no longer needs to outlive termination
+	drainOne          sync.Once
 	startedAt         time.Time
 	mappings          []dataMapping
 	mappingHead       int

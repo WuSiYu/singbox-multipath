@@ -1,6 +1,9 @@
 package stream
 
-import "math"
+import (
+	"math"
+	"sync/atomic"
+)
 
 // Buffer ownership is shared only by the connection send queue and active
 // writers. ACK processing must not recycle bytes referenced by a blocked Write.
@@ -8,11 +11,34 @@ type Buffer struct {
 	Data    []byte
 	refs    int
 	release func()
+
+	// raw[:headroom] directly precedes Data. One writer at a time may place a
+	// frame header there to send header and payload in a single child write.
+	raw      []byte
+	headroom int
+	headBusy atomic.Bool
 }
 
 func NewBuffer(data []byte, release func()) *Buffer {
 	return &Buffer{Data: data, refs: 1, release: release}
 }
+
+// NewBufferWithHeadroom uses raw[headroom:headroom+length] as Data.
+func NewBufferWithHeadroom(raw []byte, headroom, length int, release func()) *Buffer {
+	return &Buffer{Data: raw[headroom : headroom+length], refs: 1, release: release, raw: raw, headroom: headroom}
+}
+
+// TakeHeadroom returns header bytes immediately followed by data, when data
+// begins this buffer and no other writer holds the headroom. The caller
+// fills the first header bytes and calls ReturnHeadroom after the write.
+func (b *Buffer) TakeHeadroom(data []byte, header int) ([]byte, bool) {
+	if header > b.headroom || len(data) == 0 || len(b.Data) == 0 || &data[0] != &b.Data[0] || !b.headBusy.CompareAndSwap(false, true) {
+		return nil, false
+	}
+	return b.raw[b.headroom-header : b.headroom+len(data)], true
+}
+
+func (b *Buffer) ReturnHeadroom() { b.headBusy.Store(false) }
 
 func (b *Buffer) Retain() {
 	if b.refs <= 0 {
