@@ -145,7 +145,7 @@ func (c *recoveryPacketConn) deliver(d recoveryDatagram, now time.Time) {
 		if len(c.parts) >= 4 {
 			return
 		}
-		storage, _ := c.memory.tryAcquirePrimary(max(1, int(d.total)) + 512)
+		storage := c.memory.tryAcquireOther(max(1, int(d.total)) + 512)
 		if storage == nil {
 			return
 		}
@@ -178,14 +178,14 @@ func (c *recoveryPacketConn) deliver(d recoveryDatagram, now time.Time) {
 			}
 		}
 	default:
-		c.memory.release(p.data)
+		c.memory.releaseOther(p.data)
 	}
 }
 
 func (c *recoveryPacketConn) expireLocked(now time.Time) {
 	for id, p := range c.parts {
 		if now.Sub(p.at) >= 5*time.Second {
-			c.memory.release(p.data)
+			c.memory.releaseOther(p.data)
 			delete(c.parts, id)
 		}
 	}
@@ -212,7 +212,7 @@ func (c *recoveryPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	defer c.memory.release(p.data)
+	defer c.memory.releaseOther(p.data)
 	return copy(b, p.data), p.address.UDPAddr(), nil
 }
 func (c *recoveryPacketConn) ReadPacket(b *buf.Buffer) (M.Socksaddr, error) {
@@ -220,7 +220,7 @@ func (c *recoveryPacketConn) ReadPacket(b *buf.Buffer) (M.Socksaddr, error) {
 	if err != nil {
 		return M.Socksaddr{}, err
 	}
-	defer c.memory.release(p.data)
+	defer c.memory.releaseOther(p.data)
 	if b.FreeLen() < len(p.data) {
 		return M.Socksaddr{}, io.ErrShortBuffer
 	}
@@ -265,13 +265,13 @@ func (c *recoveryPacketConn) Close() error {
 		c.mu.Lock()
 		close(c.done)
 		for _, p := range c.parts {
-			c.memory.release(p.data)
+			c.memory.releaseOther(p.data)
 		}
 		clear(c.parts)
 		for {
 			select {
 			case p := <-c.queue:
-				c.memory.release(p.data)
+				c.memory.releaseOther(p.data)
 			default:
 				c.mu.Unlock()
 				c.memory.releaseSession(4096)

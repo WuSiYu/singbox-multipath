@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	statusSchemaVersion = 4
+	statusSchemaVersion = 5
 	statusTopFlowCount  = 10
 
 	leg1PhaseWaiting int32 = iota
@@ -503,18 +503,25 @@ func directionParameters(p directionPolicy, frame int) statusDirectionParameters
 }
 
 type statusMemory struct {
-	LimitBytes         int64  `json:"limit_bytes"`
-	UsedBytes          int64  `json:"used_bytes"`
-	CachedBytes        int64  `json:"cached_bytes"`
-	BoosterLimitBytes  int64  `json:"booster_limit_bytes"`
-	BoosterResumeBytes int64  `json:"booster_resume_bytes"`
-	Automatic          bool   `json:"automatic"`
-	Pressure           bool   `json:"pressure"`
-	PressureSince      string `json:"pressure_since,omitempty"`
-	PressureEvents     uint64 `json:"pressure_events"`
-	BackpressureEvents uint64 `json:"backpressure_events"`
-	PeakUsedBytes      int64  `json:"peak_used_bytes"`
-	PeakCachedBytes    int64  `json:"peak_cached_bytes"`
+	LimitBytes             int64  `json:"limit_bytes"`
+	UsedBytes              int64  `json:"used_bytes"`
+	CachedBytes            int64  `json:"cached_bytes"`
+	TXBytes                int64  `json:"tx_bytes"`
+	RXBytes                int64  `json:"rx_bytes"`
+	ReservedBytes          int64  `json:"reserved_bytes"`
+	PressureThresholdBytes int64  `json:"pressure_threshold_bytes"`
+	ActiveSenders          int    `json:"active_senders"`
+	ActiveReceivers        int    `json:"active_receivers"`
+	ReceiveShareBytes      int64  `json:"receive_share_bytes"`
+	PeakTXBytes            int64  `json:"peak_tx_bytes"`
+	PeakRXBytes            int64  `json:"peak_rx_bytes"`
+	Automatic              bool   `json:"automatic"`
+	Pressure               bool   `json:"pressure"`
+	PressureSince          string `json:"pressure_since,omitempty"`
+	PressureEvents         uint64 `json:"pressure_events"`
+	BackpressureEvents     uint64 `json:"backpressure_events"`
+	PeakUsedBytes          int64  `json:"peak_used_bytes"`
+	PeakCachedBytes        int64  `json:"peak_cached_bytes"`
 }
 
 type statusSenderDiagnostics struct {
@@ -802,17 +809,24 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	parameters.Download.EffectiveReceiveWindowBytes = &localReceive
 
 	memory := statusMemory{
-		LimitBytes:         memorySnapshot.LimitBytes,
-		UsedBytes:          memorySnapshot.UsedBytes,
-		CachedBytes:        memorySnapshot.CachedBytes,
-		BoosterLimitBytes:  memorySnapshot.BoosterLimitBytes,
-		BoosterResumeBytes: memorySnapshot.BoosterResumeBytes,
-		Automatic:          memorySnapshot.Automatic,
-		Pressure:           memorySnapshot.Pressure,
-		PressureEvents:     memorySnapshot.PressureEvents,
-		BackpressureEvents: memorySnapshot.BackpressureEvents,
-		PeakUsedBytes:      memorySnapshot.PeakUsedBytes,
-		PeakCachedBytes:    memorySnapshot.PeakCachedBytes,
+		LimitBytes:             memorySnapshot.LimitBytes,
+		UsedBytes:              memorySnapshot.UsedBytes,
+		CachedBytes:            memorySnapshot.CachedBytes,
+		TXBytes:                memorySnapshot.TXBytes,
+		RXBytes:                memorySnapshot.RXBytes,
+		ReservedBytes:          memorySnapshot.ReservedBytes,
+		PressureThresholdBytes: memorySnapshot.PressureThreshold,
+		ActiveSenders:          memorySnapshot.ActiveSenders,
+		ActiveReceivers:        memorySnapshot.ActiveReceivers,
+		ReceiveShareBytes:      memorySnapshot.ReceiveShareBytes,
+		PeakTXBytes:            memorySnapshot.PeakTXBytes,
+		PeakRXBytes:            memorySnapshot.PeakRXBytes,
+		Automatic:              memorySnapshot.Automatic,
+		Pressure:               memorySnapshot.Pressure,
+		PressureEvents:         memorySnapshot.PressureEvents,
+		BackpressureEvents:     memorySnapshot.BackpressureEvents,
+		PeakUsedBytes:          memorySnapshot.PeakUsedBytes,
+		PeakCachedBytes:        memorySnapshot.PeakCachedBytes,
 	}
 	if !memorySnapshot.PressureSince.IsZero() {
 		memory.PressureSince = memorySnapshot.PressureSince.Format(time.RFC3339Nano)

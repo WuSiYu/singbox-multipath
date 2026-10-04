@@ -127,14 +127,26 @@ func (c *mpCore) pumpLoop() {
 // Caller holds both stateMu and legsMu. Feedback contains whole-path receipt
 // frontiers, not local transport send completions and not application reads.
 func (c *mpCore) feedbackLockedWithoutLegs() flowMessage {
-	message := flowMessage{Next: c.rx.Ack(), Limit: c.rx.Advertise(c.memory.boosterAllowed())}
-	if !c.memory.boosterAllowed() {
+	target := c.receiveTargetLocked(time.Now())
+	message := flowMessage{Next: c.rx.Ack(), Limit: c.rx.Advertise(target)}
+	// Informational only: the receiver's node is using its emergency margin.
+	if c.memory.underPressure() {
 		message.Flags |= flowFlagPressure
 	}
 	for id, leg := range c.legs {
 		message.Paths[id] = leg.received
 	}
 	return message
+}
+
+// receiveTargetLocked returns the window to advertise: the configured ceiling
+// capped by this session's fair share of the node's receive region. Storage is
+// allocated only as data arrive and the sender's own history limit keeps
+// in-flight data near twice the path BDP, so a large window costs nothing
+// until used. The share keeps the sum of windows of active sessions within
+// the region, which is what prevents over-commitment and receive drops.
+func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
+	return min(uint64(c.cfg.ReceiveWindowBytes), uint64(c.memory.receiveShare(c, now)))
 }
 
 func (c *mpCore) handleWindow(message flowMessage) error {
@@ -176,6 +188,17 @@ func (c *mpCore) handleWindow(message flowMessage) error {
 	return nil
 }
 
+// ecfSlack bounds how much later than the best path a segment may complete
+// when it is handed to a slower path that happens to be idle.
+const ecfSlack = 1.5
+
+// choosePathLocked implements earliest-completion-first scheduling (ECF, as in
+// BLEST and Linux MPTCP's linger-time rule): each path's completion time is
+// its queued work over its delivery rate plus its one-way delay. The best
+// available path is used, but a slower path only while its completion time
+// stays within ecfSlack of the best path overall; otherwise new data waits for
+// the faster path instead of queueing behind a slow one and blocking in-order
+// delivery.
 func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	legs := c.availableLegs()
 	provisionalRate := float64(0)
@@ -184,10 +207,13 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	}
 	// Selection policy and transient readiness are distinct: a healthy secondary
 	// remains the sole new-data path while busy or discovery/window constrained.
-	// Only unavailable/stale paths or allocator protection permit primary fallback.
+	// Only unavailable/stale paths permit primary fallback.
 	exclusiveSecondary := c.trafficSavingSecondaryLocked()
 	var chosen *mpLeg
-	score := math.Inf(1)
+	chosenTime, bestTime := math.Inf(1), math.Inf(1)
+	// Startup sampling is bounded. Thereafter the connection-level byte
+	// window and memory, not an extra per-path cwnd, bound lookahead.
+	initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.FrameSize)*4)
 	for _, leg := range legs {
 		if exclusiveSecondary != nil && leg != exclusiveSecondary {
 			continue
@@ -195,27 +221,35 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 		if c.cfg.Recovery != nil && !c.cfg.Recovery.allows(leg.id) {
 			continue
 		}
-		if leg.path.Stale || leg.busy {
+		if leg.path.Stale {
 			continue
 		}
 		emergency := c.cfg.Recovery != nil && c.controlLeg() == leg && leg.id == 1
 		if (!c.active.Load() && leg.id == 0) || emergency {
+			if leg.busy {
+				continue
+			}
 			return leg
 		}
-		if leg.id == 1 && (!c.active.Load() || !leg.ready.Load() || c.peerPressure || !c.memory.boosterAllowed()) {
+		// Data are already retained in the send history and receive storage
+		// is accounted by the receiver, so memory never gates a path.
+		if leg.id == 1 && (!c.active.Load() || !leg.ready.Load()) {
 			continue
 		}
-		// Startup sampling is bounded. Thereafter the connection-level byte
-		// window and memory, not an extra per-path cwnd, bound lookahead.
-		initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.FrameSize)*4)
-		pipeline := leg.path.Pipeline(initial, uint64(c.cfg.SendBufferBytes))
-		if leg.path.Outstanding()+uint64(length) > pipeline {
+		completion := leg.path.CompletionTime(length, provisionalRate)
+		bestTime = min(bestTime, completion)
+		if leg.busy {
 			continue
 		}
-		next := leg.path.DrainTime(provisionalRate)
-		if next < score {
-			chosen, score = leg, next
+		if leg.path.Outstanding()+uint64(length) > leg.path.Pipeline(initial, uint64(c.cfg.SendBufferBytes)) {
+			continue
 		}
+		if completion < chosenTime {
+			chosen, chosenTime = leg, completion
+		}
+	}
+	if chosen != nil && exclusiveSecondary == nil && chosenTime > max(bestTime*ecfSlack, bestTime+0.002) {
+		return nil
 	}
 	return chosen
 }
@@ -315,7 +349,7 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 
 // Caller holds stateMu. Busy writers are healthy, and must not cause spillover.
 func (c *mpCore) trafficSavingSecondaryLocked() *mpLeg {
-	if !c.active.Load() || !c.cfg.Leg0TrafficSaving || c.peerPressure || !c.memory.boosterAllowed() {
+	if !c.active.Load() || !c.cfg.Leg0TrafficSaving {
 		return nil
 	}
 	leg := c.getLeg(1)

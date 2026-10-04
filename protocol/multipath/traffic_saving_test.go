@@ -36,12 +36,13 @@ func TestTrafficSavingSelection(t *testing.T) {
 	s.path.Stale = false
 	s.path.Sent = 0
 	check(s, 3)
+	// Neither receiver nor local memory pressure moves new data back to leg0.
 	c.peerPressure = true
-	check(p, 4)
+	check(s, 3)
 	c.peerPressure = false
-	c.memory.used = c.memory.boosterLimit
-	check(p, 4)
-	c.memory.used = 0
+	c.memory.other = c.memory.limit
+	check(s, 3)
+	c.memory.other = 0
 	s.ready.Store(false)
 	check(p, 4)
 	s.ready.Store(true)

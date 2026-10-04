@@ -174,9 +174,10 @@ func (p *Path) Pipeline(initial, maximum uint64) uint64 {
 	return maximum
 }
 
-// DrainTime mirrors the basis of Linux's default MPTCP scheduler: outstanding
-// work divided by service rate. A measured peer rate replaces initial estimates.
-func (p *Path) DrainTime(provisionalRate float64) float64 {
+// CompletionTime estimates when a new segment of length bytes would be fully
+// delivered on this path: queued work over the measured delivery rate plus the
+// one-way propagation delay. An unmeasured path borrows provisionalRate.
+func (p *Path) CompletionTime(length int, provisionalRate float64) float64 {
 	rate := p.Rate
 	if rate <= 0 {
 		rate = provisionalRate
@@ -184,5 +185,9 @@ func (p *Path) DrainTime(provisionalRate float64) float64 {
 	if rate <= 0 {
 		rate = 1
 	}
-	return float64(p.Outstanding()) / rate
+	delay := p.MinimumRTT
+	if delay == 0 {
+		delay = p.SRTT
+	}
+	return float64(p.Outstanding()+uint64(length))/rate + delay.Seconds()/2
 }

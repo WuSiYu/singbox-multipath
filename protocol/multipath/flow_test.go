@@ -324,10 +324,10 @@ func TestRecoveryTimeoutDefaultsAndBounds(t *testing.T) {
 	}
 }
 
-func TestMemoryLargeLimitWatermarks(t *testing.T) {
+func TestMemoryLargeLimitRegions(t *testing.T) {
 	budget := newMemoryBudget(1<<62, false)
-	if budget.boosterLimit <= 0 || budget.boosterResume <= 0 || !budget.boosterAllowed() {
-		t.Fatal("large memory watermark overflow")
+	if budget.txRegionLocked() <= 0 || budget.rxRegionLocked() <= 0 || budget.underPressure() {
+		t.Fatal("large memory region overflow")
 	}
 }
 
@@ -350,9 +350,14 @@ func TestFlowSharedBudgetPreservesEveryLeg0(t *testing.T) {
 		}
 		defer closeFlowCores(cores...)
 		synctest.Wait()
+		// Exhaust the shared regions and the margin: every session must still
+		// progress through its own TX reserve and prepaid receive floor.
 		snapshot := budget.snapshot()
-		held := acquireTestMemory(t, budget, int(snapshot.BoosterLimitBytes-snapshot.UsedBytes))
-		defer budget.release(held)
+		held := snapshot.LimitBytes - snapshot.UsedBytes - 1024
+		if !budget.reserveSession(held) {
+			t.Fatal("pressure reservation failed")
+		}
+		defer budget.releaseSession(held)
 		payload := flowPayload(64 << 10)
 		results := make(chan error, len(apps))
 		for index, app := range apps {

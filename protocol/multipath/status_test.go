@@ -57,7 +57,7 @@ func TestBeta8StatusPoliciesAndModes(t *testing.T) {
 	})
 	doc := status.buildDocument(time.Now())
 	u, d := doc.Node.Parameters.Upload, doc.Node.Parameters.Download
-	if u.AggregationEnabled || !d.Leg0TrafficSaving || *u.EffectiveSendBufferBytes != 28<<20 || *u.EffectiveReceiveWindowBytes != 56<<20 || *d.EffectiveSendBufferBytes != 56<<20 || *d.EffectiveReceiveWindowBytes != 28<<20 {
+	if u.AggregationEnabled || !d.Leg0TrafficSaving || *u.EffectiveSendBufferBytes != maxReplayBytes || *u.EffectiveReceiveWindowBytes != maxReorderBytes || *d.EffectiveSendBufferBytes != maxReplayBytes || *d.EffectiveReceiveWindowBytes != maxReorderBytes {
 		t.Fatalf("incorrect directional limits: %+v / %+v", u, d)
 	}
 	if doc.Node.Logical.UploadStates["leg0"] != 1 || doc.Node.Logical.DownloadStates["leg1"] != 1 || doc.Node.Logical.State != "traffic_saving" || doc.Node.Logical.RXAggregatingConnections != 0 {
@@ -176,7 +176,7 @@ func TestOutboundStatusDocument(t *testing.T) {
 	})
 
 	document := status.buildDocument(time.Now().Add(time.Second))
-	if document.SchemaVersion != 4 {
+	if document.SchemaVersion != 5 {
 		t.Fatalf("unexpected status schema: %d", document.SchemaVersion)
 	}
 	if document.Node.Parameters.MemoryLimitBytes != 8<<20 || document.Node.Memory.LimitBytes != 8<<20 || !document.Node.Memory.Automatic {

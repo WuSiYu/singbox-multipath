@@ -39,10 +39,10 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 		budget = newMemoryBudget(1<<62, false)
 	}
 	if cfg.ReceiveWindowBytes <= 0 {
-		cfg.ReceiveWindowBytes = automaticBufferLimit(budget, cfg.FrameSize)
+		cfg.ReceiveWindowBytes = maxReorderBytes
 	}
 	if cfg.SendBufferBytes <= 0 {
-		cfg.SendBufferBytes = automaticBufferLimit(budget, cfg.FrameSize)
+		cfg.SendBufferBytes = maxReplayBytes
 	}
 	reservation := minimumSessionMemory(cfg)
 	if !budget.reserveSession(reservation) {
@@ -72,7 +72,7 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 }
 
 func minimumSessionMemory(cfg coreConfig) int64 {
-	return sessionMemoryReservation(cfg) + stream.PageCharge
+	return sessionMemoryReservation(cfg)
 }
 
 // Acquire and Release implement the receive-page admission interface. They run
@@ -83,7 +83,7 @@ func (c *mpCore) Acquire(head bool) bool {
 		c.headPages++
 		return true
 	}
-	if !c.memory.reservePage(stream.PageCharge, head) {
+	if !c.memory.rxAcquire(stream.PageCharge, head) {
 		return false
 	}
 	if head {
@@ -99,7 +99,7 @@ func (c *mpCore) Release(head bool) {
 			return
 		}
 	}
-	c.memory.releaseSession(stream.PageCharge)
+	c.memory.rxRelease(stream.PageCharge)
 }
 
 func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
@@ -123,6 +123,7 @@ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 		c.memory.putReservedBuffer(buffer)
 	default:
 	}
+	c.memory.forget(c)
 	c.memory.releaseSession(c.sessionBytes)
 	c.memory.sessions.Add(-1)
 	close(c.released)
@@ -207,9 +208,9 @@ func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
 		}
 		// Charge fixed metadata as well as payload; one-byte application writes
 		// cannot create an unbounded list of uncharged send records.
-		buffer, changed := c.memory.tryAcquirePrimary(c.cfg.FrameSize + 512)
+		buffer, changed := c.memory.tryAcquireTX(c.cfg.FrameSize + 512)
 		if buffer != nil {
-			return stream.NewBuffer(buffer[:c.cfg.FrameSize], func() { c.memory.release(buffer) }), nil
+			return stream.NewBuffer(buffer[:c.cfg.FrameSize], func() { c.memory.releaseTX(buffer) }), nil
 		}
 		select {
 		case <-c.done:
@@ -230,8 +231,15 @@ func (c *mpCore) waitTXSpace() bool {
 	}()
 	for {
 		c.stateMu.Lock()
+		now := time.Now()
 		pending := c.tx.WriteNext - min(c.tx.Next, c.tx.WriteNext)
-		available := c.tx.Buffered()+uint64(c.cfg.FrameSize) <= uint64(max(c.cfg.SendBufferBytes, int64(c.cfg.FrameSize))) && pending+uint64(c.cfg.FrameSize) <= uint64(max(c.cfg.QueueBytes, int64(c.cfg.FrameSize)))
+		frame := uint64(c.cfg.FrameSize)
+		unsentOK := pending+frame <= c.unsentLimitLocked()
+		historyOK := c.tx.Buffered()+frame <= c.historyLimitLocked(now)
+		if unsentOK && !historyOK {
+			c.growHistoryLocked(now)
+		}
+		available := unsentOK && historyOK
 		c.stateMu.Unlock()
 		if available {
 			return !c.isDone()
@@ -244,6 +252,77 @@ func (c *mpCore) waitTXSpace() bool {
 		case <-c.done:
 			return false
 		case <-c.txWake:
+		}
+	}
+}
+
+const (
+	// unsentQueueTime sizes the application-to-assigner cushion, like MPTCP's
+	// msk notsent_lowat: enough to keep the pump fed between relay wakeups.
+	// Bytes handed to a child are bounded by that child's own backpressure.
+	unsentQueueTime = 10 * time.Millisecond
+	unsentFloor     = 1 << 20
+	historyFloor    = 4 << 20
+)
+
+// carryingLegsLocked returns the legs that currently receive new data, and
+// their summed delivery rate (bytes/s) and largest smoothed delivery RTT.
+func (c *mpCore) carryingRateLocked() (float64, time.Duration) {
+	rate, rtt := float64(0), time.Duration(0)
+	saving := c.trafficSavingSecondaryLocked()
+	for _, leg := range c.availableLegs() {
+		if !c.active.Load() && leg.id != 0 && c.controlLeg() != leg {
+			continue
+		}
+		if saving != nil && leg != saving {
+			continue
+		}
+		rate += leg.path.Rate
+		rtt = max(rtt, leg.path.SRTT)
+	}
+	return rate, rtt
+}
+
+// Caller holds stateMu. queue_frames is a ceiling; the working limit follows
+// the measured delivery rate of the paths currently carrying new data.
+func (c *mpCore) unsentLimitLocked() uint64 {
+	maximum := uint64(max(c.cfg.QueueBytes, int64(c.cfg.FrameSize)))
+	floor := min(maximum, max(uint64(c.cfg.FrameSize)*4, unsentFloor))
+	rate, _ := c.carryingRateLocked()
+	return min(maximum, max(floor, uint64(rate*unsentQueueTime.Seconds())))
+}
+
+// historyLimitLocked bounds bytes not yet covered by Data ACK, like MPTCP's
+// msk sndbuf: about twice the bandwidth-delay product of the carrying paths,
+// grown while history (not the network) limits sending, and capped by the
+// configured send_buffer_bytes and this session's share of the node's
+// transmit region.
+func (c *mpCore) historyLimitLocked(now time.Time) uint64 {
+	rate, rtt := c.carryingRateLocked()
+	target := max(uint64(historyFloor), uint64(2*rate*rtt.Seconds())) + c.unsentLimitLocked()
+	if !c.historyAt.IsZero() && c.historyGrant > target {
+		elapsed := now.Sub(c.historyAt).Seconds()
+		c.historyGrant = max(target, c.historyGrant-uint64(float64(c.historyGrant-target)*min(1, elapsed*0.1)))
+	}
+	c.historyGrant = max(c.historyGrant, target)
+	c.historyAt = now
+	limit := min(c.historyGrant, uint64(max(c.cfg.SendBufferBytes, int64(c.cfg.FrameSize))))
+	share := uint64(max(0, c.memory.transmitShare(c, now)))
+	return min(limit, max(share, c.unsentLimitLocked()+uint64(c.cfg.FrameSize)))
+}
+
+// growHistoryLocked expands the history grant once per RTT while an idle path
+// shows that history, not the network, is the bottleneck.
+func (c *mpCore) growHistoryLocked(now time.Time) {
+	_, rtt := c.carryingRateLocked()
+	if now.Sub(c.historyGrownAt) < max(rtt, 10*time.Millisecond) {
+		return
+	}
+	for _, leg := range c.availableLegs() {
+		if leg.ready.Load() && !leg.busy && !leg.path.Stale {
+			c.historyGrant = min(uint64(c.cfg.SendBufferBytes), c.historyGrant+c.historyGrant/4)
+			c.historyGrownAt = now
+			return
 		}
 	}
 }
@@ -263,11 +342,11 @@ func (c *mpCore) txLoop() {
 			for size < n {
 				size *= 2
 			}
-			compact, _ := c.memory.tryAcquirePrimary(size + 512)
+			compact, _ := c.memory.tryAcquireTX(size + 512)
 			if compact != nil {
 				copy(compact, buffer.Data[:n])
 				buffer.Release()
-				buffer = stream.NewBuffer(compact[:n], func() { c.memory.release(compact) })
+				buffer = stream.NewBuffer(compact[:n], func() { c.memory.releaseTX(compact) })
 			}
 		}
 		c.stateMu.Lock()

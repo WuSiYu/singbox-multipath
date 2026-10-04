@@ -69,17 +69,20 @@ func (c *mpCore) activationLoop() {
 			if primary == nil {
 				continue
 			}
+			// Leg0 is the bottleneck when the application keeps the small,
+			// rate-sized unsent queue at least half full.
 			c.stateMu.Lock()
-			backlogBytes := primary.backlogBytes() + int64(c.tx.WriteNext-min(c.tx.Next, c.tx.WriteNext))
+			backlogBytes := int64(c.tx.WriteNext - min(c.tx.Next, c.tx.WriteNext))
+			queueBytes := int64(c.unsentLimitLocked())
 			c.stateMu.Unlock()
-			if backlogBytes*5 >= c.cfg.QueueBytes*4 {
+			if backlogBytes*2 >= queueBytes {
 				if queueHighSince.IsZero() {
 					queueHighSince = now
 				} else if now.Sub(queueHighSince) >= c.cfg.ActivationWindow {
 					c.activate(activationInfo{
 						Reason:           activationReasonLeg0Queue,
 						BacklogBytes:     backlogBytes,
-						QueueBytes:       c.cfg.QueueBytes,
+						QueueBytes:       queueBytes,
 						Elapsed:          now.Sub(queueHighSince),
 						RequiredDuration: c.cfg.ActivationWindow,
 					})

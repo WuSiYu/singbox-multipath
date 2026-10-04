@@ -3,6 +3,7 @@ package multipath
 import (
 	"context"
 	"fmt"
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 	"net"
 	"testing"
 	"testing/synctest"
@@ -92,7 +93,7 @@ func TestActivationTriggerORCombinations(t *testing.T) {
 						defer core.Close()
 						wire, peer := net.Pipe()
 						defer peer.Close()
-						leg, err := core.addLeg(0, wire, nil)
+						_, err := core.addLeg(0, wire, nil)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -102,7 +103,11 @@ func TestActivationTriggerORCombinations(t *testing.T) {
 						}
 						switch stimulus {
 						case "queue":
-							leg.queuedBytes.Store(cfg.QueueBytes*4/5 + 1)
+							// The application outpaces leg0: unsent data stay
+							// above half of the rate-sized unsent limit.
+							core.stateMu.Lock()
+							_ = core.tx.Append(stream.NewBuffer(make([]byte, cfg.QueueBytes), nil))
+							core.stateMu.Unlock()
 						case "rate":
 							core.ingressBytes.Store(200_000)
 						case "bytes", "bytes_below_min":

@@ -71,12 +71,14 @@ func TestBeta8AutomaticLimitsOnOwningHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.cfg.SendBufferBytes != 224<<20 || o.cfg.ReceiveWindowBytes != 224<<20 || remote.SendBufferBytes != 28<<20 || remote.ReceiveWindowBytes != 28<<20 {
-		t.Fatal("automatic limits did not follow each host's budget")
+	// Automatic limits are ceilings: the working history follows the path BDP
+	// and the working window follows the node's fair share at run time.
+	if o.cfg.SendBufferBytes != maxReplayBytes || o.cfg.ReceiveWindowBytes != maxReorderBytes || remote.SendBufferBytes != maxReplayBytes || remote.ReceiveWindowBytes != maxReorderBytes {
+		t.Fatal("automatic limits are not the protocol ceilings")
 	}
 	for _, size := range []int{1024, 16384, 65536} {
 		cfg, err := configForPolicy(o.cfg.Memory, size, o.policy.Upload, o.policy.Download)
-		if err != nil || cfg.ReceiveWindowBytes != 224<<20 {
+		if err != nil || cfg.ReceiveWindowBytes != maxReorderBytes {
 			t.Fatalf("frame size changed receive capacity: %d %v", size, err)
 		}
 	}

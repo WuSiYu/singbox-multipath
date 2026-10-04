@@ -28,7 +28,7 @@ func TestReceiptAndReadAreIndependent(t *testing.T) {
 	if r.Ack() != uint64(len(payload)+1) || r.ReadNext != 0 || r.EOF() {
 		t.Fatal("receipt/consumption/FIN conflated")
 	}
-	if r.Advertise(true) != 4*PageSize {
+	if r.Advertise(r.Capacity) != 4*PageSize {
 		t.Fatal("ACK alone slid window")
 	}
 	var received []byte
@@ -39,7 +39,7 @@ func TestReceiptAndReadAreIndependent(t *testing.T) {
 	if !bytes.Equal(received, payload) || !r.EOF() {
 		t.Fatal("stream changed")
 	}
-	if r.Advertise(true) != uint64(4*PageSize+len(payload)) {
+	if r.Advertise(r.Capacity) != uint64(4*PageSize+len(payload)) {
 		t.Fatal("window not tied to consumption")
 	}
 }
@@ -128,7 +128,7 @@ func TestPressureKeepsAcknowledgedBytesAndAdmitsHead(t *testing.T) {
 		t.Fatal("receiver failed to resume after application read")
 	}
 	end := r.WindowEnd
-	if r.Advertise(false) != end {
+	if r.Advertise(0) != end {
 		t.Fatal("pressure shrank window")
 	}
 	r.Close()

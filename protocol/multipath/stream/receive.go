@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"math/bits"
+	"sync"
 )
 
 const (
@@ -36,6 +37,19 @@ type receivePage struct {
 	count   int
 	head    bool
 }
+
+// Pages are recycled: a 16 KiB allocation per arriving page otherwise
+// dominates garbage collection at gigabit rates.
+var pagePool = sync.Pool{New: func() any { return new(receivePage) }}
+
+func newPage(head bool) *receivePage {
+	page := pagePool.Get().(*receivePage)
+	clear(page.present[:])
+	page.count, page.head = 0, head
+	return page
+}
+
+func freePage(page *receivePage) { pagePool.Put(page) }
 
 // Receiver separates received-prefix acknowledgement from application reads.
 // Its sparse, byte-addressed pages bound metadata even for one-byte frames.
@@ -134,7 +148,7 @@ func (r *Receiver) Insert(seq uint64, data []byte) (int, error) {
 				}
 			}
 			if admitted {
-				page = &receivePage{head: head}
+				page = newPage(head)
 				r.pages[id] = page
 			}
 		}
@@ -230,20 +244,18 @@ func (r *Receiver) Consume(length int) {
 			if r.memory != nil {
 				r.memory.Release(page.head)
 			}
+			freePage(page)
 		}
 	}
 }
 
-// Advertise slides an existing window only while memory permits. Freezing the
-// right edge under pressure never retracts previously advertised capacity.
-func (r *Receiver) Advertise(grow bool) uint64 {
-	capacity := r.Capacity
-	if !grow {
-		capacity = min(capacity, PageSize)
-	}
+// Advertise slides the window to ReadNext+target, bounded by Capacity. The
+// right edge never retracts. Storage is allocated lazily as bytes arrive.
+func (r *Receiver) Advertise(target uint64) uint64 {
+	target = min(target, r.Capacity)
 	end := uint64(math.MaxUint64)
-	if capacity <= math.MaxUint64-r.ReadNext {
-		end = r.ReadNext + capacity
+	if target <= math.MaxUint64-r.ReadNext {
+		end = r.ReadNext + target
 	}
 	r.WindowEnd = max(r.WindowEnd, end)
 	return r.WindowEnd
@@ -267,6 +279,7 @@ func (r *Receiver) pruneTail(keep uint64) bool {
 	if r.memory != nil {
 		r.memory.Release(page.head)
 	}
+	freePage(page)
 	return true
 }
 
@@ -289,6 +302,7 @@ func (r *Receiver) Close() {
 		if r.memory != nil {
 			r.memory.Release(page.head)
 		}
+		freePage(page)
 	}
 	r.buffered = 0
 }

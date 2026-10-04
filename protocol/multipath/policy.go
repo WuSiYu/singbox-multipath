@@ -157,10 +157,10 @@ func configForPolicy(memory *memoryBudget, frameSize int, tx, rx directionPolicy
 		SendBufferBytes: int64(tx.SendBufferBytes), ReceiveWindowBytes: int64(rx.ReceiveWindowBytes), PathStallTimeoutMin: tx.PathStallTimeoutMin,
 	}
 	if cfg.SendBufferBytes == 0 {
-		cfg.SendBufferBytes = automaticBufferLimit(memory, frameSize)
+		cfg.SendBufferBytes = maxReplayBytes
 	}
 	if cfg.ReceiveWindowBytes == 0 {
-		cfg.ReceiveWindowBytes = automaticBufferLimit(memory, frameSize)
+		cfg.ReceiveWindowBytes = maxReorderBytes
 	}
 	if minimumSessionMemory(cfg) > memory.limit {
 		return coreConfig{}, errors.New("memory_limit is too small for this multipath session")

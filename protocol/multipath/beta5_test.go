@@ -291,7 +291,7 @@ func TestBeta5LocalQueueIsNotAPathFlightLimit(t *testing.T) {
 	}
 }
 
-func TestBeta5PeerPressureLeavesPrimaryEligible(t *testing.T) {
+func TestPeerPressureDoesNotGatePaths(t *testing.T) {
 	core, _ := newCore(context.Background(), coreConfig{AggregationEnabled: true})
 	defer core.Close()
 	core.active.Store(true)
@@ -303,17 +303,14 @@ func TestBeta5PeerPressureLeavesPrimaryEligible(t *testing.T) {
 	core.legsMu.Lock()
 	core.legs[0], core.legs[1] = primary, secondary
 	core.legsMu.Unlock()
+	// The receiver backs its whole window; its pressure flag is informational.
 	core.peerPressure = true
 	if got := core.choosePathLocked(65536); got != primary {
-		t.Error("peer pressure blocked primary head progress")
+		t.Error("peer pressure blocked primary progress")
 	}
 	primary.busy = true
-	if got := core.choosePathLocked(65536); got != nil {
-		t.Error("peer pressure permitted speculative secondary data")
-	}
-	core.peerPressure = false
 	if got := core.choosePathLocked(65536); got != secondary {
-		t.Error("secondary did not resume after peer pressure")
+		t.Error("peer pressure blocked the secondary")
 	}
 	core.legsMu.Lock()
 	delete(core.legs, 0)

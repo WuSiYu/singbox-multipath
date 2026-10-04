@@ -235,6 +235,9 @@ type mpCore struct {
 	tx              *stream.Sender
 	rx              *stream.Receiver
 	headPages       int
+	historyGrant    uint64    // stateMu
+	historyAt       time.Time // stateMu
+	historyGrownAt  time.Time // stateMu
 	nextGeneration  uint64
 	pumpWake        chan struct{}
 	rxWake          chan struct{}

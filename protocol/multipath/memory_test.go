@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 )
 
 func TestAutomaticMemoryLimit(t *testing.T) {
@@ -25,7 +27,7 @@ func TestCacheCheckoutReleasesReferencesAndSparseIndex(t *testing.T) {
 			buffers = append(buffers, acquireTestMemory(t, budget, 1200))
 		}
 		for _, p := range buffers {
-			budget.release(p)
+			budget.releaseTX(p)
 		}
 		original := budget.cache[1200]
 		for range len(original) - 1 {
@@ -68,10 +70,10 @@ func TestCacheChangingSizesRemainBounded(t *testing.T) {
 			fresh = append(fresh, acquireTestMemory(t, budget, size))
 		}
 		for _, p := range fresh {
-			budget.release(p)
+			budget.releaseTX(p)
 		}
 		for _, p := range held {
-			budget.release(p)
+			budget.releaseTX(p)
 		}
 		held = nil
 		var reachable int64
@@ -132,42 +134,79 @@ func TestIdleSessionsDoNotAllocateAdvertisedWindows(t *testing.T) {
 
 func acquireTestMemory(t *testing.T, budget *memoryBudget, size int) []byte {
 	t.Helper()
-	buffer, _ := budget.tryAcquirePrimary(size)
+	buffer, _ := budget.tryAcquireTX(size)
 	if buffer == nil {
 		t.Fatalf("test allocation failed: %d", size)
 	}
 	return buffer
 }
 
-func TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve(t *testing.T) {
-	budget := newMemoryBudget(1024, false)
-	first := acquireTestMemory(t, budget, 800)
-	second := acquireTestMemory(t, budget, 100)
-	if snapshot := budget.snapshot(); !snapshot.Pressure || snapshot.BoosterLimitBytes != 896 || snapshot.BoosterResumeBytes != 768 {
-		t.Fatalf("unexpected pressure snapshot: %+v", snapshot)
+// Transmit payload and receive pages borrow from one pool, but each always
+// leaves the other an eighth of it and neither enters the emergency margin.
+func TestMemoryRegionsCannotStarveEachOther(t *testing.T) {
+	budget := newMemoryBudget(16<<20, false)
+	pool := budget.limit - budget.margin
+	fillTX := func() [][]byte {
+		var held [][]byte
+		for {
+			buffer, wait := budget.tryAcquireTX(64 << 10)
+			if buffer == nil {
+				if wait == nil {
+					t.Fatal("blocked transmit allocation returned no wakeup")
+				}
+				return held
+			}
+			held = append(held, buffer)
+		}
 	}
-	if budget.boosterAllowed() || budget.reservePage(64, false) {
-		t.Fatal("booster passed high watermark")
+	fillRX := func() int64 {
+		var n int64
+		for budget.rxAcquire(stream.PageCharge, false) {
+			n++
+		}
+		return n * stream.PageCharge
 	}
-	primary := acquireTestMemory(t, budget, 100)
-	budget.release(primary)
-	budget.release(second)
-	if budget.boosterAllowed() {
-		t.Fatal("booster resumed above low watermark")
+	held := fillTX()
+	if tx := budget.snapshot().TXBytes; tx > pool-pool/8 || tx < pool-pool/8-(64<<10) {
+		t.Fatalf("transmit took %d, want about %d", tx, pool-pool/8)
 	}
-	budget.release(first)
-	if !budget.boosterAllowed() || !budget.reservePage(64, false) {
-		t.Fatal("booster did not resume")
+	if got := fillRX(); got < pool/8-stream.PageCharge || got > pool/8 {
+		t.Fatalf("receive kept %d with transmit full, want about %d", got, pool/8)
 	}
-	budget.releaseSession(64)
-	cached := acquireTestMemory(t, budget, 64)
-	budget.release(cached)
+	if budget.snapshot().Pressure {
+		t.Fatal("regions alone must not enter the emergency margin")
+	}
+	if !budget.rxAcquire(stream.PageCharge, true) {
+		t.Fatal("head page must use the margin")
+	}
+	budget.rxRelease(stream.PageCharge)
+	for _, buffer := range held {
+		budget.releaseTX(buffer)
+	}
+	budget.rxRelease(budget.snapshot().RXBytes)
+	if got := fillRX(); got > pool-pool/8 {
+		t.Fatalf("receive exceeded its region: %d", got)
+	}
+	if held = fillTX(); int64(len(held))*(64<<10) < pool/8-(64<<10) {
+		t.Fatal("transmit starved by receive storage")
+	}
+}
+
+func TestMemoryPressureIsObservationalAndRecovers(t *testing.T) {
+	budget := newMemoryBudget(1<<20, false)
+	if !budget.reserveSession(budget.limit - budget.margin/4) {
+		t.Fatal("session reservation within the limit failed")
+	}
+	if !budget.snapshot().Pressure || budget.reservePage(4096, false) {
+		t.Fatal("margin use must be reported and non-essential metadata refused")
+	}
+	if !budget.reservePage(128, true) {
+		t.Fatal("essential metadata must use the margin")
+	}
+	budget.releaseSession(budget.limit - budget.margin/4 + 128)
 	snapshot := budget.snapshot()
-	if snapshot.Pressure || snapshot.PressureEvents != 1 {
-		t.Fatalf("unexpected final memory snapshot: %+v", snapshot)
-	}
-	if snapshot.PeakUsedBytes < 1000 || snapshot.PeakCachedBytes < 64 {
-		t.Fatalf("memory peaks not retained: %+v", snapshot)
+	if snapshot.Pressure || snapshot.PressureEvents != 1 || snapshot.UsedBytes != 0 {
+		t.Fatalf("pressure did not clear: %+v", snapshot)
 	}
 }
 
@@ -195,7 +234,9 @@ func TestMemoryBudgetSessionAdmissionIsReleased(t *testing.T) {
 	second.Close()
 }
 
-func TestCoreMemoryPressureKeepsLeg0Available(t *testing.T) {
+// Memory pressure is observational: a busy primary still lets new data use an
+// eligible secondary, because sending retained history allocates nothing.
+func TestCoreMemoryPressureKeepsBothLegs(t *testing.T) {
 	cfg := testCoreConfig()
 	budget := newMemoryBudget(4<<20, false)
 	cfg.Memory = budget
@@ -216,15 +257,24 @@ func TestCoreMemoryPressureKeepsLeg0Available(t *testing.T) {
 	if _, err = core.addLeg(1, leg1Core, nil); err != nil {
 		t.Fatal(err)
 	}
-
 	snapshot := budget.snapshot()
-	pressureBytes := int(snapshot.BoosterLimitBytes - snapshot.UsedBytes)
-	pressureBuffer := acquireTestMemory(t, budget, pressureBytes)
-	defer budget.release(pressureBuffer)
+	held := snapshot.LimitBytes - snapshot.UsedBytes - 1024
+	if !budget.reserveSession(held) {
+		t.Fatal("pressure reservation failed")
+	}
+	defer budget.releaseSession(held)
+	if !budget.snapshot().Pressure {
+		t.Fatal("test did not create pressure")
+	}
 	core.stateMu.Lock()
+	defer core.stateMu.Unlock()
+	if selected := core.choosePathLocked(cfg.FrameSize); selected == nil || selected.id != 0 {
+		t.Fatalf("pressure selected %v instead of the idle primary", selected)
+	}
+	core.getLeg(0).busy = true
 	selected := core.choosePathLocked(cfg.FrameSize)
-	core.stateMu.Unlock()
-	if selected == nil || selected.id != 0 {
-		t.Fatalf("memory pressure selected leg %v instead of leg0", selected)
+	core.getLeg(0).busy = false
+	if selected == nil || selected.id != 1 {
+		t.Fatalf("pressure disabled the secondary: %v", selected)
 	}
 }
