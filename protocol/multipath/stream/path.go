@@ -40,6 +40,9 @@ type Path struct {
 	head          int
 	sampleBytes   uint64
 	sampleTime    uint64
+	// restart marks that the path went idle: the next receipt starts a new
+	// rate sample instead of averaging delivery over the idle gap.
+	restart bool
 }
 
 func (p *Path) Outstanding() uint64 { return p.Sent - p.Received }
@@ -50,6 +53,9 @@ func (p *Path) Submitted(length int, now time.Time, prepaid ...bool) (uint64, er
 		return 0, ErrSequence
 	}
 	seq := p.Sent
+	if p.Outstanding() == 0 && p.sampleTime != 0 {
+		p.restart = true
+	}
 	p.Sent += uint64(length)
 	p.flights = append(p.flights, Flight{End: p.Sent, SentAt: now, Prepaid: len(prepaid) > 0 && prepaid[0]})
 	return seq, nil
@@ -77,6 +83,10 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 		if receipt.FirstNext > 0 && receipt.Next > receipt.FirstNext && receipt.ReceivedAt > receipt.FirstReceivedAt && receipt.FirstReceivedAt > 0 {
 			p.Rate = float64(receipt.Next-receipt.FirstNext) * 1e6 / float64(receipt.ReceivedAt-receipt.FirstReceivedAt)
 		}
+		p.sampleTime, p.sampleBytes = receipt.ReceivedAt, receipt.Next
+	} else if p.restart {
+		// The first receipt after an idle period only re-anchors the sample.
+		p.restart = false
 		p.sampleTime, p.sampleBytes = receipt.ReceivedAt, receipt.Next
 	} else if receipt.ReceivedAt > p.sampleTime {
 		elapsed := float64(receipt.ReceivedAt-p.sampleTime) / 1e6
@@ -177,17 +187,22 @@ func (p *Path) Pipeline(initial, maximum uint64) uint64 {
 // CompletionTime estimates when a new segment of length bytes would be fully
 // delivered on this path: queued work over the measured delivery rate plus the
 // one-way propagation delay. An unmeasured path borrows provisionalRate.
-func (p *Path) CompletionTime(length int, provisionalRate float64) float64 {
+func (p *Path) CompletionTime(length int, provisionalRate float64, now time.Time) float64 {
 	rate := p.Rate
 	if rate <= 0 {
 		rate = provisionalRate
 	}
-	if rate <= 0 {
-		rate = 1
-	}
 	delay := p.MinimumRTT
 	if delay == 0 {
 		delay = p.SRTT
+	}
+	// An idle path's estimates are stale: probe it optimistically so a path
+	// that recovered from a degradation is measured again instead of starved.
+	if p.Outstanding() == 0 && !p.LastProgress.IsZero() && now.Sub(p.LastProgress) >= max(2*p.SRTT, 100*time.Millisecond) {
+		rate = max(rate, provisionalRate)
+	}
+	if rate <= 0 {
+		rate = 1
 	}
 	return float64(p.Outstanding()+uint64(length))/rate + delay.Seconds()/2
 }

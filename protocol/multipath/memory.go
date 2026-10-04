@@ -176,21 +176,34 @@ func (b *memoryBudget) usedLocked() int64 { return b.tx + b.rx + b.other + b.cac
 func (b *memoryBudget) poolLocked() int64 { return b.limit - b.margin }
 
 // Transmit payload (tx) and receive pages (rx) borrow from the same pool. Each
-// direction may use whatever the other is not using, but always leaves the
-// other at least an eighth of the pool, so neither can starve the other.
+// direction may use whatever the other is not using, but always leaves it a
+// reserve: half of the pool while the other direction has active sessions,
+// otherwise an eighth. Saturated uploads and downloads therefore split the
+// node evenly instead of the transmit side starving every receive window.
 // rx counts receive pages actually allocated (out-of-order and unread data).
 
-// txRegionLocked is the most unsent/unacked payload the node may hold now.
+func (b *memoryBudget) reserveLocked(set *activitySet) int64 {
+	pool := b.poolLocked()
+	if set.count(time.Now().UnixNano()) > 0 {
+		return max(pool/8, (pool-b.other)/2)
+	}
+	return pool / 8
+}
+
+// txRegionLocked is the most unsent/unacked payload the node may hold now. It
+// also leaves a sixteenth of the pool free, so arriving data never have to
+// wait for acknowledgements of the opposite direction to be stored.
 func (b *memoryBudget) txRegionLocked() int64 {
 	pool := b.poolLocked()
-	return max(0, pool-b.other-max(b.rx, pool/8))
+	return max(0, pool-b.other-max(b.rx, b.reserveLocked(&b.receivers))-pool/16)
 }
 
 // rxRegionLocked is the most receive storage the node may hold for
-// speculative (non-head) pages now.
+// speculative (non-head) pages now. Like transmit, it stops a sixteenth short
+// of the other direction's reserve so that reserve stays fully usable.
 func (b *memoryBudget) rxRegionLocked() int64 {
 	pool := b.poolLocked()
-	return max(0, pool-b.other-max(b.tx, pool/8))
+	return max(0, pool-b.other-max(b.tx, b.reserveLocked(&b.senders))-pool/16)
 }
 
 func (b *memoryBudget) makeRoomLocked(size int64) {
@@ -397,6 +410,13 @@ func (b *memoryBudget) rxAcquire(size int64, head bool) bool {
 	return true
 }
 
+// receiveRoom is the receive storage still available for speculative pages.
+func (b *memoryBudget) receiveRoom() int64 {
+	b.access.Lock()
+	defer b.access.Unlock()
+	return min(b.rxRegionLocked()-b.rx, b.poolLocked()-b.usedLocked())
+}
+
 func (b *memoryBudget) rxRelease(size int64) {
 	if b == nil || size <= 0 {
 		return
@@ -418,6 +438,11 @@ func (b *memoryBudget) receiveShare(key any, now time.Time) int64 {
 	defer b.access.Unlock()
 	nanos := now.UnixNano()
 	b.receivers.mark(key, nanos)
+	if b.pressure {
+		// Stored data already exceed the pool: grow no window beyond the
+		// floor until applications drain it.
+		return receiveWindowFloor
+	}
 	share := b.rxRegionLocked() / int64(max(1, b.receivers.count(nanos)))
 	return max(receiveWindowFloor, share/stream.PageCharge*stream.PageSize)
 }

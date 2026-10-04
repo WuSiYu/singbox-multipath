@@ -231,6 +231,7 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 	c.legsMu.Unlock()
 	c.stateMu.Lock()
 	leg.path.Close()
+	c.repairScan = true
 	c.stateMu.Unlock()
 	leg.close(err)
 	c.cancelLegProbe(leg.id)

@@ -39,6 +39,14 @@ func (c *mpCore) pumpLoop() {
 		if c.cfg.Recovery != nil && now.Sub(lastFeedback) >= time.Second {
 			c.feedbackDirty = true
 		}
+		// A sender paused by our "full" report must learn promptly when room
+		// returns, even if nothing arrives or is read meanwhile.
+		if c.reportedFull {
+			if now.Sub(lastFeedback) >= 20*time.Millisecond {
+				c.feedbackDirty = true
+			}
+			wait = min(wait, 20*time.Millisecond)
+		}
 		if primary != nil && c.feedbackDirty {
 			if now.Sub(lastFeedback) >= 5*time.Millisecond || c.rx.Complete() {
 				c.legsMu.RLock()
@@ -79,6 +87,7 @@ func (c *mpCore) pumpLoop() {
 		for _, leg := range legs {
 			if leg.path.Stalled(now, c.cfg.PathStallTimeoutMin) && !leg.path.Stale {
 				leg.path.Stale = true
+				c.repairScan = true
 				c.replayTO.Add(1)
 			}
 			// A leg without any progress for this long is closed so its
@@ -198,10 +207,23 @@ func (c *mpCore) feedbackLockedWithoutLegs() flowMessage {
 	target := c.receiveTargetLocked(time.Now())
 	c.feedbackSeq++
 	message := flowMessage{Next: c.rx.Ack(), Limit: c.rx.Advertise(target), Seq: c.feedbackSeq}
-	// Informational only: the receiver's node is using its emergency margin.
-	if c.memory.underPressure() {
+	// The receiver is full: it refused data since the last feedback or has
+	// room for less than two frames. The sender then pauses new data and only
+	// repairs holes, so stored out-of-order data drain instead of growing.
+	full := c.rx.Dropped > c.droppedReported || c.memory.receiveRoom() < 2*int64(c.cfg.FrameSize)
+	c.droppedReported = c.rx.Dropped
+	if full {
 		message.Flags |= flowFlagPressure
 	}
+	c.reportedFull = full
+	// Ask only for dropped bytes that can be stored: while full, those near
+	// the next expected byte, whose repair advances in-order delivery and
+	// releases memory; a repair sent beyond them would just be dropped again.
+	limit := uint64(math.MaxUint64)
+	if full {
+		limit = c.rx.HeadPageEnd() + (stream.NearHeadPages-1)*stream.PageSize
+	}
+	message.NACKs = c.rx.DroppedRanges(maxFlowNACKs, limit)
 	for id, leg := range c.legs {
 		message.Paths[id] = leg.received
 	}
@@ -218,19 +240,31 @@ func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
 	return min(uint64(c.cfg.ReceiveWindowBytes), uint64(c.memory.receiveShare(c, now)))
 }
 
+// repairBudgetLocked limits receiver-requested repairs to a quarter of the
+// carrying paths' delivery rate per RTT, so repairs never crowd out new data.
+func (c *mpCore) repairBudgetLocked(now time.Time) bool {
+	rate, rtt := c.carryingRateLocked()
+	interval := max(rtt, 10*time.Millisecond)
+	if now.Sub(c.repairWindowAt) >= interval {
+		c.repairWindowAt, c.repairWindowBytes = now, 0
+	}
+	return c.repairWindowBytes < max(uint64(rate*interval.Seconds()/4), 2*uint64(c.cfg.FrameSize))
+}
+
 func (c *mpCore) handleWindow(message flowMessage) error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 	if err := c.tx.Acknowledge(message.Next, message.Limit); err != nil {
 		return err
 	}
+	now := time.Now()
 	// Copies of feedback travel on both legs and may arrive out of order.
 	// Monotonic fields merge above; the rest only applies when newer.
 	if message.Seq > c.peerFeedbackSeq {
 		c.peerFeedbackSeq = message.Seq
 		c.peerPressure = message.Flags&flowFlagPressure != 0
+		c.queueRepairsLocked(message.NACKs, now)
 	}
-	now := time.Now()
 	for _, leg := range c.availableLegs() {
 		if err := leg.path.Feedback(message.Paths[leg.id], now); err != nil {
 			return err
@@ -282,7 +316,13 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	// Selection policy and transient readiness are distinct: a healthy secondary
 	// remains the sole new-data path while busy or discovery/window constrained.
 	// Only unavailable/stale paths permit primary fallback.
+	// A full receiver asked for a pause: keep at most two frames of new data
+	// in flight until it reports room again; repairs continue meanwhile.
+	if c.peerPressure && c.tx.Next-c.tx.Una >= 2*uint64(c.cfg.FrameSize) {
+		return nil
+	}
 	exclusiveSecondary := c.trafficSavingSecondaryLocked()
+	now := time.Now()
 	var chosen *mpLeg
 	chosenTime, bestTime := math.Inf(1), math.Inf(1)
 	// Startup sampling is bounded. Thereafter the connection-level byte
@@ -310,9 +350,11 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 		if leg.id == 1 && (!c.active.Load() || !leg.ready.Load()) {
 			continue
 		}
-		completion := leg.path.CompletionTime(length, provisionalRate)
+		completion := leg.path.CompletionTime(length, provisionalRate, now)
 		bestTime = min(bestTime, completion)
-		if leg.busy {
+		// A penalized path recently held the connection head back; it takes
+		// no new data until its penalty (one of its RTTs) expires.
+		if leg.busy || leg.penaltyUntil.After(now) {
 			continue
 		}
 		if leg.path.Outstanding()+uint64(length) > leg.path.Pipeline(initial, uint64(c.cfg.SendBufferBytes)) {
@@ -322,7 +364,12 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 			chosen, chosenTime = leg, completion
 		}
 	}
-	if chosen != nil && exclusiveSecondary == nil && chosenTime > max(bestTime*ecfSlack, bestTime+0.002) {
+	// A path holding less than two frames keeps receiving data regardless:
+	// its delivery-rate estimate would otherwise be capped by the scheduler's
+	// own restraint (an application-limited sample) and never recover after a
+	// degradation. Each round then grows its in-flight data geometrically.
+	probing := chosen != nil && chosen.path.Outstanding() < 2*uint64(c.cfg.FrameSize)
+	if chosen != nil && exclusiveSecondary == nil && !probing && chosenTime > max(bestTime*ecfSlack, bestTime+0.002) {
 		return nil
 	}
 	return chosen
@@ -374,7 +421,114 @@ func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, n
 // neither consumes new window space nor needs a new payload allocation. There
 // is no separate leg1 replay map, idle-credit epoch, or reconnect-on-RTO state.
 func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
-	for i := c.mappingHead; i < len(c.mappings); i++ {
+	if sent, err := c.repairDroppedLocked(now); sent || err != nil {
+		return sent, err
+	}
+	if sent, err := c.repairMappingsLocked(now); sent || err != nil {
+		return sent, err
+	}
+	return c.opportunisticLocked(now)
+}
+
+// repairDroppedLocked resends byte ranges the receiver reported as dropped
+// for lack of memory. Several holes are repaired per round trip.
+func (c *mpCore) repairDroppedLocked(now time.Time) (bool, error) {
+	for len(c.repairQueue) > 0 && c.repairBudgetLocked(now) {
+		r := &c.repairQueue[0]
+		start, end := max(r.Start, c.tx.Una), min(r.End, c.tx.Next)
+		if start >= end {
+			c.repairQueue = c.repairQueue[1:]
+			continue
+		}
+		target := c.bestIdleLegLocked(nil, end-start)
+		if target == nil {
+			return false, nil
+		}
+		segment, ok := c.tx.Range(start, int(min(end-start, uint64(c.cfg.FrameSize))))
+		if !ok {
+			c.repairQueue = c.repairQueue[1:]
+			continue
+		}
+		if err := c.submitLocked(target, segment, true, now); err != nil {
+			return false, err
+		}
+		r.Start = segment.End()
+		c.repairWindowBytes += uint64(segment.Length)
+		c.fallbackB.Add(uint64(segment.Length))
+		c.fallbackF.Add(1)
+		c.fallbackE.Add(1)
+		return true, nil
+	}
+	return false, nil
+}
+
+// queueRepairsLocked accepts the receiver's dropped ranges, at most once per
+// range start within a retransmission timeout.
+func (c *mpCore) queueRepairsLocked(nacks []stream.Range, now time.Time) {
+	for start := range c.repairAt {
+		if start < c.tx.Una {
+			delete(c.repairAt, start)
+		}
+	}
+	for _, r := range nacks {
+		r.Start, r.End = max(r.Start, c.tx.Una), min(r.End, c.tx.Next)
+		if r.Start >= r.End {
+			continue
+		}
+		if at, ok := c.repairAt[r.Start]; ok && now.Sub(at) < c.repairTimeoutLocked() {
+			continue
+		}
+		if c.repairAt == nil {
+			c.repairAt = make(map[uint64]time.Time)
+		}
+		c.repairAt[r.Start] = now
+		c.repairQueue = append(c.repairQueue, r)
+	}
+	if len(c.repairQueue) > 0 {
+		wakeFlow(c.pumpWake)
+	}
+}
+
+func (c *mpCore) repairTimeoutLocked() time.Duration {
+	timeout := time.Duration(0)
+	for _, leg := range c.availableLegs() {
+		timeout = max(timeout, leg.path.RTO(c.cfg.PathStallTimeoutMin))
+	}
+	return max(timeout, 200*time.Millisecond)
+}
+
+// bestIdleLegLocked returns the usable, idle leg with the earliest completion
+// time, excluding avoid.
+func (c *mpCore) bestIdleLegLocked(avoid *mpLeg, length uint64) *mpLeg {
+	now := time.Now()
+	provisional := float64(0)
+	for _, leg := range c.availableLegs() {
+		provisional = max(provisional, leg.path.Rate)
+	}
+	var best *mpLeg
+	bestTime := math.Inf(1)
+	for _, leg := range c.availableLegs() {
+		if leg == avoid || leg.busy || !c.usableLeg(leg) || !leg.ready.Load() {
+			continue
+		}
+		if t := leg.path.CompletionTime(int(length), provisional, now); t < bestTime {
+			best, bestTime = leg, t
+		}
+	}
+	return best
+}
+
+// repairMappingsLocked reinjects mappings whose leg failed (lost generation)
+// or stalled, and the connection head when a path receipt shows it arrived
+// but the Data ACK did not move (receiver eviction). The full scan only runs
+// after a leg failed or stalled; otherwise only the head is examined.
+func (c *mpCore) repairMappingsLocked(now time.Time) (bool, error) {
+	last := len(c.mappings)
+	if !c.repairScan {
+		last = min(last, c.mappingHead+1)
+	}
+	candidates := false
+	for i := c.mappingHead; i < last; i++ {
 		mapping := &c.mappings[i]
 		owner := c.getLeg(mapping.path)
 		lost := owner == nil || owner.path.Generation != mapping.generation
@@ -385,6 +539,7 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 		if !lost && !stale && !pruned {
 			continue
 		}
+		candidates = true
 		// A path receipt with no corresponding Data ACK may indicate receive
 		// pruning. Allow normal coalescing/reordering before repairing it.
 		if pruned && !stale && now.Sub(mapping.sentAt) < owner.path.RTO(c.cfg.PathStallTimeoutMin) {
@@ -397,10 +552,7 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 				target = other
 			}
 		}
-		if c.cfg.Recovery != nil && target != nil && !c.cfg.Recovery.allows(target.id) {
-			continue
-		}
-		if target == nil || target.busy || !target.ready.Load() || target.path.Stale {
+		if target == nil || target.busy || !target.ready.Load() || !c.usableLeg(target) {
 			continue
 		}
 		if !mapping.repairedAt.IsZero() && now.Sub(mapping.repairedAt) < target.path.RTO(c.cfg.PathStallTimeoutMin) {
@@ -419,6 +571,69 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 		c.fallbackB.Add(uint64(segment.Length))
 		c.fallbackF.Add(1)
 		c.fallbackE.Add(1)
+		return true, nil
+	}
+	if c.repairScan && !candidates {
+		c.repairScan = false
+	}
+	return false, nil
+}
+
+// opportunisticLocked implements opportunistic reinjection with penalization
+// (as in MPTCP): when new data are blocked by the receive window or the send
+// history while the connection head waits on a path that has delivered
+// nothing for a whole RTT, idle capacity on another path resends that head in
+// order, and the stuck path takes no new data for one of its RTTs.
+func (c *mpCore) opportunisticLocked(now time.Time) (bool, error) {
+	if c.mappingHead >= len(c.mappings) || !c.active.Load() {
+		return false, nil
+	}
+	frame := uint64(c.cfg.FrameSize)
+	windowBlocked := c.tx.WriteNext > c.tx.Next && c.tx.Next >= c.tx.WindowEnd
+	historyBlocked := c.tx.Buffered()+frame > c.historyLimitLocked(now)
+	if !windowBlocked && !historyBlocked {
+		return false, nil
+	}
+	head := &c.mappings[c.mappingHead]
+	slow := c.getLeg(head.path)
+	if slow == nil || slow.path.Generation != head.generation {
+		return false, nil
+	}
+	fast := c.bestIdleLegLocked(slow, frame)
+	if fast == nil || fast.path.SRTT == 0 {
+		return false, nil
+	}
+	// Only a path that delivered nothing for a whole RTT of its own is holding
+	// the head back; ordinary RTT differences are left to ECF scheduling.
+	if slow.path.SRTT == 0 || now.Sub(slow.path.LastProgress) < max(slow.path.SRTT, 2*fast.path.SRTT) {
+		return false, nil
+	}
+	limit := c.tx.Una + uint64(fast.path.Rate*slow.path.SRTT.Seconds())
+	for i := c.mappingHead; i < len(c.mappings) && i < c.mappingHead+64; i++ {
+		mapping := &c.mappings[i]
+		if mapping.seq >= limit && i > c.mappingHead {
+			break
+		}
+		if mapping.path != slow.id || mapping.generation != slow.path.Generation {
+			continue
+		}
+		if now.Sub(mapping.sentAt) < fast.path.SRTT || !mapping.repairedAt.IsZero() && now.Sub(mapping.repairedAt) < fast.path.SRTT {
+			continue
+		}
+		segment, ok := c.tx.Range(max(mapping.seq, c.tx.Una), int(mapping.end-max(mapping.seq, c.tx.Una)))
+		if !ok {
+			continue
+		}
+		if err := c.submitLocked(fast, segment, true, now); err != nil {
+			return false, err
+		}
+		// The original copy stays in flight on the slow path; whichever
+		// arrives first is used. Only the repair time is recorded.
+		mapping.repairedAt = now
+		slow.penaltyUntil = now.Add(slow.path.SRTT)
+		c.opportunisticE.Add(1)
+		c.fallbackB.Add(uint64(segment.Length))
+		c.fallbackF.Add(1)
 		return true, nil
 	}
 	return false, nil

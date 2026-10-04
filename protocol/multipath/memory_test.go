@@ -167,11 +167,12 @@ func TestMemoryRegionsCannotStarveEachOther(t *testing.T) {
 		return n * stream.PageCharge
 	}
 	held := fillTX()
-	if tx := budget.snapshot().TXBytes; tx > pool-pool/8 || tx < pool-pool/8-(64<<10) {
-		t.Fatalf("transmit took %d, want about %d", tx, pool-pool/8)
+	// Transmit leaves the other direction an eighth and arrivals a sixteenth.
+	if tx, want := budget.snapshot().TXBytes, pool-pool/8-pool/16; tx > want || tx < want-(64<<10) {
+		t.Fatalf("transmit took %d, want about %d", tx, want)
 	}
-	if got := fillRX(); got < pool/8-stream.PageCharge || got > pool/8 {
-		t.Fatalf("receive kept %d with transmit full, want about %d", got, pool/8)
+	if got := fillRX(); got < pool/8-stream.PageCharge || got > pool/8+pool/16 {
+		t.Fatalf("receive kept %d with transmit full, want at least %d", got, pool/8)
 	}
 	if budget.snapshot().Pressure {
 		t.Fatal("regions alone must not enter the emergency margin")
@@ -184,11 +185,26 @@ func TestMemoryRegionsCannotStarveEachOther(t *testing.T) {
 		budget.releaseTX(buffer)
 	}
 	budget.rxRelease(budget.snapshot().RXBytes)
-	if got := fillRX(); got > pool-pool/8 {
+	if got := fillRX(); got > pool-pool/8-pool/16 {
 		t.Fatalf("receive exceeded its region: %d", got)
 	}
 	if held = fillTX(); int64(len(held))*(64<<10) < pool/8-(64<<10) {
 		t.Fatal("transmit starved by receive storage")
+	}
+	for _, buffer := range held {
+		budget.releaseTX(buffer)
+	}
+	budget.rxRelease(budget.snapshot().RXBytes)
+	// With active sessions in both directions each side keeps half.
+	now := time.Now()
+	budget.transmitShare("sender", now)
+	budget.receiveShare("receiver", now)
+	held = fillTX()
+	if tx := budget.snapshot().TXBytes; tx > pool/2 || tx < pool/2-pool/16-(128<<10) {
+		t.Fatalf("transmit took %d of %d with both directions active", tx, pool)
+	}
+	if got := fillRX(); got < pool/2-pool/16-stream.PageCharge {
+		t.Fatalf("receive kept only %d of %d with both directions active", got, pool)
 	}
 }
 

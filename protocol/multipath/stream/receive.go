@@ -19,6 +19,68 @@ const (
 // Range is a half-open byte interval of the connection sequence space.
 type Range struct{ Start, End uint64 }
 
+// maxDroppedRanges bounds the dropped-range set. When exceeded, the highest
+// ranges are forgotten rather than merged: a merge would cover bytes that did
+// arrive and turn one repair into a large duplicate. Forgotten ranges are
+// still recovered by the sender's head and timeout repairs.
+const maxDroppedRanges = 16
+
+// rangeSet is a sorted list of disjoint ranges.
+type rangeSet []Range
+
+func (s *rangeSet) add(r Range) {
+	if r.Start >= r.End {
+		return
+	}
+	out := (*s)[:0:0]
+	for _, x := range *s {
+		if x.End < r.Start || x.Start > r.End {
+			out = append(out, x)
+			continue
+		}
+		r.Start, r.End = min(r.Start, x.Start), max(r.End, x.End)
+	}
+	index := len(out)
+	for i, x := range out {
+		if x.Start > r.Start {
+			index = i
+			break
+		}
+	}
+	out = append(out, Range{})
+	copy(out[index+1:], out[index:])
+	out[index] = r
+	if len(out) > maxDroppedRanges {
+		out = out[:maxDroppedRanges]
+	}
+	*s = out
+}
+
+func (s *rangeSet) remove(r Range) {
+	if len(*s) == 0 || r.Start >= r.End {
+		return
+	}
+	out := (*s)[:0:0]
+	for _, x := range *s {
+		if x.End <= r.Start || x.Start >= r.End {
+			out = append(out, x)
+			continue
+		}
+		if x.Start < r.Start {
+			out = append(out, Range{x.Start, r.Start})
+		}
+		if x.End > r.End {
+			out = append(out, Range{r.End, x.End})
+		}
+	}
+	*s = out
+}
+
+// NearHeadPages pages from the next expected byte are admitted like the head
+// itself (using the emergency margin and evicting the farthest data): a whole
+// repaired frame can then advance in-order delivery in one round trip.
+const NearHeadPages = 16
+
 var (
 	ErrSequence = errors.New("invalid multipath byte sequence")
 	ErrWindow   = errors.New("multipath data exceeds receive window")
@@ -66,6 +128,8 @@ type Receiver struct {
 	HasFIN    bool
 	Pruned    uint64
 	Dropped   uint64
+	MaxSeen   uint64 // highest byte end that arrived, including duplicates
+	dropped   rangeSet
 	buffered  uint64
 	pages     map[uint64]*receivePage
 	memory    PageMemory
@@ -128,6 +192,7 @@ func (r *Receiver) Insert(seq uint64, data []byte) (int, error) {
 	if end > r.WindowEnd {
 		return 0, ErrWindow
 	}
+	r.MaxSeen = max(r.MaxSeen, end)
 	if end <= r.Next {
 		return 0, nil
 	}
@@ -141,7 +206,7 @@ func (r *Receiver) Insert(seq uint64, data []byte) (int, error) {
 		length := min(len(data), PageSize-offset)
 		page := r.pages[id]
 		if page == nil {
-			head := id == r.Next/PageSize
+			head := id < r.Next/PageSize+NearHeadPages
 			admitted := r.memory == nil || r.memory.Acquire(head)
 			if !admitted && head {
 				// Linux's receive-pressure rule: discard the farthest data
@@ -157,10 +222,14 @@ func (r *Receiver) Insert(seq uint64, data []byte) (int, error) {
 		}
 		if page == nil {
 			r.Dropped += uint64(length)
+			r.dropped.add(Range{seq, seq + uint64(length)})
 		} else {
 			added := page.insert(offset, data[:length])
 			accepted += added
 			r.buffered += uint64(added)
+			if len(r.dropped) > 0 {
+				r.dropped.remove(Range{seq, seq + uint64(length)})
+			}
 		}
 		seq += uint64(length)
 		data = data[length:]
@@ -268,7 +337,7 @@ func (r *Receiver) pruneTail(keep uint64) bool {
 	var last uint64
 	found := false
 	for id := range r.pages {
-		if id != keep && id*PageSize >= r.Next && (!found || id > last) {
+		if id != keep && id >= r.Next/PageSize+NearHeadPages && (!found || id > last) {
 			last, found = id, true
 		}
 	}
@@ -276,6 +345,8 @@ func (r *Receiver) pruneTail(keep uint64) bool {
 		return false
 	}
 	page := r.pages[last]
+	start := last * PageSize
+	r.dropped.add(Range{max(start, r.Next), min(start+PageSize, r.MaxSeen)})
 	r.Pruned += uint64(page.count)
 	r.buffered -= uint64(page.count)
 	delete(r.pages, last)
@@ -285,6 +356,29 @@ func (r *Receiver) pruneTail(keep uint64) bool {
 	freePage(page)
 	return true
 }
+
+// DroppedRanges returns up to n of the lowest byte ranges above Next that this
+// receiver refused or evicted for lack of memory, ending no later than limit.
+// The sender repairs them without waiting for a timeout.
+func (r *Receiver) DroppedRanges(n int, limit uint64) []Range {
+	if len(r.dropped) == 0 {
+		return nil
+	}
+	r.dropped.remove(Range{0, r.Next})
+	var out []Range
+	for _, x := range r.dropped {
+		if len(out) == n || x.Start >= limit {
+			break
+		}
+		x.End = min(x.End, limit)
+		out = append(out, x)
+	}
+	return out
+}
+
+// HeadPageEnd is the end of the page holding the next expected byte. Bytes
+// below it are always admitted, even under memory pressure.
+func (r *Receiver) HeadPageEnd() uint64 { return (r.Next/PageSize + 1) * PageSize }
 
 func (r *Receiver) Buffered() (bytes, outOfOrder uint64, pages int) {
 	if len(r.pages) == 0 {

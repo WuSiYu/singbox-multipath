@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bytes"
+	"math"
 	"math/rand"
 	"testing"
 	"time"
@@ -104,20 +105,26 @@ func (m *testMemory) Release(bool) { m.used-- }
 
 func TestPressureKeepsAcknowledgedBytesAndAdmitsHead(t *testing.T) {
 	memory := &testMemory{limit: 2}
-	r := NewReceiver(8*PageSize, memory)
+	far := uint64(NearHeadPages + 5)
+	r := NewReceiver((far+2)*PageSize, memory)
 	payload := bytes.Repeat([]byte{9}, PageSize)
 	_, _ = r.Insert(0, payload)
-	_, _ = r.Insert(3*PageSize, payload)
-	if r.Ack() != PageSize {
+	_, _ = r.Insert(far*PageSize, payload)
+	if r.Ack() != PageSize || memory.used != 2 {
 		t.Fatal("bad prefix")
 	}
+	// A page near the head evicts the farthest unacknowledged page.
 	_, err := r.Insert(PageSize, payload)
 	if err != nil || r.Ack() != 2*PageSize || r.Pruned != PageSize {
-		t.Fatal("head did not evict unacknowledged tail", err, r.Ack(), r.Pruned)
+		t.Fatal("near-head data did not evict the unacknowledged tail", err, r.Ack(), r.Pruned)
+	}
+	if got := r.DroppedRanges(4, math.MaxUint64); len(got) != 1 || got[0].Start != far*PageSize {
+		t.Fatalf("evicted tail not reported: %v", got)
 	}
 	if !bytes.Equal(r.Readable(), payload) {
 		t.Fatal("acknowledged unread bytes evicted")
 	}
+	// Nothing left to evict: acknowledged unread bytes are never dropped.
 	_, _ = r.Insert(2*PageSize, payload)
 	if r.Ack() != 2*PageSize {
 		t.Fatal("acknowledged unowned bytes under pressure")
@@ -340,5 +347,69 @@ func TestPathRateDoesNotTreatQUICBurstsAsCapacity(t *testing.T) {
 	}
 	if p.Rate < 3_000_000 || p.Rate > 11_000_000 {
 		t.Fatal("burst-biased delivery rate", p.Rate)
+	}
+}
+
+func TestDroppedRangesAreReportedAndCleared(t *testing.T) {
+	memory := &testMemory{limit: 1}
+	r := NewReceiver(16*PageSize, memory)
+	payload := bytes.Repeat([]byte{1}, PageSize)
+	_, _ = r.Insert(PageSize, payload)   // admitted (first speculative page)
+	_, _ = r.Insert(3*PageSize, payload) // refused: memory exhausted
+	_, _ = r.Insert(5*PageSize, payload) // refused
+	got := r.DroppedRanges(4, math.MaxUint64)
+	if len(got) != 2 || got[0] != (Range{3 * PageSize, 4 * PageSize}) || got[1] != (Range{5 * PageSize, 6 * PageSize}) {
+		t.Fatalf("dropped ranges %v", got)
+	}
+	memory.limit = 16
+	_, _ = r.Insert(3*PageSize, payload)
+	if got = r.DroppedRanges(4, math.MaxUint64); len(got) != 1 || got[0].Start != 5*PageSize {
+		t.Fatalf("repaired range still reported: %v", got)
+	}
+	_, _ = r.Insert(0, bytes.Repeat([]byte{1}, 6*PageSize))
+	if got = r.DroppedRanges(4, math.MaxUint64); len(got) != 0 {
+		t.Fatalf("acknowledged range still reported: %v", got)
+	}
+}
+
+func TestRangeSetBounded(t *testing.T) {
+	var s rangeSet
+	for i := uint64(0); i < 40; i++ {
+		s.add(Range{i * 10, i*10 + 1 + i%3})
+	}
+	if len(s) > maxDroppedRanges || s[0] != (Range{0, 1}) {
+		t.Fatal("range set unbounded or lost its lowest range", s)
+	}
+	for _, r := range s {
+		if r.End-r.Start > 3 {
+			t.Fatal("ranges merged across gaps", s)
+		}
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i-1].End >= s[i].Start {
+			t.Fatal("ranges overlap or unsorted", s)
+		}
+	}
+	s.remove(Range{0, 400})
+	if len(s) != 0 {
+		t.Fatal("remove", s)
+	}
+}
+
+// Delivery after an idle period must not average throughput over the gap.
+func TestPathRateRestartsAfterIdle(t *testing.T) {
+	var p Path
+	p.Generation = 1
+	start := time.Unix(1000, 0)
+	_, _ = p.Submitted(1000, start)
+	_ = p.Feedback(Receipt{Generation: 1, Next: 500, ReceivedAt: 1_000_000, FirstNext: 100, FirstReceivedAt: 900_000}, start.Add(time.Millisecond))
+	_ = p.Feedback(Receipt{Generation: 1, Next: 1000, ReceivedAt: 1_001_000}, start.Add(2*time.Millisecond))
+	rate := p.Rate
+	// Ten seconds idle, then another burst at the same delivery rate.
+	_, _ = p.Submitted(1000, start.Add(10*time.Second))
+	_ = p.Feedback(Receipt{Generation: 1, Next: 1500, ReceivedAt: 11_000_000}, start.Add(10*time.Second+time.Millisecond))
+	_ = p.Feedback(Receipt{Generation: 1, Next: 2000, ReceivedAt: 11_001_000}, start.Add(10*time.Second+2*time.Millisecond))
+	if p.Rate < rate/2 {
+		t.Fatalf("idle gap collapsed the delivery rate: %.0f -> %.0f", rate, p.Rate)
 	}
 }

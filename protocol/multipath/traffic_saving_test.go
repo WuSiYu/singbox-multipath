@@ -3,6 +3,7 @@ package multipath
 import (
 	"bytes"
 	"context"
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 	"io"
 	"net"
 	"testing"
@@ -12,7 +13,7 @@ import (
 func TestTrafficSavingSelection(t *testing.T) {
 	cfg := testCoreConfig()
 	cfg.Leg0TrafficSaving = true
-	c := &mpCore{cfg: cfg, memory: newMemoryBudget(64<<20, false), legs: make(map[uint8]*mpLeg)}
+	c := &mpCore{cfg: cfg, memory: newMemoryBudget(64<<20, false), legs: make(map[uint8]*mpLeg), tx: stream.NewSender(uint64(cfg.FrameSize))}
 	p, s := &mpLeg{id: 0}, &mpLeg{id: 1}
 	p.ready.Store(true)
 	s.ready.Store(true)
@@ -36,7 +37,8 @@ func TestTrafficSavingSelection(t *testing.T) {
 	s.path.Stale = false
 	s.path.Sent = 0
 	check(s, 3)
-	// Neither receiver nor local memory pressure moves new data back to leg0.
+	// Neither receiver nor local memory pressure moves new data back to leg0;
+	// a full receiver only limits how much new data are in flight.
 	c.peerPressure = true
 	check(s, 3)
 	c.peerPressure = false
