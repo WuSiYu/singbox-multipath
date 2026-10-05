@@ -515,7 +515,7 @@ func TestPathMinimumRTTExpires(t *testing.T) {
 func TestPathObservedDelayBoundsEstimates(t *testing.T) {
 	now := time.Now()
 	// Bursts suggest 100 MB/s, but frames have been taking 600 ms.
-	p := Path{Generation: 1, Rate: 100 << 20, SRTT: 610 * time.Millisecond, MinimumRTT: 20 * time.Millisecond}
+	p := Path{Generation: 1, Rate: 100 << 20, SRTT: 610 * time.Millisecond, recentRTT: 610 * time.Millisecond, MinimumRTT: 20 * time.Millisecond}
 	_, _ = p.Submitted(64<<10, now)
 	if got := p.CompletionTime(64<<10, 0, 0, now); got < 0.59 {
 		t.Fatalf("queued path completion ignores observed delay: %.3f s", got)
@@ -526,5 +526,29 @@ func TestPathObservedDelayBoundsEstimates(t *testing.T) {
 	idle := Path{Generation: 1, Rate: 100 << 20, SRTT: 610 * time.Millisecond, MinimumRTT: 20 * time.Millisecond}
 	if got := idle.CompletionTime(64<<10, 0, 0, now); got > 0.02 {
 		t.Fatalf("empty path keeps old queueing delay: %.3f s", got)
+	}
+}
+
+// Frames that sat out an outage must not keep a recovered path looking slow.
+func TestPathObservedDelayRecovers(t *testing.T) {
+	now := time.Unix(100, 0)
+	p := Path{Generation: 1}
+	sample := func(rtt time.Duration) {
+		_, _ = p.Submitted(1000, now)
+		now = now.Add(rtt)
+		_ = p.Feedback(Receipt{Generation: 1, Next: p.Sent}, now)
+	}
+	for range 10 {
+		sample(10 * time.Millisecond)
+	}
+	sample(2 * time.Second)
+	if p.observedDelay() < 0.9 {
+		t.Fatalf("outage sample ignored: %.3f s", p.observedDelay())
+	}
+	for range 4 {
+		sample(10 * time.Millisecond)
+	}
+	if got := p.observedDelay(); got > 0.15 {
+		t.Fatalf("recovered path still looks slow after four samples: %.3f s", got)
 	}
 }

@@ -33,7 +33,8 @@ type Path struct {
 	SRTT          time.Duration
 	RTTVar        time.Duration
 	MinimumRTT    time.Duration
-	minimumAt     time.Time // when MinimumRTT was last confirmed
+	minimumAt     time.Time     // when MinimumRTT was last confirmed
+	recentRTT     time.Duration // fast-moving average of the latest samples
 	LastProgress  time.Time
 	Stale         bool
 	ReleaseFlight func(prepaid bool)
@@ -125,8 +126,9 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 	if !sent.IsZero() && now.After(sent) {
 		rtt := now.Sub(sent)
 		if p.SRTT == 0 {
-			p.SRTT, p.RTTVar, p.MinimumRTT, p.minimumAt = rtt, rtt/2, rtt, now
+			p.SRTT, p.RTTVar, p.MinimumRTT, p.minimumAt, p.recentRTT = rtt, rtt/2, rtt, now, rtt
 		} else {
+			p.recentRTT = (p.recentRTT + rtt) / 2
 			delta := rtt - p.SRTT
 			if delta < 0 {
 				delta = -delta
@@ -255,14 +257,16 @@ const initialWindowBytes = 12 << 10
 const MinimumRTTWindow = 10 * time.Second
 
 // observedDelay is the send-to-arrival latency recent frames actually saw:
-// smoothed send-to-receipt time less the receipt's return trip. Delivery-rate
+// their send-to-receipt time less the receipt's return trip. Delivery-rate
 // samples come from bursts and miss what a window-limited or lossy child does
-// to queued data (whole extra round trips); this does not.
+// to queued data (whole extra round trips); this does not. It follows the
+// latest samples rather than SRTT, so a path that recovers from an outage is
+// not judged by the frames that sat out the outage.
 func (p *Path) observedDelay() float64 {
-	if p.SRTT == 0 {
+	if p.recentRTT == 0 {
 		return 0
 	}
-	return (p.SRTT - p.MinimumRTT/2).Seconds()
+	return max(0, (p.recentRTT - p.MinimumRTT/2).Seconds())
 }
 
 // CompletionTime estimates when a new segment of length bytes would be fully
