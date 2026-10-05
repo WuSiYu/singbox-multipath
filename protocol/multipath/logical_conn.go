@@ -81,8 +81,9 @@ func (c *logicalConn) Read(buffer []byte) (int, error) {
 		}
 		eof := core.rx.EOF()
 		var ready <-chan struct{}
+		wake := false
 		if n > 0 {
-			core.feedbackDirty = true
+			wake = core.markFeedbackLocked()
 			core.updateStateCountersLocked()
 		} else if !eof {
 			ready = core.rxReadyLocked()
@@ -90,7 +91,9 @@ func (c *logicalConn) Read(buffer []byte) (int, error) {
 		core.stateMu.Unlock()
 		if n > 0 {
 			core.egressBytes.Add(uint64(n))
-			wakeFlow(core.pumpWake)
+			if wake {
+				wakeFlow(core.pumpWake)
+			}
 			return n, nil
 		}
 		if eof {
@@ -276,6 +279,16 @@ func (c *mpCore) signalReadersLocked() {
 		close(c.rxReady)
 		c.rxReady = nil
 	}
+}
+
+// markFeedbackLocked records that the peer should hear about new receive
+// progress. Only the first mark since the last feedback wakes the pump, which
+// then paces feedback itself; waking it for every arrival or read costs a
+// goroutine switch per chunk and sends nothing sooner.
+func (c *mpCore) markFeedbackLocked() bool {
+	wake := !c.feedbackDirty
+	c.feedbackDirty = true
+	return wake
 }
 
 // discardLocked consumes everything readable after the application closed
