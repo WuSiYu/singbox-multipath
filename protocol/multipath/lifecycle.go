@@ -280,6 +280,9 @@ func (c *mpCore) writeControlFrame(leg *mpLeg, frame wireFrame) error {
 	if err != nil && frame.typ == frameTypePing {
 		c.cancelProbe(leg.id, frame.seq)
 	}
+	if err == nil && frame.typ == frameTypeWindow {
+		c.legCounters[leg.id].feedbackTX.Add(1)
+	}
 	return err
 }
 

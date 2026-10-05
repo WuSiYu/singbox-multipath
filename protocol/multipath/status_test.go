@@ -554,3 +554,33 @@ func TestConnectionCoreConfigAttributesPreferredFailureToLeg0(t *testing.T) {
 		t.Fatalf("preferred failure was incorrectly attributed to leg1: %+v", document.Node.Legs[1])
 	}
 }
+
+func TestSenderStatusCodecRoundTrip(t *testing.T) {
+	status := senderStatus{
+		DataMode: 3, SendBufferLimit: 1, ReceiveWindowLimit: 2,
+		LegDeliveryRate: [2]uint64{3, 4}, LegDeliveryRTT: [2]uint64{5, 6}, LegMinimumRTT: [2]uint64{7, 8},
+		LegPipeline: [2]uint64{9, 10}, LegOutstanding: [2]uint64{11, 12},
+		UnsentLimit: 13, HistoryLimit: 14, OpportunisticEvents: 15, TailEvents: 16, TailBytes: 17,
+		Sequence: 18, Flags: senderStatusFlagActive | senderStatusFlagLeg1Present, LogicalTX: 19,
+		LegTX: [2]uint64{20, 21}, LegTXFrames: [2]uint64{22, 23}, LegBacklog: [2]uint64{24, 25},
+		LegWriting: [2]uint64{26, 27}, LegWriteBlockedNanos: [2]uint64{28, 29}, LegPeakBacklog: [2]uint64{30, 31},
+		SendBufferBytes: 32, ReplayPeakBytes: 33, FallbackBytes: 34, FallbackFrames: 35, FallbackEvents: 36,
+		ReplayTimeouts: 37, BackpressureEvents: 38, BackpressureNanos: 39, MemoryUsed: 40, MemoryPeakUsed: 41,
+		MemoryPressureEvents: 42, MemoryBackpressureEvents: 43, LegFailures: [2]uint64{44, 45},
+		LastFailureLeg: 1, LastFailureStage: 2,
+	}
+	a, b := net.Pipe()
+	go func() { defer a.Close(); _ = writeSenderStatus(a, status) }()
+	var typ [1]byte
+	if _, err := io.ReadFull(b, typ[:]); err != nil || typ[0] != frameTypeSenderStatus {
+		t.Fatal("sender status frame type", err)
+	}
+	got, err := readSenderStatus(b)
+	b.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != status {
+		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got, status)
+	}
+}

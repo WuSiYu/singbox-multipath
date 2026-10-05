@@ -34,6 +34,8 @@ type coreTrafficCounters struct {
 	legRX     [2]uint64
 	legTXF    [2]uint64
 	legRXF    [2]uint64
+	legFBTX   [2]uint64 // WINDOW frames
+	legFBRX   [2]uint64
 }
 
 type senderTotals struct {
@@ -47,6 +49,9 @@ type senderTotals struct {
 	backpressureEvents uint64
 	backpressureNanos  uint64
 	legFailures        [2]uint64
+	opportunistic      uint64
+	tailEvents         uint64
+	tailBytes          uint64
 }
 
 func (t *senderTotals) add(other senderTotals) {
@@ -57,6 +62,9 @@ func (t *senderTotals) add(other senderTotals) {
 	t.replayTimeouts += other.replayTimeouts
 	t.backpressureEvents += other.backpressureEvents
 	t.backpressureNanos += other.backpressureNanos
+	t.opportunistic += other.opportunistic
+	t.tailEvents += other.tailEvents
+	t.tailBytes += other.tailBytes
 	for index := range t.legTX {
 		t.legTX[index] += other.legTX[index]
 		t.legTXF[index] += other.legTXF[index]
@@ -76,6 +84,9 @@ func (s coreStatusSnapshot) localSenderTotals() senderTotals {
 		backpressureEvents: s.backpressureEvents,
 		backpressureNanos:  s.backpressureNanos,
 		legFailures:        s.legFailures,
+		opportunistic:      s.opportunistic,
+		tailEvents:         s.tailEvents,
+		tailBytes:          s.tailBytes,
 	}
 }
 
@@ -91,6 +102,9 @@ func senderTotalsFromPeer(status senderStatus) senderTotals {
 		backpressureEvents: status.BackpressureEvents,
 		backpressureNanos:  status.BackpressureNanos,
 		legFailures:        status.LegFailures,
+		opportunistic:      status.OpportunisticEvents,
+		tailEvents:         status.TailEvents,
+		tailBytes:          status.TailBytes,
 	}
 }
 
@@ -103,6 +117,8 @@ func (c *coreTrafficCounters) add(other coreTrafficCounters) {
 		c.legRX[index] += other.legRX[index]
 		c.legTXF[index] += other.legTXF[index]
 		c.legRXF[index] += other.legRXF[index]
+		c.legFBTX[index] += other.legFBTX[index]
+		c.legFBRX[index] += other.legFBRX[index]
 	}
 }
 
@@ -130,6 +146,13 @@ type coreStatusSnapshot struct {
 	backpressureEvents uint64
 	backpressureNanos  uint64
 	legFailures        [2]uint64
+	opportunistic      uint64
+	tailEvents         uint64
+	tailBytes          uint64
+	unsentLimit        uint64
+	historyLimit       uint64
+	legOutstanding     [2]uint64
+	legPipeline        [2]uint64
 	peerSender         peerSenderStatus
 	rtt                [2]legRTTSnapshot
 	failure            string
@@ -150,6 +173,9 @@ func (c *mpCore) statusSnapshot() coreStatusSnapshot {
 		replayTimeouts:     c.replayTO.Load(),
 		backpressureEvents: c.backpressE.Load(),
 		backpressureNanos:  c.backpressNS.Load(),
+		opportunistic:      c.opportunisticE.Load(),
+		tailEvents:         c.tailE.Load(),
+		tailBytes:          c.tailB.Load(),
 		peerSender:         c.peerSenderStatusSnapshot(),
 		rtt:                c.rttSnapshot(),
 		counters: coreTrafficCounters{
@@ -157,8 +183,17 @@ func (c *mpCore) statusSnapshot() coreStatusSnapshot {
 			logicalRX: c.egressBytes.Load(),
 		},
 	}
+	now := time.Now()
 	c.stateMu.Lock()
 	snapshot.dataMode = c.dataModeLocked()
+	snapshot.unsentLimit = c.unsentLimitLocked()
+	snapshot.historyLimit = c.historyLimitLocked(now)
+	for index := range snapshot.legOutstanding {
+		if leg := c.getLeg(uint8(index)); leg != nil {
+			snapshot.legOutstanding[index] = leg.path.Outstanding()
+			snapshot.legPipeline[index] = leg.path.Pipeline(c.initialPipeline(), uint64(c.cfg.SendBufferBytes))
+		}
+	}
 	c.stateMu.Unlock()
 	for index := range snapshot.legPresent {
 		snapshot.counters.legJoins[index] = c.legCounters[index].joins.Load()
@@ -166,13 +201,15 @@ func (c *mpCore) statusSnapshot() coreStatusSnapshot {
 		snapshot.legPresent[index] = leg != nil
 		if leg != nil {
 			snapshot.legBacklog[index] = leg.backlogBytes()
-			snapshot.legWriting[index], snapshot.legWriteBlock[index] = leg.writingSnapshot(time.Now())
+			snapshot.legWriting[index], snapshot.legWriteBlock[index] = leg.writingSnapshot(now)
 		}
 		snapshot.legPeak[index] = c.legPeak[index].Load()
 		snapshot.counters.legTX[index] = c.legCounters[index].txBytes.Load()
 		snapshot.counters.legRX[index] = c.legCounters[index].rxBytes.Load()
 		snapshot.counters.legTXF[index] = c.legCounters[index].txFrames.Load()
 		snapshot.counters.legRXF[index] = c.legCounters[index].rxFrames.Load()
+		snapshot.counters.legFBTX[index] = c.legCounters[index].feedbackTX.Load()
+		snapshot.counters.legFBRX[index] = c.legCounters[index].feedbackRX.Load()
 	}
 	c.activationMu.Lock()
 	snapshot.activation = c.activation
@@ -543,6 +580,12 @@ type statusSenderDiagnostics struct {
 	MemoryPeakUsedBytes      uint64 `json:"memory_peak_used_bytes"`
 	MemoryPressureEvents     uint64 `json:"memory_pressure_events"`
 	MemoryBackpressureEvents uint64 `json:"memory_backpressure_events"`
+	// Largest current effective limits among open sessions.
+	UnsentLimitBytes          uint64 `json:"unsent_limit_bytes"`
+	HistoryLimitBytes         uint64 `json:"history_limit_bytes"`
+	OpportunisticReinjections uint64 `json:"opportunistic_reinjections"`
+	TailReinjections          uint64 `json:"tail_reinjections"`
+	TailReinjectionBytes      uint64 `json:"tail_reinjection_bytes"`
 }
 
 type statusLogical struct {
@@ -583,7 +626,12 @@ type statusLeg struct {
 	RemoteDeliveryRate      uint64         `json:"remote_delivery_bytes_per_second"`
 	RemoteDeliveryRTT       uint64         `json:"remote_delivery_rtt_max_ms"`
 	RemoteMinimumRTT        uint64         `json:"remote_delivery_rtt_min_ms"`
-	RemotePipeline          uint64         `json:"remote_pipeline_bytes"`
+	RemotePipelineLimit     uint64         `json:"remote_pipeline_limit_bytes"`
+	RemoteOutstanding       uint64         `json:"remote_outstanding_bytes"`
+	PipelineLimit           uint64         `json:"pipeline_limit_bytes"`
+	Outstanding             uint64         `json:"outstanding_bytes"`
+	FeedbackFramesSent      uint64         `json:"feedback_frames_sent"`
+	FeedbackFramesReceived  uint64         `json:"feedback_frames_received"`
 	ID                      int            `json:"id"`
 	Tag                     string         `json:"tag"`
 	Type                    string         `json:"type"`
@@ -841,29 +889,35 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			RXBytes: totals.logicalRX + udpTotals.RXBytes,
 		},
 		LocalSender: statusSenderDiagnostics{
-			Available:                true,
-			FallbackBytes:            localSenderTotals.fallbackBytes,
-			FallbackFrames:           localSenderTotals.fallbackFrames,
-			FallbackEvents:           localSenderTotals.fallbackEvents,
-			Leg1TXBytes:              localSenderTotals.legTX[1],
-			ReplayTimeouts:           localSenderTotals.replayTimeouts,
-			BackpressureEvents:       localSenderTotals.backpressureEvents,
-			BackpressureDurationMS:   localSenderTotals.backpressureNanos / uint64(time.Millisecond),
-			MemoryPressure:           memorySnapshot.Pressure,
-			MemoryUsedBytes:          uint64(max(0, memorySnapshot.UsedBytes)),
-			MemoryPeakUsedBytes:      uint64(max(0, memorySnapshot.PeakUsedBytes)),
-			MemoryPressureEvents:     memorySnapshot.PressureEvents,
-			MemoryBackpressureEvents: memorySnapshot.BackpressureEvents,
+			Available:                 true,
+			FallbackBytes:             localSenderTotals.fallbackBytes,
+			FallbackFrames:            localSenderTotals.fallbackFrames,
+			FallbackEvents:            localSenderTotals.fallbackEvents,
+			Leg1TXBytes:               localSenderTotals.legTX[1],
+			ReplayTimeouts:            localSenderTotals.replayTimeouts,
+			BackpressureEvents:        localSenderTotals.backpressureEvents,
+			BackpressureDurationMS:    localSenderTotals.backpressureNanos / uint64(time.Millisecond),
+			OpportunisticReinjections: localSenderTotals.opportunistic,
+			TailReinjections:          localSenderTotals.tailEvents,
+			TailReinjectionBytes:      localSenderTotals.tailBytes,
+			MemoryPressure:            memorySnapshot.Pressure,
+			MemoryUsedBytes:           uint64(max(0, memorySnapshot.UsedBytes)),
+			MemoryPeakUsedBytes:       uint64(max(0, memorySnapshot.PeakUsedBytes)),
+			MemoryPressureEvents:      memorySnapshot.PressureEvents,
+			MemoryBackpressureEvents:  memorySnapshot.BackpressureEvents,
 		},
 		RemoteSender: statusSenderDiagnostics{
-			Available:              remoteSenderTotals.logicalTX > 0 || remoteSenderTotals.legFailures[0] > 0 || remoteSenderTotals.legFailures[1] > 0,
-			FallbackBytes:          remoteSenderTotals.fallbackBytes,
-			FallbackFrames:         remoteSenderTotals.fallbackFrames,
-			FallbackEvents:         remoteSenderTotals.fallbackEvents,
-			Leg1TXBytes:            remoteSenderTotals.legTX[1],
-			ReplayTimeouts:         remoteSenderTotals.replayTimeouts,
-			BackpressureEvents:     remoteSenderTotals.backpressureEvents,
-			BackpressureDurationMS: remoteSenderTotals.backpressureNanos / uint64(time.Millisecond),
+			Available:                 remoteSenderTotals.logicalTX > 0 || remoteSenderTotals.legFailures[0] > 0 || remoteSenderTotals.legFailures[1] > 0,
+			FallbackBytes:             remoteSenderTotals.fallbackBytes,
+			FallbackFrames:            remoteSenderTotals.fallbackFrames,
+			FallbackEvents:            remoteSenderTotals.fallbackEvents,
+			Leg1TXBytes:               remoteSenderTotals.legTX[1],
+			ReplayTimeouts:            remoteSenderTotals.replayTimeouts,
+			BackpressureEvents:        remoteSenderTotals.backpressureEvents,
+			BackpressureDurationMS:    remoteSenderTotals.backpressureNanos / uint64(time.Millisecond),
+			OpportunisticReinjections: remoteSenderTotals.opportunistic,
+			TailReinjections:          remoteSenderTotals.tailEvents,
+			TailReinjectionBytes:      remoteSenderTotals.tailBytes,
 		},
 	}
 	legs := []statusLeg{
@@ -874,6 +928,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			Frames:                  statusFrames{TX: totals.legTXF[0], RX: totals.legRXF[0]},
 			QueueBytesPerConnection: s.config.cfg.QueueBytes,
 			JoinCount:               totals.legJoins[0],
+			FeedbackFramesSent:      totals.legFBTX[0],
+			FeedbackFramesReceived:  totals.legFBRX[0],
 			AttemptCount:            connectionsMade,
 			RemoteFailureCount:      remoteSenderTotals.legFailures[0],
 			TopFlows:                []statusFlow{},
@@ -885,6 +941,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			Frames:                  statusFrames{TX: totals.legTXF[1], RX: totals.legRXF[1]},
 			QueueBytesPerConnection: s.config.cfg.QueueBytes,
 			JoinCount:               totals.legJoins[1],
+			FeedbackFramesSent:      totals.legFBTX[1],
+			FeedbackFramesReceived:  totals.legFBRX[1],
 			AttemptCount:            leg1Attempts,
 			RemoteFailureCount:      remoteSenderTotals.legFailures[1],
 			TopFlows:                []statusFlow{},
@@ -942,6 +1000,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		logical.DownloadStates[downloadMode]++
 		logical.SendBufferBytes += snapshot.replayBytes
 		logical.LocalSender.SendBufferBytes += snapshot.replayBytes
+		logical.LocalSender.UnsentLimitBytes = max(logical.LocalSender.UnsentLimitBytes, snapshot.unsentLimit)
+		logical.LocalSender.HistoryLimitBytes = max(logical.LocalSender.HistoryLimitBytes, snapshot.historyLimit)
 		s.peakReplayLocal = max(s.peakReplayLocal, snapshot.replayPeak)
 		logical.ReorderBytes += snapshot.reorderBytes
 		logical.ReorderFrames += snapshot.reorderFrames
@@ -950,6 +1010,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		if remote.status.Sequence > 0 {
 			logical.RemoteSender.Available = true
 			logical.RemoteSender.SendBufferBytes += int64(remote.status.SendBufferBytes)
+			logical.RemoteSender.UnsentLimitBytes = max(logical.RemoteSender.UnsentLimitBytes, remote.status.UnsentLimit)
+			logical.RemoteSender.HistoryLimitBytes = max(logical.RemoteSender.HistoryLimitBytes, remote.status.HistoryLimit)
 			s.peakReplayRemote = max(s.peakReplayRemote, int64(remote.status.ReplayPeakBytes))
 			if now.Sub(remote.receivedAt) > 3*time.Second {
 				logical.RemoteSender.StaleConnections++
@@ -989,6 +1051,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			s.peakLegBacklog[legIndex] = max(s.peakLegBacklog[legIndex], snapshot.legPeak[legIndex])
 			leg.WritingBytes += snapshot.legWriting[legIndex]
 			leg.WriteBlockedMS = max(leg.WriteBlockedMS, snapshot.legWriteBlock[legIndex].Milliseconds())
+			leg.PipelineLimit += snapshot.legPipeline[legIndex]
+			leg.Outstanding += snapshot.legOutstanding[legIndex]
 			if remote.status.Sequence > 0 {
 				leg.RemoteDeliveryRate += remote.status.LegDeliveryRate[legIndex]
 				leg.RemoteDeliveryRTT = max(leg.RemoteDeliveryRTT, remote.status.LegDeliveryRTT[legIndex]/uint64(time.Millisecond))
@@ -996,7 +1060,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 				if rtt > 0 && (leg.RemoteMinimumRTT == 0 || rtt < leg.RemoteMinimumRTT) {
 					leg.RemoteMinimumRTT = rtt
 				}
-				leg.RemotePipeline += remote.status.LegPipeline[legIndex]
+				leg.RemotePipelineLimit += remote.status.LegPipeline[legIndex]
+				leg.RemoteOutstanding += remote.status.LegOutstanding[legIndex]
 				leg.RemoteBacklogBytes += int64(remote.status.LegBacklog[legIndex])
 				leg.RemoteWritingBytes += int64(remote.status.LegWriting[legIndex])
 				leg.RemoteWriteBlockedMS = max(leg.RemoteWriteBlockedMS, int64(remote.status.LegWriteBlockedNanos[legIndex]/uint64(time.Millisecond)))

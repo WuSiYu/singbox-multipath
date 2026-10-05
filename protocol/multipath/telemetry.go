@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	senderStatusSchemaVersion byte = 3
-	senderStatusPayloadSize        = 316
+	senderStatusSchemaVersion byte = 4
+	senderStatusPayloadSize        = 372
 	senderStatusHeaderSize         = 3
 
 	senderStatusFlagActive byte = 1 << iota
@@ -26,7 +26,13 @@ type senderStatus struct {
 	LegDeliveryRate          [2]uint64
 	LegDeliveryRTT           [2]uint64
 	LegMinimumRTT            [2]uint64
-	LegPipeline              [2]uint64
+	LegPipeline              [2]uint64 // in-flight limit
+	LegOutstanding           [2]uint64 // bytes in flight
+	UnsentLimit              uint64    // current effective limits
+	HistoryLimit             uint64
+	OpportunisticEvents      uint64
+	TailEvents               uint64
+	TailBytes                uint64
 	Sequence                 uint64
 	Flags                    byte
 	LogicalTX                uint64
@@ -111,6 +117,7 @@ func encodeSenderStatus(status senderStatus) [senderStatusPayloadSize]byte {
 		status.LegDeliveryRTT,
 		status.LegMinimumRTT,
 		status.LegPipeline,
+		status.LegOutstanding,
 	} {
 		put(values[0])
 		put(values[1])
@@ -131,6 +138,8 @@ func encodeSenderStatus(status senderStatus) [senderStatusPayloadSize]byte {
 		status.LegFailures[0],
 		status.LegFailures[1],
 		status.DataMode, status.SendBufferLimit, status.ReceiveWindowLimit,
+		status.UnsentLimit, status.HistoryLimit,
+		status.OpportunisticEvents, status.TailEvents, status.TailBytes,
 	} {
 		put(value)
 	}
@@ -164,6 +173,7 @@ func decodeSenderStatus(payload []byte) (senderStatus, error) {
 		&status.LegDeliveryRTT,
 		&status.LegMinimumRTT,
 		&status.LegPipeline,
+		&status.LegOutstanding,
 	}
 	for _, values := range arrays {
 		values[0] = read()
@@ -185,6 +195,8 @@ func decodeSenderStatus(payload []byte) (senderStatus, error) {
 		&status.LegFailures[0],
 		&status.LegFailures[1],
 		&status.DataMode, &status.SendBufferLimit, &status.ReceiveWindowLimit,
+		&status.UnsentLimit, &status.HistoryLimit,
+		&status.OpportunisticEvents, &status.TailEvents, &status.TailBytes,
 	}
 	for _, value := range values {
 		*value = read()
@@ -194,12 +206,11 @@ func decodeSenderStatus(payload []byte) (senderStatus, error) {
 
 func writeSenderStatus(conn net.Conn, status senderStatus) error {
 	payload := encodeSenderStatus(status)
-	var header [senderStatusHeaderSize]byte
-	header[0] = frameTypeSenderStatus
-	binary.BigEndian.PutUint16(header[1:3], senderStatusPayloadSize)
-	buffers := net.Buffers{header[:], payload[:]}
-	_, err := buffers.WriteTo(conn)
-	return err
+	var frame [senderStatusHeaderSize + senderStatusPayloadSize]byte
+	frame[0] = frameTypeSenderStatus
+	binary.BigEndian.PutUint16(frame[1:3], senderStatusPayloadSize)
+	copy(frame[senderStatusHeaderSize:], payload[:])
+	return writeAll(conn, frame[:])
 }
 
 func readSenderStatus(conn net.Conn) (senderStatus, error) {
@@ -243,20 +254,25 @@ func (c *mpCore) buildSenderStatus(now time.Time) senderStatus {
 	status := senderStatus{
 		LogicalTX:       c.ingressBytes.Load(),
 		SendBufferLimit: uint64(c.cfg.SendBufferBytes), ReceiveWindowLimit: uint64(c.cfg.ReceiveWindowBytes),
-		SendBufferBytes:    uint64(max(0, c.replayBytesSnapshot())),
-		ReplayPeakBytes:    uint64(max(0, c.replayPeak.Load())),
-		FallbackBytes:      c.fallbackB.Load(),
-		FallbackFrames:     c.fallbackF.Load(),
-		FallbackEvents:     c.fallbackE.Load(),
-		ReplayTimeouts:     c.replayTO.Load(),
-		BackpressureEvents: c.backpressE.Load(),
-		BackpressureNanos:  c.backpressNS.Load(),
+		SendBufferBytes:     uint64(max(0, c.replayBytesSnapshot())),
+		ReplayPeakBytes:     uint64(max(0, c.replayPeak.Load())),
+		FallbackBytes:       c.fallbackB.Load(),
+		FallbackFrames:      c.fallbackF.Load(),
+		FallbackEvents:      c.fallbackE.Load(),
+		ReplayTimeouts:      c.replayTO.Load(),
+		BackpressureEvents:  c.backpressE.Load(),
+		BackpressureNanos:   c.backpressNS.Load(),
+		OpportunisticEvents: c.opportunisticE.Load(),
+		TailEvents:          c.tailE.Load(),
+		TailBytes:           c.tailB.Load(),
 	}
 	if c.active.Load() {
 		status.Flags |= senderStatusFlagActive
 	}
 	c.stateMu.Lock()
 	status.DataMode = c.dataModeLocked()
+	status.UnsentLimit = c.unsentLimitLocked()
+	status.HistoryLimit = c.historyLimitLocked(now)
 	for index := range status.LegTX {
 		status.LegTX[index] = c.legCounters[index].txBytes.Load()
 		status.LegTXFrames[index] = c.legCounters[index].txFrames.Load()
@@ -273,7 +289,8 @@ func (c *mpCore) buildSenderStatus(now time.Time) senderStatus {
 		status.LegDeliveryRate[index] = uint64(leg.path.Rate)
 		status.LegDeliveryRTT[index] = uint64(leg.path.SRTT)
 		status.LegMinimumRTT[index] = uint64(leg.path.MinimumRTT)
-		status.LegPipeline[index] = leg.path.Pipeline(min(uint64(c.cfg.QueueBytes), uint64(c.cfg.FrameSize)*4), uint64(c.cfg.SendBufferBytes))
+		status.LegPipeline[index] = leg.path.Pipeline(c.initialPipeline(), uint64(c.cfg.SendBufferBytes))
+		status.LegOutstanding[index] = leg.path.Outstanding()
 		status.LegBacklog[index] = uint64(max(0, leg.backlogBytes()))
 		writing, blocked := leg.writingSnapshot(now)
 		status.LegWriting[index] = uint64(max(0, writing))

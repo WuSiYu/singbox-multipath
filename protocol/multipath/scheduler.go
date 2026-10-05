@@ -312,6 +312,13 @@ func (c *mpCore) provisionalLocked() (float64, time.Duration) {
 	return rate, delay
 }
 
+// initialPipeline bounds a path until its first delivery-rate sample.
+// Thereafter the connection-level byte window and memory, not an extra
+// per-path cwnd, bound lookahead.
+func (c *mpCore) initialPipeline() uint64 {
+	return min(uint64(c.cfg.QueueBytes), uint64(c.cfg.FrameSize)*4)
+}
+
 // ecfSlack bounds how much later than the best path a segment may complete
 // when it is handed to a slower path that happens to be idle, while the
 // application keeps the connection backlogged.
@@ -342,9 +349,7 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	now := time.Now()
 	var chosen, best *mpLeg
 	chosenTime, bestTime := math.Inf(1), math.Inf(1)
-	// Startup sampling is bounded. Thereafter the connection-level byte
-	// window and memory, not an extra per-path cwnd, bound lookahead.
-	initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.FrameSize)*4)
+	initial := c.initialPipeline()
 	for _, leg := range legs {
 		if exclusiveSecondary != nil && leg != exclusiveSecondary {
 			continue

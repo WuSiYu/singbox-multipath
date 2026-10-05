@@ -146,6 +146,7 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 		}
 		switch frame.typ {
 		case frameTypeWindow:
+			c.legCounters[leg.id].feedbackRX.Add(1)
 			err = c.handleWindow(frame.flow)
 		case frameTypePing:
 			leg.tryQueueControl(wireFrame{typ: frameTypePong, seq: frame.seq})

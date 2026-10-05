@@ -112,11 +112,13 @@ func (i activationInfo) String() string {
 }
 
 type mpLegCounters struct {
-	joins    atomic.Uint64 // Successfully attached transports, independent of TX activation.
-	txBytes  atomic.Uint64
-	rxBytes  atomic.Uint64
-	txFrames atomic.Uint64
-	rxFrames atomic.Uint64
+	joins      atomic.Uint64 // Successfully attached transports, independent of TX activation.
+	txBytes    atomic.Uint64
+	rxBytes    atomic.Uint64
+	txFrames   atomic.Uint64
+	rxFrames   atomic.Uint64
+	feedbackTX atomic.Uint64 // WINDOW frames
+	feedbackRX atomic.Uint64
 }
 
 type legShutdownRequest struct {
