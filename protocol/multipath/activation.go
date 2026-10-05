@@ -34,6 +34,7 @@ func (c *mpCore) activationLoop() {
 	windowStart := time.Now()
 	windowBase := c.ingressBytes.Load()
 	var queueHighSince time.Time
+	var plateau ratePlateau
 	for {
 		select {
 		case <-c.done:
@@ -75,15 +76,19 @@ func (c *mpCore) activationLoop() {
 				continue
 			}
 			// Leg0 is the bottleneck when the application keeps the small,
-			// rate-sized unsent queue at least half full.
+			// rate-sized unsent queue at least half full and leg0's delivery
+			// rate stopped growing. A backlog during leg0's slow start only
+			// shows its window opening; a path added then would carry the
+			// connection head while leg0 overtakes it.
 			c.stateMu.Lock()
 			backlogBytes := int64(c.tx.WriteNext - min(c.tx.Next, c.tx.WriteNext))
 			queueBytes := int64(c.unsentLimitLocked())
+			full := plateau.update(primary.path.Rate, primary.path.SRTT, now)
 			c.stateMu.Unlock()
 			if backlogBytes*2 >= queueBytes {
 				if queueHighSince.IsZero() {
 					queueHighSince = now
-				} else if now.Sub(queueHighSince) >= c.cfg.ActivationWindow {
+				} else if now.Sub(queueHighSince) >= c.cfg.ActivationWindow && full {
 					c.activate(activationInfo{
 						Reason:           activationReasonLeg0Queue,
 						BacklogBytes:     backlogBytes,
@@ -161,4 +166,26 @@ func (c *mpCore) notifyLeg1Active() {
 	callback := c.cfg.OnLeg1Active
 	c.activationMu.Unlock()
 	callback(info, reconnect)
+}
+
+// ratePlateau detects that a path's delivery rate stopped growing, as BBR
+// detects a full pipe: no 25% gain over two round trips. Growth restarts the
+// count at once; a path that delivers nothing measurable does not grow.
+type ratePlateau struct {
+	roundStart time.Time
+	best       float64
+	rounds     int
+}
+
+func (p *ratePlateau) update(rate float64, rtt time.Duration, now time.Time) bool {
+	switch {
+	case p.roundStart.IsZero():
+		p.roundStart, p.best = now, rate
+	case rate > 0 && rate >= p.best*1.25:
+		p.roundStart, p.best, p.rounds = now, rate, 0
+	case now.Sub(p.roundStart) >= max(rtt, 10*time.Millisecond):
+		p.roundStart, p.best = now, max(p.best, rate)
+		p.rounds++
+	}
+	return p.rounds >= 2
 }

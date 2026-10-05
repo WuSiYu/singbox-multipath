@@ -260,6 +260,8 @@ func (c *mpCore) waitTXSpace(app *logicalConn) error {
 	var blocked time.Time
 	defer func() {
 		if !blocked.IsZero() {
+			c.writerReleasedAt.Store(time.Now().UnixNano())
+			c.writerWaiting.Store(false)
 			c.backpressNS.Add(uint64(time.Since(blocked)))
 		}
 	}()
@@ -291,6 +293,7 @@ func (c *mpCore) waitTXSpace(app *logicalConn) error {
 		if blocked.IsZero() {
 			blocked = time.Now()
 			c.backpressE.Add(1)
+			c.writerWaiting.Store(true)
 		}
 		select {
 		case <-c.done:
@@ -303,6 +306,15 @@ func (c *mpCore) waitTXSpace(app *logicalConn) error {
 		}
 	}
 }
+
+// writerBacklogged reports whether the application recently had more data
+// than the session would accept, so it is not yet at the end of a transfer.
+func (c *mpCore) writerBacklogged(now time.Time) bool {
+	return c.writerWaiting.Load() || now.UnixNano()-c.writerReleasedAt.Load() < int64(writerBacklogHold)
+}
+
+// writerBacklogHold bridges the gap between consecutive blocked Writes.
+const writerBacklogHold = 10 * time.Millisecond
 
 const (
 	// unsentQueueTime sizes the application-to-assigner cushion, like MPTCP's

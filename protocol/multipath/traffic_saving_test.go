@@ -88,6 +88,9 @@ func TestTrafficSavingExclusiveDataAndHalfClose(t *testing.T) {
 	if !bytes.Equal(payload, got) {
 		t.Fatal("DATA mismatch")
 	}
+	// A leg counts its bytes after the child write returns, which may be
+	// after the peer has already read them.
+	waitForStatus(t, func() bool { return left.legCounters[1].txBytes.Load() == uint64(len(payload)) })
 	if left.legCounters[0].txBytes.Load() != 0 || left.legCounters[1].txBytes.Load() != uint64(len(payload)) {
 		t.Fatalf("DATA leaked onto leg0: %d/%d", left.legCounters[0].txBytes.Load(), left.legCounters[1].txBytes.Load())
 	}

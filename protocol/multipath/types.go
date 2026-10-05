@@ -173,6 +173,8 @@ type mpCore struct {
 	droppedReported   uint64               // stateMu; receiver drops already reported
 	reportedFull      bool                 // stateMu; last feedback asked the sender to pause
 	opportunisticE    atomic.Uint64
+	tailE             atomic.Uint64 // tail reinjections
+	tailB             atomic.Uint64
 	feedbackSeq       uint64 // stateMu; sequence of the feedback this side sends
 	peerFeedbackSeq   uint64 // stateMu; newest feedback sequence received
 	peerPressure      bool   // stateMu; suppress speculative secondary assignments
@@ -221,6 +223,8 @@ type mpCore struct {
 	fallbackE         atomic.Uint64
 	replayTO          atomic.Uint64
 	backpressE        atomic.Uint64
+	writerWaiting     atomic.Bool  // an application Write waits for send space
+	writerReleasedAt  atomic.Int64 // unix nanos when the last such wait ended
 	backpressNS       atomic.Uint64
 	legFailureMu      sync.Mutex
 	legFailures       [2]uint64

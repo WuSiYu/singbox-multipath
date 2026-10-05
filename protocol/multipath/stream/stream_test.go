@@ -440,3 +440,51 @@ func TestBufferHeadroom(t *testing.T) {
 		t.Fatal("buffer without headroom offered one")
 	}
 }
+
+func TestPathRecentDelivery(t *testing.T) {
+	start := time.Unix(100, 0)
+	p := Path{Generation: 1, SRTT: 50 * time.Millisecond, MinimumRTT: 50 * time.Millisecond}
+	if got := p.RecentDelivery(start); got != 0 {
+		t.Fatalf("fresh path delivered %d", got)
+	}
+	for range 4 {
+		_, _ = p.Submitted(64<<10, start)
+	}
+	at := func(ms int, next uint64) uint64 {
+		now := start.Add(time.Duration(ms) * time.Millisecond)
+		_ = p.Feedback(Receipt{Generation: 1, Next: next}, now)
+		return p.RecentDelivery(now)
+	}
+	if got := at(50, 64<<10); got != 64<<10 {
+		t.Fatalf("first window: %d", got)
+	}
+	if got := at(75, 128<<10); got != 128<<10 {
+		t.Fatalf("growing window: %d", got)
+	}
+	// One round trip later the window closes; the larger of the closed
+	// window and the new one counts.
+	if got := at(100, 256<<10); got != 128<<10 {
+		t.Fatalf("closed window: %d", got)
+	}
+	// Two silent round trips leave nothing recent, as after an idle period.
+	if got := p.RecentDelivery(start.Add(300 * time.Millisecond)); got != 0 {
+		t.Fatalf("idle path still reports %d", got)
+	}
+}
+
+func TestPathRemainingDelivery(t *testing.T) {
+	cold := Path{Generation: 1}
+	_, _ = cold.Submitted(128<<10, time.Now())
+	// Without a rate sample 128 KiB need four slow-start rounds of 100 ms.
+	if got := cold.RemainingDelivery(128<<10, 100*time.Millisecond); got < 0.4 || got > 0.5 {
+		t.Fatalf("cold path estimate %.3f s", got)
+	}
+	warm := Path{Generation: 1, Rate: 1 << 20, MinimumRTT: 20 * time.Millisecond}
+	_, _ = warm.Submitted(256<<10, time.Now())
+	if got := warm.RemainingDelivery(256<<10, 0); got < 0.25 || got > 0.27 {
+		t.Fatalf("warm path estimate %.3f s", got)
+	}
+	if got := warm.RemainingDelivery(0, 0); got != 0 {
+		t.Fatalf("delivered bytes still pending: %.3f", got)
+	}
+}

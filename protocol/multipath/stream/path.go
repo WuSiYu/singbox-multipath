@@ -43,6 +43,11 @@ type Path struct {
 	// restart marks that the path went idle: the next receipt starts a new
 	// rate sample instead of averaging delivery over the idle gap.
 	restart bool
+	// Bytes delivered per round trip: the previous complete window and the
+	// start of the current one.
+	windowStart time.Time
+	windowBase  uint64
+	recentBytes uint64
 }
 
 func (p *Path) Outstanding() uint64 { return p.Sent - p.Received }
@@ -73,6 +78,7 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 	if receipt.Next <= p.Received {
 		return nil
 	}
+	p.rollWindow(now)
 	p.Received = receipt.Next
 	p.LastProgress = now
 	p.Stale = false
@@ -184,10 +190,67 @@ func (p *Path) Pipeline(initial, maximum uint64) uint64 {
 	return maximum
 }
 
+// RecentDelivery returns the bytes this path delivered in about its last
+// round trip: the larger of the previous window and the current one so far.
+func (p *Path) RecentDelivery(now time.Time) uint64 {
+	p.rollWindow(now)
+	return max(p.recentBytes, p.Received-p.windowBase)
+}
+
+// rollWindow closes the delivery window after one propagation round trip.
+// Smoothed RTT would include queueing that this window itself causes, so
+// windows (and the in-flight data sized from them) would grow without bound.
+// A window that saw no delivery for a whole extra round trip leaves nothing.
+func (p *Path) rollWindow(now time.Time) {
+	length := p.MinimumRTT
+	if length == 0 {
+		length = p.SRTT
+	}
+	length = max(length, 10*time.Millisecond)
+	if p.windowStart.IsZero() {
+		p.windowStart, p.windowBase = now, p.Received
+		return
+	}
+	elapsed := now.Sub(p.windowStart)
+	if elapsed < length {
+		return
+	}
+	p.recentBytes = p.Received - p.windowBase
+	if elapsed >= 2*length {
+		p.recentBytes = 0
+	}
+	p.windowStart, p.windowBase = now, p.Received
+}
+
+// RemainingDelivery estimates the seconds until this path delivers its bytes
+// up to pathEnd: what is still ahead over the delivery rate plus the one-way
+// delay. A path without a rate sample is still in its first slow-start
+// rounds: one initial window per round trip of at least provisionalDelay,
+// doubling each round.
+func (p *Path) RemainingDelivery(pathEnd uint64, provisionalDelay time.Duration) float64 {
+	if pathEnd <= p.Received {
+		return 0
+	}
+	remaining := float64(pathEnd - p.Received)
+	delay := p.MinimumRTT
+	if delay == 0 {
+		delay = max(p.SRTT, provisionalDelay)
+	}
+	if p.Rate <= 0 {
+		return math.Ceil(math.Log2(1+remaining/initialWindowBytes))*delay.Seconds() + delay.Seconds()/2
+	}
+	return remaining/p.Rate + delay.Seconds()/2
+}
+
+// initialWindowBytes approximates a child transport's initial window (ten
+// segments).
+const initialWindowBytes = 12 << 10
+
 // CompletionTime estimates when a new segment of length bytes would be fully
 // delivered on this path: queued work over the measured delivery rate plus the
-// one-way propagation delay. An unmeasured path borrows provisionalRate.
-func (p *Path) CompletionTime(length int, provisionalRate float64, now time.Time) float64 {
+// one-way propagation delay. An unmeasured path borrows provisionalRate and
+// provisionalDelay: the best measured rate and the longest measured delay.
+func (p *Path) CompletionTime(length int, provisionalRate float64, provisionalDelay time.Duration, now time.Time) float64 {
 	rate := p.Rate
 	if rate <= 0 {
 		rate = provisionalRate
@@ -195,6 +258,9 @@ func (p *Path) CompletionTime(length int, provisionalRate float64, now time.Time
 	delay := p.MinimumRTT
 	if delay == 0 {
 		delay = p.SRTT
+	}
+	if delay == 0 {
+		delay = provisionalDelay
 	}
 	// An idle path's estimates are stale: probe it optimistically so a path
 	// that recovered from a degradation is measured again instead of starved.

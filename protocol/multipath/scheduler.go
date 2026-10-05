@@ -297,8 +297,24 @@ func (c *mpCore) handleWindow(message flowMessage) error {
 	return nil
 }
 
+// provisionalLocked returns what an unmeasured path borrows: the best measured
+// delivery rate and the longest measured round-trip time.
+func (c *mpCore) provisionalLocked() (float64, time.Duration) {
+	rate, delay := float64(0), time.Duration(0)
+	for _, leg := range c.availableLegs() {
+		rate = max(rate, leg.path.Rate)
+		if leg.path.MinimumRTT > 0 {
+			delay = max(delay, leg.path.MinimumRTT)
+		} else {
+			delay = max(delay, leg.path.SRTT)
+		}
+	}
+	return rate, delay
+}
+
 // ecfSlack bounds how much later than the best path a segment may complete
-// when it is handed to a slower path that happens to be idle.
+// when it is handed to a slower path that happens to be idle, while the
+// application keeps the connection backlogged.
 const ecfSlack = 1.5
 
 // choosePathLocked implements earliest-completion-first scheduling (ECF, as in
@@ -307,13 +323,13 @@ const ecfSlack = 1.5
 // available path is used, but a slower path only while its completion time
 // stays within ecfSlack of the best path overall; otherwise new data waits for
 // the faster path instead of queueing behind a slow one and blocking in-order
-// delivery.
+// delivery. Once the application has finished (DATA_FIN queued) or handed
+// over everything it has for now, the rule is strict ECF: a slower path only
+// takes a segment it delivers before the best path could deliver all pending
+// data, so the tail of a transfer is not left on a slow or starting path.
 func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	legs := c.availableLegs()
-	provisionalRate := float64(0)
-	for _, leg := range legs {
-		provisionalRate = max(provisionalRate, leg.path.Rate)
-	}
+	provisionalRate, provisionalDelay := c.provisionalLocked()
 	// Selection policy and transient readiness are distinct: a healthy secondary
 	// remains the sole new-data path while busy or discovery/window constrained.
 	// Only unavailable/stale paths permit primary fallback.
@@ -324,7 +340,7 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	}
 	exclusiveSecondary := c.trafficSavingSecondaryLocked()
 	now := time.Now()
-	var chosen *mpLeg
+	var chosen, best *mpLeg
 	chosenTime, bestTime := math.Inf(1), math.Inf(1)
 	// Startup sampling is bounded. Thereafter the connection-level byte
 	// window and memory, not an extra per-path cwnd, bound lookahead.
@@ -351,8 +367,10 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 		if leg.id == 1 && (!c.active.Load() || !leg.ready.Load()) {
 			continue
 		}
-		completion := leg.path.CompletionTime(length, provisionalRate, now)
-		bestTime = min(bestTime, completion)
+		completion := leg.path.CompletionTime(length, provisionalRate, provisionalDelay, now)
+		if completion < bestTime {
+			best, bestTime = leg, completion
+		}
 		// A penalized path recently held the connection head back; it takes
 		// no new data until its penalty (one of its RTTs) expires.
 		if leg.busy || leg.penaltyUntil.After(now) {
@@ -365,12 +383,31 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 			chosen, chosenTime = leg, completion
 		}
 	}
-	// A path holding less than two frames keeps receiving data regardless:
-	// its delivery-rate estimate would otherwise be capped by the scheduler's
-	// own restraint (an application-limited sample) and never recover after a
-	// degradation. Each round then grows its in-flight data geometrically.
-	probing := chosen != nil && chosen.path.Outstanding() < 2*uint64(c.cfg.FrameSize)
-	if chosen != nil && exclusiveSecondary == nil && !probing && chosenTime > max(bestTime*ecfSlack, bestTime+0.002) {
+	if chosen == nil || exclusiveSecondary != nil || chosen == best {
+		return chosen
+	}
+	pending := c.tx.WriteNext - min(c.tx.Next, c.tx.WriteNext)
+	backlogged := c.writerBacklogged(now) || pending+uint64(c.cfg.FrameSize) > c.unsentLimitLocked()
+	// While the application is backlogged, a slower path keeps up to twice
+	// what it delivered in its last round trip (at least two frames) in
+	// flight regardless of its estimate. Its delivery-rate estimate would
+	// otherwise be capped by the scheduler's own restraint (an application-
+	// limited sample): a path that joins late, or recovers from a degradation,
+	// would never show its capacity. This grows its in-flight data
+	// geometrically, like the child's own slow start, up to twice its
+	// bandwidth-delay product, which keeps it busy.
+	probing := backlogged && chosen.path.Outstanding() < max(2*uint64(c.cfg.FrameSize), 2*chosen.path.RecentDelivery(now))
+	if c.tx.HasFIN || !backlogged {
+		bestRate := best.path.Rate
+		if bestRate <= 0 {
+			bestRate = provisionalRate
+		}
+		drain := bestTime + float64(pending-min(pending, uint64(length)))/max(bestRate, 1)
+		if chosenTime > drain+0.002 {
+			return nil
+		}
+	}
+	if !probing && chosenTime > max(bestTime*ecfSlack, bestTime+0.002) {
 		return nil
 	}
 	return chosen
@@ -428,7 +465,56 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 	if sent, err := c.repairMappingsLocked(now); sent || err != nil {
 		return sent, err
 	}
-	return c.opportunisticLocked(now)
+	if sent, err := c.opportunisticLocked(now); sent || err != nil {
+		return sent, err
+	}
+	return c.tailReinjectLocked(now)
+}
+
+// tailReinjectLocked resends, on an idle path, data near the connection head
+// that a slower path would deliver later than the idle path can, once there
+// is no new data left to send. At the end of a transfer the receiver waits for
+// the last byte; frames still queued on a slower or still-starting path would
+// otherwise set the completion time. Whichever copy arrives first is used.
+func (c *mpCore) tailReinjectLocked(now time.Time) (bool, error) {
+	if c.mappingHead >= len(c.mappings) || !c.active.Load() || c.trafficSavingSecondaryLocked() != nil {
+		return false, nil
+	}
+	if c.tx.Next < c.tx.WriteNext || !c.tx.HasFIN && c.writerBacklogged(now) {
+		return false, nil
+	}
+	provisionalRate, provisionalDelay := c.provisionalLocked()
+	for i := c.mappingHead; i < len(c.mappings) && i < c.mappingHead+64; i++ {
+		mapping := &c.mappings[i]
+		if !mapping.repairedAt.IsZero() || mapping.end <= c.tx.Una {
+			continue
+		}
+		slow := c.getLeg(mapping.path)
+		if slow == nil || slow.path.Generation != mapping.generation || mapping.pathEnd <= slow.path.Received {
+			continue
+		}
+		length := mapping.end - max(mapping.seq, c.tx.Una)
+		fast := c.bestIdleLegLocked(slow, length)
+		if fast == nil {
+			return false, nil
+		}
+		fastArrival := fast.path.CompletionTime(int(length), provisionalRate, provisionalDelay, now)
+		if fastArrival+0.002 >= slow.path.RemainingDelivery(mapping.pathEnd, provisionalDelay) {
+			continue
+		}
+		segment, ok := c.tx.Range(max(mapping.seq, c.tx.Una), int(length))
+		if !ok {
+			continue
+		}
+		if err := c.submitLocked(fast, segment, true, now); err != nil {
+			return false, err
+		}
+		mapping.repairedAt = now
+		c.tailE.Add(1)
+		c.tailB.Add(uint64(segment.Length))
+		return true, nil
+	}
+	return false, nil
 }
 
 // repairDroppedLocked resends byte ranges the receiver reported as dropped
@@ -502,17 +588,14 @@ func (c *mpCore) repairTimeoutLocked() time.Duration {
 // time, excluding avoid.
 func (c *mpCore) bestIdleLegLocked(avoid *mpLeg, length uint64) *mpLeg {
 	now := time.Now()
-	provisional := float64(0)
-	for _, leg := range c.availableLegs() {
-		provisional = max(provisional, leg.path.Rate)
-	}
+	provisional, provisionalDelay := c.provisionalLocked()
 	var best *mpLeg
 	bestTime := math.Inf(1)
 	for _, leg := range c.availableLegs() {
 		if leg == avoid || leg.busy || !c.usableLeg(leg) || !leg.ready.Load() {
 			continue
 		}
-		if t := leg.path.CompletionTime(int(length), provisional, now); t < bestTime {
+		if t := leg.path.CompletionTime(int(length), provisional, provisionalDelay, now); t < bestTime {
 			best, bestTime = leg, t
 		}
 	}
