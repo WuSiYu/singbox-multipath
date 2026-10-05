@@ -2,159 +2,178 @@
 
 [English](multipath.md) · [配置参考](../README.md#中文)
 
-本文说明 Multipath 的数据传输、连接生命周期和状态统计。部署示例与完整配置字段见 README。
+本文说明 Multipath（协议 v13，beta10）的数据传输、调度、内存、连接生命周期和状态统计。部署示例与完整配置字段见 README。
 
 ## 作用范围与 MPTCP 的关系
 
 Multipath 在客户端 outbound 与服务端 inbound 之间组合恰好两条可靠 child 字节流；每条逻辑连接在服务端对应一条访问目标的 TCP 连接。中间节点只需把普通流量转发到聚合监听端口，无需理解 Multipath 协议。
 
-MPTCP 在多条 TCP subflow 上向应用提供一条有序字节流，以连接级数据序号、Data ACK 和路径映射维护整体顺序。Multipath 借鉴这些连接级机制，包括重注入和按序 FIN，但使用代理字节流上的独立分帧协议，不使用 TCP option，也不与 MPTCP 线协议互通。参见 [RFC 8684](https://www.rfc-editor.org/rfc/rfc8684.html)。
+MPTCP 在多条 TCP subflow 上向应用提供一条有序字节流，以连接级数据序号、Data ACK 和路径映射维护整体顺序。Multipath 借鉴这些连接级机制，包括 msk 级发送缓冲、最早完成优先（ECF）调度、机会性重注入与惩罚，以及按序 FIN，但使用代理字节流上的独立分帧协议，不使用 TCP option，也不与 MPTCP 线协议互通。参见 [RFC 8684](https://www.rfc-editor.org/rfc/rfc8684.html)。
 
-TCP/QUIC 的报文拥塞控制与重传仍由 child 承担。本项目没有实现 MPTCP 的带认证 MP_JOIN、地址发现、回退普通 TCP 或 subflow 耦合拥塞控制。调度设计参考[固定提交的 Linux MPTCP 实现](https://github.com/torvalds/linux/blob/587858367581b9c55c3690f4e63382ad622719d4/net/mptcp/protocol.c)，并不声称跟随所有后续内核变化。
+TCP/QUIC 的报文拥塞控制、pacing 与重传仍由 child 承担，包括 Hysteria2 使用的拥塞控制。本项目没有实现 MPTCP 的地址发现、回退普通 TCP 或 subflow 耦合拥塞控制。调度设计参考[固定提交的 Linux MPTCP 实现](https://github.com/torvalds/linux/blob/587858367581b9c55c3690f4e63382ad622719d4/net/mptcp/protocol.c)，并不声称跟随所有后续内核变化。
 
-监听端口本身没有认证或加密。会话 ID 和策略摘要用于关联、校验协议状态，不能代替对端认证。部署时应使用可信路径、带认证的代理和访问控制。当前双端要求协议 v12，旧线协议会被拒绝。
+## 认证与访问控制
 
-## 数据路径与 leg 分工
+Multipath 不加密数据；加密由 child 协议或私有链路负责。监听端口若不加保护，任何能访问它的人都能借服务端访问任意目标。
 
-leg0 是常规会话的建立、控制和首选路径，承载累计确认、流控制，以及激活前的全部应用数据。因此建连和小流量通常留在低延迟路径。未开启故障接管时，leg0 失效会关闭逻辑连接；开启后，leg1 也可以承担建连、控制和数据传输。
+- **`psk`**：两端配置相同的预共享密钥后，每个 hello 都带 HMAC-SHA256 签名，覆盖会话 ID、策略、目标地址、时间戳和随机 nonce。服务端拒绝签名错误、时间偏差超过 2 分钟或 nonce 重放的 hello。PSK 只保护建连，不加密后续数据。
+- **`allowed_ips`**（仅服务端）：只接受来自这些前缀的 child 连接，按服务端看到的源地址判断。
+- 服务端既没有 `psk` 和 `allowed_ips`、又监听在非私有地址时，启动日志会给出警告。
 
-leg1 用于增加带宽。它可以在连接尚处于 leg0-only 阶段时先行连接，但只有该方向触发激活，或者故障接管接替 leg0 后，才承载应用数据。
+双端必须都使用协议 v13。版本不一致时，服务端回复带版本号的明确拒绝，客户端日志会说明原因，不再表现为莫名的连接失败。其他拒绝原因（认证失败、参数不一致、会话已关闭等）同样带原因码。
 
-上传和下载分别根据本方向接收的应用字节数、速率和 leg0 积压判断激活。激活后的调度比较各路径尚未交付的字节量与观测交付速率，选择合适路径。反馈由远端 Multipath 接收端产生，因此在途量包括本地代理和其远端传输内部的缓冲；本地 socket `Write` 完成不等于交付完成。没有手工带宽权重或限速参数。
+## 会话与 leg
 
-尚无交付样本的路径先接受有界的采样数据。反馈形成实际交付速率与时延估计，而不是对剩余可用带宽的保证。获得样本后，分配受共享接收窗口、发送历史预算和 child 写入反压约束，不另设每路径拥塞窗口。某条 writer 忙或停滞，不会直接阻止其他合格路径接受数据；未激活的首选路径阶段采用正常 child 反压，不受路径发现采样额度约束。报文级拥塞控制、pacing 和重传仍在 child 中执行，包括 Hysteria2 使用的拥塞控制。
+两条 leg 地位对等：WINDOW 反馈、DATA_FIN、session-close、reset 和 sender status 都可以在任一已就绪的 leg 上收发，**没有哪条 leg 是会话必需的**。leg0 仍是首选路径：常规建连、激活前的应用数据都走它。
 
-客户端配置 `upload` 和 `download`，在建连时把两份策略传给服务端。上传策略用于客户端发送端、服务端接收端；下载策略用于服务端发送端、客户端接收端。服务端校验并接受同一策略，同时执行自己的共享内存预算；后续 leg 加入和恢复重连必须携带相同策略。
+- **建立**：客户端先经首选 leg 拨号并创建会话；该 leg 在 `handshake_timeout` 的一半内无法到达服务端时，改由另一条 leg 创建。会话建立后，客户端为每条 leg 维持一个连接管理器。
+- **重连**：任一 leg 断开后按指数退避重拨（1 秒起，翻倍到 30 秒；连续稳定 30 秒后退避清零），以 join 方式重新挂入原会话，服务端不会重新拨号目标。
+- **失效的 leg**：交付停滞的 leg 不再分配新数据；连续 15 秒没有任何进展、且另一条 leg 可用时，关闭它以便重拨。唯一可用的 leg 不会被这样关闭。
+- **leg0 丢失**：新数据转到 leg1，反馈、FIN 和关闭都可经 leg1 完成，不需要开启故障接管或聚合。2 秒的 leg0 中断在实测中保持约 950 Mbps 走 leg1。
+- **全部 leg 缺失**：未开启故障接管时，两条 leg 都缺失超过 `max(30 秒, 3 × handshake_timeout)` 后结束会话。开启故障接管时，由恢复组租期和所有权确认决定（见下文）。
+- **墓碑**：服务端记住已关闭的会话 ID 两分钟，拒绝迟到的 join 或重复创建，避免对同一 ID 第二次拨号目标。
 
-各方向的 `aggregation_enabled` 是总开关。关闭后，新数据留在 leg0，但独立的故障接管仍可使用 leg1；另一方向也仍可激活。
+反馈 WINDOW 帧走写入阻塞最轻的 leg，另一条 leg 至少每 20 ms 收到一份副本；选中的 leg 写入阻塞超过 `max(10 ms, SRTT/2)` 时立即在另一条 leg 上补发。各份副本带序号，单调字段（累计确认、窗口右边界、路径回执）取最大值合并，标志位只采用最新序号。DATA_FIN 在其所在 leg 消失或一个 RTO 内未确认时，改在另一条 leg 重发。
 
-开启 `leg0_traffic_saving` 时，激活后新数据改由 leg1 独占发送，而非双路径聚合。激活前和 leg1 尚未就绪时仍使用 leg0。健康 leg1 的 writer 反压、采样额度用尽会导致等待，不会因此把新数据溢出到 leg0。leg1 缺失、停滞，或本地/对端内存保护生效时，允许 leg0 回退；leg1 重新满足条件后恢复独占新数据。已经分配给 leg0 的数据正常完成，控制和重注入也仍可能使用 leg0，因此该模式不保证 leg0 零流量。UDP 首选路径和故障接管不由这个开关控制。
+## 激活
 
-总开关开启时，激活条件按每连接、每发送方向独立计算，三者为“或”关系：
+上传和下载分别配置、分别激活。`aggregation_enabled` 是总开关；开启时，以下条件按每连接、每发送方向独立判断，任一满足即激活（“或”关系）：
 
-1. 排队条件：启用 `activation_on_queue`，leg0 在途字节与本地未发送字节之和，连续 `activation_window` 达到 `queue_frames * frame_size` 的 80%。
-2. 速率条件：`activation_threshold_mbps` 大于 0，且窗口内平均接收应用数据的速率达到阈值。
-3. 字节条件：`activation_after_bytes` 大于 0，且累计接收应用字节达到阈值；若 `activation_after_bytes_min_mbps` 非零，还须满足完整采样窗口内的最低平均速率。
+1. **排队条件**（`activation_on_queue`，默认开启）：本地未发送字节持续 `activation_window`（默认 200 ms）不低于当前未发送上限的一半，**并且** leg0 的交付速率已不再增长（连续两个 RTT 增幅不足 25%，与 BBR 判断管道已满的方式相同）。前者说明应用快于 leg0，后者说明 leg0 已走出慢启动、确实是瓶颈。
+2. **速率条件**（`activation_threshold_mbps`，默认 0 即关闭）：窗口内平均接收应用数据的速率达到阈值。
+3. **字节条件**（`activation_after_bytes`，默认关闭）：累计接收应用字节达到阈值；若 `activation_after_bytes_min_mbps` 非零，还须满足完整采样窗口内的最低平均速率。
 
-字节条件的最低速率不限制其他两个条件。关闭全部条件后不会激活，数值 0 不代表立即激活。激活后不会因流量减少自动退回未激活状态。省略速率阈值时，如果没有累计字节触发，默认 150 Mbps；已配置非零字节触发时，默认速率阈值为 0。
+leg0 交付速率的平台期判断，避免了高 RTT 路径上中等大小传输在 leg0 慢启动阶段就拉入 leg1：此时 leg1 的新 child 连接同样处于慢启动，分给它的靠前字节往往比 leg0 晚到，反而拖慢完成时间。低 RTT 路径上 leg0 的慢启动只需几十毫秒，激活时间基本由 `activation_window` 决定。
 
-## 字节流、接收窗口与重排
+三个条件全部关闭就不会激活；数值 0 不代表立即激活。激活后不会因流量减少退回。需要 beta10 之前的行为，可显式写 `activation_threshold_mbps: 150` 与 `activation_window: "1s"`。
 
-两条路径的数据都映射到同一个 64 位连接级字节序号空间，每条路径另有独立序号和路径实例标识。接收端处理重复和重叠映射，对已经连续收到的字节前缀返回累计 Data ACK。它表示接收端已接管这些字节，不表示目标应用已经读取。
+## 调度
 
-线协议仍使用 DATA 帧，`frame_size` 是单帧最大载荷，不是固定大小记录或应用读取单位。接收端增量处理帧内数据：帧的前缀到达且逻辑顺序连续时，可以先交付和确认，不必等待整帧剩余部分到齐。但如果更早的连接级字节缺失，后续字节仍必须等待；按字节处理并没有消除有序流的队头阻塞。
+### 最早完成优先
 
-发送端为两条路径共同保留一份连接级发送历史，只有累计 Data ACK 才能释放已确认范围。原发送或重注入 writer 还持有独立引用，避免 ACK 到达时回收仍被阻塞 writer 使用的缓冲。
+激活后，每个新数据段交给预计最早送达的路径。路径的预计完成时间为：
 
-接收端为两条路径通告同一个单调递增的字节窗口右边界。应用读取推动窗口前进，单路径回执不会扩大连接窗口。短写入只消耗实际字节数，不按一整帧扣额度。几类状态具有不同含义：
+`(该路径在途字节 + 本段长度) / 该路径交付速率 + 最小 RTT / 2`
 
-| 状态 | 含义 |
+交付速率与 RTT 来自远端 Multipath 接收端的路径回执，因此在途量包括本地代理和远端传输内部的缓冲；本地 socket `Write` 完成不等于交付完成。没有手工带宽权重或限速参数。
+
+- 应用仍有积压（写入被阻塞，或刚刚被阻塞）时，较慢的空闲路径可以接收完成时间不晚于最佳路径 1.5 倍的数据段，以便两条路径都保持忙碌。
+- 应用已结束（DATA_FIN 已排队）或暂时没有更多数据时，改用严格 ECF：较慢路径只接收它能在最佳路径送完全部待发数据之前送达的数据段，避免传输尾部落在慢路径上。
+- 尚无速率样本的路径借用已测路径中最好的速率和最长的时延，并在第一个样本前最多持有 4 帧。
+- 应用积压时，较慢路径始终可以保持“上一传播 RTT 内实际送达量的两倍（至少两帧）”在途，不受估计值限制。否则一条后加入或刚从劣化中恢复的路径，其速率估计会被调度器自己的克制压低而永远无法回升；这一规则让它的在途量像 child 自身的慢启动那样按 RTT 倍增，直到约两倍带宽时延积。
+- 空闲超过 `max(2 × SRTT, 100 ms)` 的路径按乐观速率重新探测；空闲之后的第一个回执重新开始速率采样，不把空闲间隔算进速率。
+
+### 修复与重注入
+
+所有重传都复用同一份连接级发送历史，不消耗新的连接序号或接收窗口，也不复制载荷；迟到的原始数据作为重复范围丢弃，不会重复交付。
+
+- **接收端丢弃修复**：接收端因内存不足拒收数据时，在 WINDOW 帧中报告最多 4 个丢弃区间（不跨越空洞合并）。发送端在一个 RTO 内对同一区间至多修复一次，修复流量不超过每 RTT 交付速率的四分之一。
+- **失效路径修复**：leg 断开（实例变化）或停滞时，其上尚未确认的映射在其他可用路径上重发。
+- **机会性重注入与惩罚**：新数据因接收窗口或发送历史受阻、而连接队头所在路径已有一个自身 RTT（且不少于快路径 RTT 两倍）没有任何交付时，在空闲路径上按序重发队头附近的数据，并惩罚卡住的路径一个 RTT 不接收新数据。
+- **尾部重注入**：没有新数据可发时，若队头附近的数据仍排在较慢或刚起步的路径上、预计晚于空闲快路径现在重发的到达时间，就在快路径上再发一份，先到者生效。慢启动中的 child 连接把数据保留数个 RTT 的情形由此覆盖。
+
+### 停滞检测
+
+无进展检测时限为平滑交付 RTT 加四倍时延变化量，至少 200 ms；尚无样本时为 1 秒。`path_stall_timeout_min` 只能再提高这个下限，不是固定重传周期。停滞的路径暂停接收新数据，收到新进展后恢复；停滞本身不要求重连。
+
+## 字节流、发送历史与接收窗口
+
+两条路径的数据映射到同一个 64 位连接级字节序号空间，每条路径另有独立序号和路径实例标识。接收端处理重复和重叠映射，对已经连续收到的前缀返回累计 Data ACK。它表示接收端已接管这些字节，不表示目标应用已经读取。
+
+`frame_size` 是单帧最大载荷，不是固定大小记录。接收端增量处理帧内数据：前缀到达且逻辑连续时即可交付和确认。但更早的连接级字节缺失时，后续字节仍必须等待；按字节处理并没有消除有序流的队头阻塞。
+
+| 状态 | 含义与上限 |
 | --- | --- |
-| 本地待发送数据 | 已被 MP 接收、尚未分配发送的字节；`queue_frames * frame_size` 限制这一部分，且它包含在发送历史中。 |
+| 本地未发送数据 | 已被 MP 接收、尚未分配给路径的字节。上限约为承载路径交付速率 × 10 ms，至少 1 MiB（或 4 帧），至多 `queue_frames × frame_size`，类似 MPTCP 的 `notsent_lowat`。 |
 | 路径在途数据 | 已分配给某 leg、尚未得到该路径完整交付回执的字节，包括 child 内部缓冲。 |
-| 连接发送历史 | 尚未被累计 Data ACK 确认的数据，覆盖两条路径与待发送部分，由 `send_buffer_bytes` 限制。 |
-| 接收存储 | 已到达的乱序数据和按序但尚未被应用读取的数据；受字节窗口和共享内存预算约束。 |
+| 连接发送历史 | 尚未被累计 Data ACK 确认的全部数据，含未发送部分，类似 MPTCP 的 msk 发送缓冲。目标为承载路径带宽时延积的两倍加未发送上限，至少 4 MiB；发送受历史而非网络限制时每 RTT 增长 25%，需求下降后逐渐回收；至多 `send_buffer_bytes`，并受本会话在发送区内的公平份额约束。 |
+| 接收窗口 | 接收端为两条路径通告的同一个连接级字节窗口，单调右移、从不回缩。首次通告前为 256 KiB，之后为本会话的公平份额（见下文），至多 `receive_window_bytes`。应用读取推动窗口前进。 |
+| 接收存储 | 实际到达的乱序数据和按序但尚未被应用读取的数据，按 16 KiB 页懒分配并复用。 |
 
-因此，`queue_frames` 不是第二份相同的重传缓存，`send_buffer_bytes` 也不是仅属于 leg1 的缓存。实现中没有按固定带宽分配的额度、空闲 credit epoch 或独立的 leg1 replay 所有权。
+`queue_frames`、`send_buffer_bytes` 与 `receive_window_bytes` 都是**上限**，不是容量或预分配；实际值随路径速率、RTT 和内存份额自动变化。默认值即推荐值，通常无需调整。
 
-接收存储使用稀疏的 16 KiB 页，只为实际到达的数据分配空间。内存压力下可以拒收推测性的后续数据，或裁剪完全尚未被累计确认的乱序页；已经 Data ACK、等待应用读取的字节不能丢弃。
-
-路径回执仍报告传输交付进度，但不释放连接发送历史。如果某个映射仍覆盖连接中缺失的最前部字节，发送端可以从这份历史重注入。每个获准会话都预留 reader 工作缓冲、一个头部接收页和可复用的主路径 TX 缓冲，使缺失头部的推进不依赖 leg1 先释放推测性数据。
-
-## 弱 leg1 与回退
-
-每条路径有独立 writer。leg1 的阻塞写入不持有连接状态锁，不直接阻塞 leg0 写入、接收处理或控制处理。重注入复用同一份不可变字节历史，不消耗新的连接序号或接收窗口，也无需复制一份新载荷。迟到的原始数据作为重复范围处理，不会重复交付给应用。
-
-完整路径交付回执驱动速率与时延估计。某条路径持续没有进展时，会被标记为停滞，暂停分配新数据，并允许在其他可用路径补发尚未确认的范围；重新收到进展反馈后可以清除停滞状态。停滞本身不要求断开重连，leg1 硬故障也不会直接关闭逻辑流。某 leg 已交付后续字节、连接仍缺少更早字节，是正常的乱序现象，不能据此断言缺失字节已经丢失。
-
-无进展检测间隔为平滑交付 RTT 加四倍时延变化量，至少 200 ms；尚无测量样本时初始为 1 秒。`path_stall_timeout_min` 只能再增加一个下限，不是固定重传周期。交付测量包含 child 传输内部的排队时间。
-
-控制和窗口更新优先于尚未提交给主路径 child 的 DATA，但不能越过已经阻塞的 child 写入或已排入可靠传输的数据。它们仍是带内控制消息，不是独立的低延迟旁路。
-
-这些机制让可用 leg0 在 leg1 停滞或失败时继续承担传输，但不保证激活后延迟始终等同于单 leg0。已经交给慢路径的靠前字节需要检测和补发，仍会消耗时间与带宽；两条路径如果共享物理瓶颈，也不能简单获得带宽之和。
+应用读写直接在接收页与发送缓冲上进行，没有中转管道或中转 goroutine；每个数据帧的帧头与载荷合并为一次 child 写入。
 
 ## 内存与反压
 
-每个 Multipath inbound/outbound 使用一份本机预算，覆盖载荷、路径/映射元数据、进展预留缓冲、缓存和估算的会话开销。默认 `min(512 MiB, 可用内存 × 0.5)`。Linux 上取 `MemAvailable` 与可见 cgroup v1/v2 剩余额度的较小值，包括可见父级限制。显式预算不会自动缩小。
+每个 Multipath inbound/outbound 使用一份本机预算，覆盖发送载荷、接收页、元数据、缓存与会话固定开销。默认 `min(512 MiB, 可用内存 × 0.5)`；Linux 上取 `MemAvailable` 与可见 cgroup v1/v2 剩余额度的较小值。显式预算不会自动缩小。
 
-占用达到预算的 7/8 时，新的 booster 分配和普通接收窗口增长暂停，降到 3/4 以下恢复；头部推进仍有预留资源。已经通告但未使用的接收窗口不是内存分配。该预算不是整个进程的 RSS 上限，也不包含 child TCP/QUIC 的全部缓冲。
+预算的 1/16 是应急余量，其余为共享池。池内分三本账：发送载荷（tx）、接收页（rx）和其他（会话预留、UDP 重组等）。
 
-缓存取出时立即清除旧槽位引用，稀疏缓存索引会缩小，较大的发送和路径索引在全部确认后释放。缓冲归还预算意味着可以复用或被 GC 回收，不意味着 Go 立即把物理页交回操作系统。实现不使用周期性强制 GC，因此单看较高 RSS 不能证明仍有存活数据泄漏。
+- 发送与接收互相借用对方未用的部分，但始终给对方留出保底：对方方向有活跃会话时为池的一半，否则为 1/8；另外各留 1/16 的余量带，避免一侧把池用满后另一侧无法起步。
+- 发送历史按发送区除以活跃发送会话数分配公平份额；接收窗口按接收区的 3/4 除以活跃接收会话数分配（至少 256 KiB），剩余 1/4 吸收页面开销与窗口边缘到达的数据。最近 1 秒有数据移动的会话才计入活跃数。
+- 接收页满时，靠近下一个期望字节（16 页以内）的数据仍会接收，并挤出最远的未确认页；被拒收或挤出的范围通过 WINDOW 帧报告给发送端修复。
+- 接收端已拒收数据、或剩余空间不足两帧时，反馈中带“已满”标志：发送端暂停新数据（最多保留两帧在途），只修复缺口，等接收端报告有空间后恢复。
+- 已经 Data ACK、等待应用读取的字节永远不会被丢弃。
+
+“压力”只表示应急余量正在使用：它会记录日志和状态，但**不会关闭 leg1、不会冻结接收窗口，也不改变任何会话的路径选择**。
+
+每个获准会话都预留 reader 工作缓冲、一个队头接收页和一个可复用的发送缓冲，保证队头推进不依赖其他会话先释放内存。缓冲归还预算意味着可以复用或被 GC 回收，不意味着 Go 立即把物理页交回操作系统。
 
 1 GiB 主机可以从 `"memory_limit": "256MB"` 起步，为 child 协议、其他进程和操作系统留出余量。多个 MP 实例各有独立预算，大型 QUIC 窗口还会占用预算外内存。
 
-如果没有设置 `GOMEMLIMIT`，也没有已有的 runtime 内存限制（包括 sing-box 的 `debug.memory_limit`），第一个 MP 实例启动时把进程级 Go 软限制设置为：
+如果没有设置 `GOMEMLIMIT`，也没有已有的 runtime 内存限制（包括 sing-box 的 `debug.memory_limit`），第一个 MP 实例启动时把进程级 Go 软限制设为“当前 Go 内存占用 + 检测到的可用内存 × 80%”。所有 MP 实例共享这一软限制；最后一个实例停止时恢复原设置。显式 `GOMEMLIMIT`（包括 `off`）优先。它不是 RSS 硬上限；参见 [Go GC 指南](https://go.dev/doc/gc-guide#Memory_limit)。
 
-`当前 Go 内存占用 + 检测到的可用内存 × 80%`
+## 流量节省模式
 
-所有 MP 实例共享这一软限制；最后一个实例停止时，如果没有后续覆盖，则恢复原设置。启动日志打印有效值与来源。它由正常 Go GC 使用，不需要周期性读取系统内存或强制回收。显式 `GOMEMLIMIT`，包括 `GOMEMLIMIT=off`，优先于自动设置。软限制用于约束 GC 运行所需的余量，不是 RSS 硬上限，也不能让超出物理内存的存活工作集正常运行；参见 [Go GC 指南](https://go.dev/doc/gc-guide#Memory_limit)。
-
-省略或设为 0 的单连接发送历史、接收窗口上限，根据拥有该缓冲的主机预算自动计算：普通分配区域的一半，即总预算的 7/16，至多 512 MiB、至少一个 frame。512 MiB 预算对应每方向 224 MiB 上限。它们不是预分配，也不是每连接独占预留；并发连接仍共享同一分配器。显式字节上限保持硬限制。接收端没有独立帧数限制，只受字节窗口和共享预算约束。
+开启 `leg0_traffic_saving` 时，激活后新数据改由 leg1 独占发送，而非双路径聚合。激活前和 leg1 尚未就绪时仍使用 leg0。健康 leg1 的写入反压会导致等待，不会因此把新数据溢出到 leg0；leg1 缺失或停滞时允许 leg0 回退，leg1 恢复后继续独占新数据。leg1 健康时，尾部重注入也不使用 leg0。已经分配给 leg0 的数据正常完成，控制帧和失效修复仍可能使用 leg0，因此该模式不保证 leg0 零流量。
 
 ## 可选路径故障接管
 
-`failover_enabled` 只在客户端配置，默认 false。关闭时，不创建共享恢复探测或 UDP 中继 socket，原有聚合和经单个 child 直接转发 UDP 的方式不变。服务端始终监听 TCP 和 UDP，可以接受普通与恢复会话，但只有客户端请求时才创建恢复组；服务端没有这个配置开关。
+`failover_enabled` 只在客户端配置，默认 false。没有它时，会话本身已能在任一 leg 上存活（见上文）；故障接管额外提供：共享健康检查、新会话直接选择健康路径、UDP 中继与 UDP 路径切换，以及跨长时间双路径中断的会话保留。服务端始终监听 TCP 和 UDP，只有客户端请求时才创建恢复组。
 
-开启后，每个 outbound 为每个 child 维持一条共享 TCP 控制连接和一条原生 UDP 关联，供所有业务连接共用。路径必须同时具有新鲜的 TCP 和 UDP 挑战响应才算健康；完整的 `failover_timeout`（默认 5 秒）无有效响应后判为不可用。阻塞之后才迟到的旧响应不能算作新的健康证据。探测通常每秒一次；检测与会话重连还会增加时间，配置的 timeout 不是业务中断时间上界。
+开启后，每个 outbound 为每个 child 维持一条共享 TCP 控制连接和一条原生 UDP 关联，供所有业务连接共用。路径必须同时具有新鲜的 TCP 和 UDP 挑战响应才算健康；完整的 `failover_timeout`（默认 5 秒）无有效响应后判为不可用。探测通常每秒一次；检测与会话重连还会增加时间，配置的 timeout 不是业务中断时间上界。
 
-启动阶段，任何已确认健康的路径都可以先承载流量。首选路径第一次确认健康时立即选用，不经过 `failback_delay`。它一旦经历“健康后又故障”，后续恢复就必须满足稳定期；TCP 和 UDP 分别按各自首选路径执行。
+首选路径第一次确认健康时立即选用。它一旦经历“健康后又故障”，再次恢复须持续健康一段时间才回到正常角色：首次为 3 秒，之后每次反复故障翻倍，最长到 `failback_delay`（默认 30 秒）。单次漏探测不重置稳定计时，完整失效超时才会重置；备用路径也失效时可立即选用健康的首选路径。TCP 和 UDP 分别按各自首选路径执行。
 
-leg0 失效时，已有 TCP 会话保留目标连接、字节序号、接收窗口和未确认发送历史，数据、累计 ACK 和 FIN 都可以经 leg1 传输，不要求开启聚合；新会话也可直接从 leg1 建立。客户端重连丢失的 leg，服务端不会重新拨号目标。
+启用接管时，`udp_outbound` 是独立于 TCP leg0 的 UDP 首选路径，必须为两个 child 之一。UDP 从第一个包起就通过服务端中继，切换路径时保留面向目标的 socket 和源端口。服务端按客户端同步的路径 epoch 发送响应，迟到旧消息不能撤销更新的选路。
 
-已发生过故障的 leg0 恢复后，须持续健康达到 `failback_delay`（默认 30 秒）才恢复正常角色。单次漏探测不重置稳定计时，完整失效超时才会重置。如果备用路径也失效，而首选路径可用，则跳过等待。应用主动关闭、服务端重启或两条路径中断超过恢复组租期，仍可能终止连接。
+UDP 保持不可靠报文语义，不走 UDP-over-TCP。中继将大包拆成较小的外层 datagram，独立重组每个报文，不做 MP 层重传；缺片五秒后过期。缓存计入共享内存预算，压力下丢弃 UDP 包而非积累可靠队列。五分钟没有应用报文的 UDP 关联过期。恢复组在没有控制或 UDP 流量达到 `max(2 分钟, 4 × failover_timeout + failback_delay)` 后过期。
 
-启用接管时，`udp_outbound` 是独立于 TCP leg0 的 UDP 首选路径，必须为两个 child 之一。UDP 从第一个包起就通过服务端中继，切换路径时保留面向目标的 socket 和源端口。指定 leg1 后，leg0 的故障或恢复不会让 UDP 跟随 TCP 切回 leg0；只有 UDP 自身首选路径失效才回退。服务端按客户端同步的路径 epoch 发送响应，包括单向应用流量，迟到旧消息不能撤销更新的选路。
+恢复控制心跳同时确认 TCP 会话所有权。服务端每轮最多询问 64 个 ID，轮询覆盖活跃会话；客户端报告已经不再持有的 ID，只有明确的“已不存在”才释放对应服务端会话。客户端在第一次 hello（包括 fast open）发出前登记所有权，逻辑连接终止后才注销；客户端仍持有的会话不会仅因两条数据 leg 暂时中断而被回收。
 
-UDP 保持不可靠报文语义，不走 UDP-over-TCP。中继将大包拆成较小的外层 datagram，独立重组每个报文，不做 MP 层重传；缺片五秒后过期。缓存计入共享内存预算，压力下丢弃 UDP 包而非积累可靠队列。五分钟没有应用报文的 UDP 关联过期；关闭的会话 ID 保留两分钟，拒绝迟到报文和 leg 加入，这些记录也计入预算。恢复组在没有控制或 UDP 流量达到 `max(2 分钟, 4 * failover_timeout + failback_delay)` 后过期。
-
-恢复控制心跳同时确认 TCP 会话所有权。服务端每轮最多询问 64 个 ID，轮询覆盖活跃会话；客户端在同一控制连接的下一次请求中报告已经不再持有的 ID。只有明确的“已不存在”才释放对应服务端会话。控制连接断开会丢弃该轮待确认列表，再通过新询问继续，不积累关闭通知队列。客户端在第一次 hello（包括 fast open）发出前登记所有权，逻辑 core 终止后才注销；客户端仍持有的会话，不会仅因两条数据 leg 暂时中断而被回收。
-
-应用完整 `Close` 后，已接收的 TX 可以继续排空，但连续两分钟没有累计 Data ACK 进展会结束剩余会话，避免所有控制路径都不可用时无限等待 FIN/ACK。这个时限不适用于 `CloseWrite`、`CloseRead` 或仍开放的空闲连接；正常 FIN 确认会立即完成关闭。
-
-被取消的握手会中断对应 child I/O，会话清理等待 secondary join 和恢复重连 worker 退出后，才归还它们的内存预留。
-
-两个 child 都须能够访问服务端端口的 TCP 和 UDP。目标 TCP/UDP 出口仍由服务端普通路由决定。故障接管无法阻止游戏自身超时造成的断线，也不能在服务端重启后保留原 socket。
+两个 child 都须能够访问服务端端口的 TCP 和 UDP。故障接管无法阻止游戏自身超时造成的断线，也不能在服务端重启后保留原 socket。
 
 ## 连接关闭
 
-DATA_FIN 占用每个发送方向末尾的一个字节序号。只有其之前的数据全部到达，累计 Data ACK 才覆盖 FIN。应用关闭后拒绝新的本地 I/O，但后台继续排空已接收 TX；对端确认最终序号后才发送 session-close。单方向半关闭不会关闭反向数据流，连接包装器也保留这一语义。
+DATA_FIN 占用每个发送方向末尾的一个字节序号。只有其之前的数据全部到达，累计 Data ACK 才覆盖 FIN。应用关闭后拒绝新的本地 I/O，但后台继续排空已接收 TX；对端确认最终序号后才发送 session-close。单方向半关闭不会关闭反向数据流。
 
-如果 FIN 及其之前的数据已经到达，后续 session-close 或控制路径传输失败不会直接丢弃已缓冲 RX，应用可以继续读取。因此接收确认在慢读取时仍然有效，会话记账在排空和缓冲释放后完成。错误、reset 和服务停止仍可以立即中止；本地应用关闭也可以丢弃自身未读 RX。
+如果 FIN 及其之前的数据已经到达，后续 session-close 或路径失败不会丢弃已缓冲 RX，应用可以继续读完。错误、reset 和服务停止仍可以立即中止；本地应用关闭也可以丢弃自身未读 RX。
 
-正常排空依据协议确认，不使用固定延迟，仍受对端反压和 child 故障影响；服务停止可打断排空。完整应用关闭的无进展上限见上一节。
+应用完整 `Close` 后，连续两分钟没有累计 Data ACK 进展会结束剩余会话，避免所有路径都不可用时无限等待 FIN/ACK。这个时限不适用于 `CloseWrite`、`CloseRead` 或仍开放的空闲连接。
 
-应用读写 deadline 覆盖首次 fast-open 写入等待。一次应用超时不会重置逻辑连接：已接受的前缀继续排队，调用者可以清除或延长 deadline 后续写尚未接受的后缀。没有收到 FIN 就终止的不完整流返回错误，而不是干净 EOF；本地关闭会中断等待中的应用 I/O。
+应用读写 deadline 覆盖首次 fast-open 写入等待。写入超时返回已接受的前缀，已接受字节继续排队，调用者可以延长 deadline 后续写剩余部分。没有收到 FIN 就终止的不完整流返回错误，而不是干净 EOF。
 
-## 运行时统计
+## 运行时统计（状态 schema 5）
 
-客户端设置 `status_file` 后，会在握手中请求服务端发送简洁的 sender-status 帧，经当前控制路径返回：通常是 leg0，故障接管时可以是 leg1。它按逻辑会话报告服务端下行队列、发送历史、重注入、写阻塞和内存压力。状态更新会合并，不占用 DATA 序号、发送历史空间或载荷内存预算；不意味着没有任何元数据或传输开销。客户端在更新停止后标记 stale，不把缺失状态当作零。
+客户端设置 `status_file` 后，会在握手中请求服务端发送 sender-status 帧（schema 4，372 字节），经任一 leg 返回。它按逻辑会话报告服务端下行的队列、发送历史、实时上限、修复与重注入、写阻塞和内存压力。状态更新会合并，不占用 DATA 序号或载荷内存预算。客户端在更新停止三秒后把远端数据标为 stale，不把缺失当作零。
 
-已有流量的路径独立于 `status_file` 发送低频 PING/PONG，用于观测；数据重注入计时依据 DATA 交付样本，不仅依据探测成功与否。未使用的空闲 leg1 不会只因已连接就开启每流探测。可选故障接管另有两条 child 共享的 TCP/UDP 健康探测。
+| 位置 | 主要字段 |
+| --- | --- |
+| `node.memory` | `tx_bytes`、`rx_bytes`、`reserved_bytes`、`cached_bytes`、`active_senders`、`active_receivers`、`receive_share_bytes`、`pressure_threshold_bytes` 及各自峰值 |
+| `logical.local_sender` / `remote_sender` | `unsent_limit_bytes`、`history_limit_bytes`（开放会话中的最大当前值）、`replay_bytes`、`fallback_*`（修复）、`opportunistic_reinjections`、`tail_reinjections`、`tail_reinjection_bytes`、反压次数与时长 |
+| 每条腿 | `pipeline_limit_bytes` 与 `outstanding_bytes`（本端发送），`remote_pipeline_limit_bytes` 与 `remote_outstanding_bytes`（对端发送），`feedback_frames_sent/received`、`join_count`、交付速率与 RTT |
 
-RTT 是有效的应用层往返时间，包含代理和传输排队。探测超时、停滞和重注入计数都是 MP 可见事件，不是底层 IP/UDP 丢包率。速率峰值是启动以来最高的一秒平均值；内存峰值由分配器直接更新。
+已有流量的路径独立于 `status_file` 发送低频 PING/PONG，用于观测。RTT 是有效的应用层往返时间，包含代理和传输排队。探测超时、停滞和重注入计数都是 MP 可见事件，不是底层丢包率。速率峰值是启动以来最高的一秒平均值。远端调度速率估计不是当前一秒吞吐或物理带宽。
 
-Leg join 统计已成功挂接的传输，与本侧发送方向是否激活无关。Join、拨号尝试和已报告的远端失败保留关闭连接的累计值；probe 统计只覆盖活跃连接。开启接管后，attempt 统计每条 leg 的业务 TCP 拨号，不含共享健康连接；未开启时，leg0 attempt 对应已建立的逻辑连接数。延迟拨号的主路径可以在 deferred handshake 完成前挂接；远端失败总数只包含对端实际报告过的事件。
+Leg join 统计已成功挂接的传输（含重连）；join、拨号尝试和远端失败保留已关闭连接的累计值。错误事件携带 `last_error_source`：`local_endpoint`、`remote_endpoint`、`transport`、`shutdown` 或 `unknown`，只用于诊断，不改变调度或关闭时机。
 
-错误事件携带 `last_error_source`：`local_endpoint`、`remote_endpoint`、`transport`、`shutdown` 或 `unknown`。健康逻辑连接由应用关闭时标记端点来源；若此前已有 MP 路径失败，保留原始来源。session-close 在两条 leg 上传递该来源。只有关闭相关 I/O 错误继承端点归因，超时与协议错误仍显示。没有关闭标记时保留 unknown，不靠 EOF、reset 或 QUIC cancel 文本猜测。来源标记只用于诊断，不改变 FIN、调度、恢复或关闭时机。
-
-状态 schema 4 包含错误来源、方向策略和发送模式。确认来自应用端点关闭的事件不增加 leg failure/event 计数；其他事件，包括来源不明和无害关闭，保留原有计数语义。
-
-当前 aggregate / traffic-saving 模式要求同一条客户端逻辑连接上存在 leg1。新鲜的远端模式不能覆盖本地路径已断开的事实；方向标为 unknown，已激活却没有 booster 的连接显示 degraded。已连接但无流量的 leg1 不因此失效，超过三秒的远端模式视为 unknown。
-
-远端调度速率估计不是当前一秒吞吐或物理带宽。DATA-feedback RTT 包含数据沿该 leg 发送、反馈沿控制路径返回的时间；常规控制路径为 leg0，接管时为 leg1。一次停滞不一定产生重注入，反压时长是跨连接累加值，不是某次暂停的最长时间。
-
-每个 MP inbound/outbound 启动时打印实际预算、高水位、恢复水位和缓存上限。越过高水位和降回恢复水位时，各打印一次 info 状态转换日志。
+每个 MP inbound/outbound 启动时打印实际预算、应急余量和缓存上限；进入和退出压力状态时各打印一次日志。
 
 ## 源码索引
 
 | 内容 | 源码 |
 | --- | --- |
 | 客户端方向策略及校验 | [policy.go](../protocol/multipath/policy.go)、[option/multipath.go](../option/multipath.go) |
-| 分配、交付反馈与重注入 | [scheduler.go](../protocol/multipath/scheduler.go)、[stream/path.go](../protocol/multipath/stream/path.go) |
-| 连接发送历史与接收存储 | [stream/send.go](../protocol/multipath/stream/send.go)、[stream/receive.go](../protocol/multipath/stream/receive.go) |
-| 共享预算、cgroup 和 Go 内存限制 | [memory.go](../protocol/multipath/memory.go)、[memory_available_linux.go](../protocol/multipath/memory_available_linux.go)、[memory_runtime.go](../protocol/multipath/memory_runtime.go) |
-| 共享健康检查和会话所有权 | [recovery_client.go](../protocol/multipath/recovery_client.go)、[recovery_policy.go](../protocol/multipath/recovery_policy.go)、[recovery_sessions.go](../protocol/multipath/recovery_sessions.go) |
-| 关闭与半关闭 | [lifecycle.go](../protocol/multipath/lifecycle.go)、[logical_conn.go](../protocol/multipath/logical_conn.go) |
+| 握手、认证与版本拒绝 | [protocol.go](../protocol/multipath/protocol.go)、[inbound.go](../protocol/multipath/inbound.go) |
+| 会话建立与 leg 管理 | [recovery_tcp.go](../protocol/multipath/recovery_tcp.go)、[outbound.go](../protocol/multipath/outbound.go) |
+| 激活 | [activation.go](../protocol/multipath/activation.go) |
+| 调度、反馈与重注入 | [scheduler.go](../protocol/multipath/scheduler.go)、[stream/path.go](../protocol/multipath/stream/path.go) |
+| 发送历史与接收存储 | [stream/send.go](../protocol/multipath/stream/send.go)、[stream/receive.go](../protocol/multipath/stream/receive.go)、[core.go](../protocol/multipath/core.go) |
+| 应用读写 | [logical_conn.go](../protocol/multipath/logical_conn.go) |
+| 共享预算与 Go 内存限制 | [memory.go](../protocol/multipath/memory.go)、[memory_available_linux.go](../protocol/multipath/memory_available_linux.go)、[memory_runtime.go](../protocol/multipath/memory_runtime.go) |
+| 故障接管与会话所有权 | [recovery_client.go](../protocol/multipath/recovery_client.go)、[recovery_policy.go](../protocol/multipath/recovery_policy.go)、[recovery_sessions.go](../protocol/multipath/recovery_sessions.go) |
+| 关闭与半关闭 | [lifecycle.go](../protocol/multipath/lifecycle.go) |
 | 远端遥测与客户端状态 | [telemetry.go](../protocol/multipath/telemetry.go)、[status.go](../protocol/multipath/status.go) |
 
 [beta5 设计](development/multipath-beta5.zh-CN.md)和[验证记录](development/multipath-beta5-validation.zh-CN.md)保留为历史开发文档，不是当前配置参考。

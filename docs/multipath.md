@@ -2,348 +2,178 @@
 
 [中文](multipath.zh-CN.md) · [Configuration reference](../README.md#english)
 
-This document describes the implemented Multipath data path, session lifecycle and observability. The README contains deployment examples and the complete configuration reference.
+This document describes the Multipath data path, scheduling, memory, session lifecycle and observability of protocol v13 (beta10). The README contains deployment examples and the complete configuration reference.
 
 ## Scope and relationship to MPTCP
 
-Multipath combines exactly two reliable child streams between a client outbound and a server inbound. The server maintains one target-facing TCP connection for each logical stream. Child nodes forward ordinary traffic to the aggregation listener and do not need to understand Multipath.
+Multipath combines exactly two reliable child streams between a client outbound and a server inbound. The server maintains one target-facing TCP connection for each logical stream. Intermediate nodes forward ordinary traffic to the aggregation listener and do not need to understand Multipath.
 
-MPTCP presents one ordered byte stream over multiple TCP subflows, with a connection-level sequence space, Data ACK and cross-path data mappings. Multipath adopts those connection-level ideas, including reinjection and an ordered FIN, but carries its own framed protocol over proxy streams rather than TCP options. See [RFC 8684](https://www.rfc-editor.org/rfc/rfc8684.html).
+MPTCP presents one ordered byte stream over multiple TCP subflows, with a connection-level sequence space, Data ACK and cross-path data mappings. Multipath adopts those connection-level ideas, including an msk-level send buffer, earliest-completion-first (ECF) scheduling, opportunistic reinjection with penalties and an ordered FIN, but carries its own framed protocol over proxy streams rather than TCP options and does not interoperate with the MPTCP wire protocol. See [RFC 8684](https://www.rfc-editor.org/rfc/rfc8684.html).
 
-Native TCP/QUIC congestion control and retransmission remain inside the children. Multipath does not implement MPTCP's authenticated MP_JOIN, address discovery, TCP fallback or coupled subflow congestion control. The scheduling reference is the [Linux MPTCP implementation at a pinned commit](https://github.com/torvalds/linux/blob/587858367581b9c55c3690f4e63382ad622719d4/net/mptcp/protocol.c), not a promise to track every future kernel change.
+Packet-level congestion control, pacing and retransmission remain inside the children, including the congestion control used by Hysteria2. Multipath does not implement MPTCP address discovery, TCP fallback or coupled subflow congestion control. The scheduling reference is the [Linux MPTCP implementation at a pinned commit](https://github.com/torvalds/linux/blob/587858367581b9c55c3690f4e63382ad622719d4/net/mptcp/protocol.c), not a promise to track every future kernel change.
 
-The listener has no built-in authentication or encryption. Session IDs and policy digests bind protocol state; they do not authenticate a peer. Use trusted paths or authenticated proxies and restrict listener access. Current endpoints require protocol v12; older wire versions are rejected.
+## Authentication and access control
 
-## Data path and leg roles
+Multipath does not encrypt data; the child protocols or private links do. An unprotected listener lets anyone who can reach it use the server to connect to arbitrary targets.
 
-Leg 0 is the session anchor and preferred path. It creates the session, carries
-cumulative acknowledgements and stream control, and carries all application data
-before aggregation activates. This keeps connection setup and small transfers on the
-configured low-latency path. With recovery disabled, losing leg 0 closes the logical
-connection. Optional recovery permits session creation, control and data on leg 1.
+- **`psk`**: with the same pre-shared key on both endpoints, every hello carries an HMAC-SHA256 tag over the session ID, policy, destination, a timestamp and a random nonce. The server rejects a wrong tag, a clock skew above two minutes or a replayed nonce. The PSK protects session setup; it does not encrypt the data that follows.
+- **`allowed_ips`** (server only): accept child connections only from these prefixes, judged by the source address the server sees.
+- A server with neither `psk` nor `allowed_ips` listening on a non-private address logs a warning at startup.
 
-Leg 1 is a capacity booster. It can attach while the connection is still using only
-leg 0, but it does not carry application data until a local activation trigger fires
-or optional failover takes over from leg 0.
-Each direction makes that decision independently from its own accepted-byte count,
-measured rate, and leg 0 backlog. After activation, the scheduler compares outstanding
-path bytes divided by observed delivery rate. Receipt feedback comes from the far
-multipath endpoint, so outstanding bytes include buffering inside a local proxy and
-its remote transport. Completing a local socket write is not delivery confirmation.
-There are no configured bandwidth weights or rate limits.
+Both endpoints must run protocol v13. On a version mismatch the server answers with an explicit rejection carrying its version, and the client logs the reason instead of failing obscurely. Other rejections (authentication, parameter mismatch, closed session) also carry a reason code.
 
-An unmeasured path starts with a bounded probe. Feedback establishes its observed
-delivery rate and timing, not a guaranteed estimate of unused capacity. Once sampled,
-the shared receive window, send-history budget and child write backpressure bound
-assignment; there is no second per-path congestion window. Busy or stalled writers
-do not block assignment to another eligible path. The preferred-only phase uses
-normal child backpressure without the discovery-probe limit. Packet-level congestion
-control, pacing, and retransmission remain in the child: this protocol does not
-replace Hysteria2's congestion controller with an outer TCP one.
+## Sessions and legs
 
-The client configures separate `upload` and `download` policies and sends both
-during session establishment. Upload applies to the client sender and server
-receiver; download applies to the server sender and client receiver. The server
-accepts the exact session policy, subject to protocol validation and its own memory
-budget. Joins and recovery reattachments must carry the same policy.
+The two legs are equals for control: WINDOW feedback, DATA_FIN, session close, reset and sender status are valid on either ready leg, and **no leg is essential to a session**. Leg 0 remains the preferred path for session creation and for application data before activation.
 
-Each direction has an `aggregation_enabled` master switch. When false, new data
-uses leg 0 except during optional failover. The other direction can still activate
-leg 1. With `leg0_traffic_saving: true`, activation switches new data to leg 1
-instead of using both legs. Before activation and while leg 1 is connecting,
-data still uses leg 0. Healthy leg 1 writer backpressure or exhausted discovery
-credit causes waiting, not spillover onto leg 0. A missing or stalled leg 1, or
-local/peer memory pressure, permits leg 0 fallback; once eligible again, leg 1
-resumes exclusive new-data transmission. Existing leg 0 assignments finish normally.
-Reinjection and control traffic may still use leg 0, so this is not a zero-byte
-guarantee. UDP preference and failover are separate from this switch.
+- **Creation**: the client creates the session through the preferred leg; if that leg cannot reach the server within half of `handshake_timeout`, the other leg creates it. Each leg then has its own connection manager.
+- **Redial**: a lost leg is redialed with exponential backoff (1 s doubling to 30 s, reset after 30 s of stable attachment) and rejoins the same session; the server does not dial the target again.
+- **Failed legs**: a stalled leg takes no new data; a leg without any progress for 15 s is closed for redial while the other leg is usable. A sole leg is never closed this way.
+- **Losing leg 0**: new data move to leg 1, and feedback, FIN and close proceed on leg 1 without failover or aggregation. On the testbed a two-second leg 0 outage keeps about 950 Mbps on leg 1.
+- **No legs at all**: without failover, a session ends after both legs have been absent for `max(30 s, 3 × handshake_timeout)`. With failover, the recovery-group lease and ownership checks decide (see below).
+- **Tombstones**: the server remembers closed session IDs for two minutes and rejects late joins and repeated creation, so one ID never dials its target twice.
 
-With aggregation enabled, the following triggers are independent alternatives
-(OR), evaluated separately for each connection and sending direction:
+WINDOW feedback goes on the least blocked leg, and the other leg receives a copy at least every 20 ms, or immediately when the chosen leg's writer has been blocked for `max(10 ms, SRTT/2)`. Copies carry a sequence number: monotonic fields (cumulative ACK, window edge, path receipts) merge by maximum, while flags follow only the newest copy. DATA_FIN is repeated on the other leg when its leg disappears or it stays unacknowledged for an RTO.
 
-- Queue: `activation_on_queue` is enabled and leg 0 in-flight plus local unsent
-  bytes stay at least 80% of `queue_frames * frame_size` for `activation_window`.
-- Rate: `activation_threshold_mbps` is greater than zero and the average local
-  ingress rate over `activation_window` reaches it.
-- Bytes: `activation_after_bytes` is greater than zero and the local TX accepted-byte
-  count reaches it. If `activation_after_bytes_min_mbps` is non-zero, this trigger
-  also requires that average rate over a complete `activation_window`.
+## Activation
 
-The minimum byte-trigger rate does not gate the queue or rate triggers. Disabling
-all three triggers keeps local TX on leg 0; zero thresholds never imply immediate
-activation. Once activated, aggregation does not automatically deactivate when
-traffic drops. Explicit zero disables a numeric trigger. An omitted rate threshold
-retains the default of 150 Mbps when the byte trigger is disabled, or zero when a
-non-zero byte trigger is configured.
+Upload and download are configured and activated independently. `aggregation_enabled` is the master switch. When it is on, the following triggers are evaluated per connection and per sending direction, and any one of them activates:
 
-## Byte stream, receive window, and recovery
+1. **Queue trigger** (`activation_on_queue`, on by default): unsent bytes stay at or above half of the current unsent limit for `activation_window` (default 200 ms), **and** leg 0's delivery rate has stopped growing (less than 25% gain over two round trips, as BBR detects a full pipe). The first condition means the application outpaces leg 0; the second means leg 0 has left slow start and really is the bottleneck.
+2. **Rate trigger** (`activation_threshold_mbps`, default 0 = off): the average rate of accepted application data in the window reaches the threshold.
+3. **Byte trigger** (`activation_after_bytes`, off by default): accepted application bytes reach the threshold; a non-zero `activation_after_bytes_min_mbps` additionally requires that average rate over a complete window.
 
-Both paths carry mappings into one 64-bit **byte** sequence space. Each path also
-has a separate sequence space and incarnation ID. A receiver deduplicates overlapping
-mappings and returns a cumulative Data ACK for the contiguous received prefix.
-That ACK means the receiver owns the bytes, not that the application has read them.
-DATA mappings are processed incrementally: an arriving prefix can be delivered and
-acknowledged before the remaining payload of the same mapping reaches the receiver.
-The wire format still uses DATA frames. `frame_size` caps the payload of one frame;
-it is not a fixed-size record or an application read unit. Missing earlier bytes
-still block ordered delivery of later bytes: incremental processing does not
-eliminate connection-level head-of-line blocking.
-Only Data ACK releases the sender's connection-level history, which retains data
-from **both** paths. An original or recovery writer holds an independent reference,
-so acknowledgement cannot free a buffer while a blocked child still uses it.
+The plateau condition keeps mid-size transfers on high-RTT paths from pulling in leg 1 while leg 0 is still in slow start. Leg 1's fresh child connection would then be in slow start too, and the early bytes it carries often arrive after leg 0 has delivered everything else. On low-RTT paths leg 0 leaves slow start within tens of milliseconds, so `activation_window` dominates.
 
-The receiver advertises one monotonic byte-window right edge shared by both paths.
-Application reads move the window; individual path receipts do not. Short writes
-consume their actual byte length, not a whole frame credit. Local unsent capacity,
-whole-path in-flight bytes, retained send history, and receive storage are separate
-states. There are no idle-credit epochs, weight-based quotas, or separate leg 1
-replay ownership rules.
+With every trigger disabled, nothing activates; a numeric zero does not mean immediate activation. An activated connection stays activated. For the pre-beta10 behavior, set `activation_threshold_mbps: 150` and `activation_window: "1s"` explicitly.
 
-| State | Meaning |
+## Scheduling
+
+### Earliest completion first
+
+After activation each new segment goes to the path expected to deliver it first. A path's expected completion is
+
+`(bytes outstanding on the path + segment length) / delivery rate + minimum RTT / 2`
+
+Delivery rate and RTT come from path receipts sent by the far Multipath endpoint, so outstanding bytes include buffering inside a local proxy and its remote transport; finishing a local socket `Write` is not delivery. There are no configured bandwidth weights or rate limits.
+
+- While the application is backlogged (its writes block, or blocked within the last 10 ms), a slower idle path may take a segment that completes within 1.5 times the best path's completion, so that both paths stay busy.
+- Once the application has finished (DATA_FIN queued) or has nothing more for now, the rule is strict ECF: a slower path takes a segment only if it delivers it before the best path could deliver everything pending, so the tail of a transfer does not end up on a slow path.
+- A path without a rate sample borrows the best measured rate and the longest measured delay, and holds at most four frames until its first sample.
+- While the application is backlogged, a slower path may always keep twice what it delivered in its last propagation round trip (at least two frames) in flight, regardless of its estimate. Otherwise a late-joining or recovering path would have its estimate held down by the scheduler's own restraint and never show its capacity. This grows its in-flight data per round trip like the child's own slow start, up to about twice its bandwidth-delay product.
+- A path idle for `max(2 × SRTT, 100 ms)` is probed with an optimistic rate, and the first receipt after an idle period starts a new rate sample instead of averaging over the gap.
+
+### Repair and reinjection
+
+Every resend borrows from the one connection-level send history: it consumes no new sequence space or receive window and copies no payload. A late original arrives as a duplicate range and is never delivered twice.
+
+- **Receiver drops**: a receiver that refused data for lack of memory reports up to four dropped ranges in WINDOW feedback (never merged across gaps). The sender repairs a range at most once per RTO and spends at most a quarter of the delivery rate per RTT on repairs.
+- **Failed paths**: when a leg is replaced (new generation) or stalls, its unacknowledged mappings are resent on another usable path.
+- **Opportunistic reinjection with penalty**: when new data are blocked by the receive window or the send history, and the path holding the connection head has delivered nothing for one of its RTTs (and at least twice the fast path's RTT), an idle path resends the data near the head in order, and the stuck path takes no new data for one of its RTTs.
+- **Tail reinjection**: when nothing new is left to send and data near the head are still queued on a slower or still-starting path that would deliver them later than an idle faster path could now, the faster path sends another copy; whichever arrives first is used. This covers a child connection in slow start holding data for several round trips.
+
+### Stall detection
+
+The no-progress timeout is the smoothed delivery RTT plus four times its variation, at least 200 ms, or 1 s before any sample. `path_stall_timeout_min` can only raise that floor; it is not a fixed retransmission period. A stalled path takes no new data until it makes progress again; a stall alone does not require a reconnect.
+
+## Byte stream, send history and receive window
+
+Data on both paths map into one 64-bit connection-level byte sequence; each path also has its own sequence and incarnation. The receiver handles duplicate and overlapping mappings and returns a cumulative Data ACK for the contiguous prefix. That means the receiver owns those bytes, not that the target application has read them.
+
+`frame_size` is the largest DATA payload, not a fixed record size. The receiver processes frames incrementally: a contiguous prefix is delivered and acknowledged as soon as it arrives. Missing earlier bytes still hold later ones back; byte-level processing does not remove head-of-line blocking from an ordered stream.
+
+| State | Meaning and limit |
 | --- | --- |
-| Local unsent data | Accepted bytes not yet assigned for transmission; bounded by `queue_frames * frame_size` and included in send history. |
-| Path in-flight data | Bytes assigned to one leg but not yet covered by a whole-path receipt, including child buffers. |
-| Connection send history | Bytes not yet covered by cumulative Data ACK, including both paths and unsent data; bounded by `send_buffer_bytes`. |
-| Receive storage | Arrived out-of-order data and unread in-order data, subject to the byte window and shared memory budget. |
+| Unsent data | Bytes accepted by Multipath but not yet assigned to a path. Limited to about 10 ms of the carrying paths' delivery rate, at least 1 MiB (or four frames), at most `queue_frames × frame_size`, like MPTCP's `notsent_lowat`. |
+| Path in flight | Bytes assigned to a leg without a complete path receipt yet, including child-internal buffering. |
+| Send history | Every byte not yet covered by the cumulative Data ACK, unsent bytes included, like MPTCP's msk send buffer. The target is twice the carrying paths' bandwidth-delay product plus the unsent limit, at least 4 MiB. It grows 25% per RTT while history rather than the network limits sending and shrinks back gradually when demand falls; it is capped by `send_buffer_bytes` and by the session's fair share of the transmit region. |
+| Receive window | One connection-level byte window advertised for both paths; its right edge only moves forward. It is 256 KiB before the first advertisement and then the session's fair share (see below), at most `receive_window_bytes`. Application reads move it forward. |
+| Receive storage | Out-of-order data and in-order data not yet read by the application, allocated lazily in pooled 16 KiB pages. |
 
-`queue_frames` therefore does not define a second copy of the retransmission
-buffer, and `send_buffer_bytes` is not exclusive to leg1.
+`queue_frames`, `send_buffer_bytes` and `receive_window_bytes` are **ceilings**, not capacities or preallocations; the working values follow path rates, RTTs and memory shares. The defaults are the recommended values and rarely need tuning.
 
-Receive storage uses sparse 16 KiB pages, allocated only for arriving bytes. Under
-memory pressure, a receiver may decline speculative data or prune wholly
-unacknowledged out-of-order pages. It never discards Data-ACKed bytes waiting for the
-application. Path receipts still report transport delivery; they do not release the
-connection history. If a received mapping still covers the missing connection head,
-the sender can reinject it from that history. Each admitted session has reserved
-reader scratch, one head receive page, and a reusable primary TX buffer, so a missing
-head is not dependent on leg 1 releasing speculative storage.
-
-## Weak leg 1 and fallback
-
-Each path has an independent writer. A blocked leg 1 write does not hold the state
-lock, prevent leg 0 writes, or stop receive/control processing. Recovery reuses the
-same immutable byte history, does not consume new connection-window space, and does
-not need another payload allocation. Late originals are harmless duplicates.
-
-Whole-path receipts drive delivery-rate and timing estimates. A leg without progress
-is marked stale and pauses new assignments; retained mappings can be reinjected on
-another available path. Receipt progress clears the stale state. A stall is not an
-automatic disconnect/reconnect, and a hard secondary failure does not close the
-logical stream. An individual leg receipt above a missing global byte is ordinary
-reordering, not evidence that the missing byte was lost.
-
-The adaptive no-progress interval is smoothed delivery RTT plus four times its
-variation, at least 200 ms, initially one second before measurements are available.
-An explicit `path_stall_timeout_min` supplies an additional lower bound. Buffering in
-child transports is included in timing measurements. Control/window updates take
-priority over DATA not yet submitted to the primary child; they cannot overtake an
-already blocked child write or bytes already queued inside a reliable transport.
-
-These mechanisms preserve a usable leg 0 through secondary stalls and failures.
-They cannot guarantee the same latency as leg 0 alone after data have already been
-assigned to a slow path: detecting and recovering an earlier missing byte takes
-time and bandwidth. Aggregation also cannot exceed shared physical bottlenecks.
+Application reads and writes copy directly between the application's buffers and the receive pages or send buffers, without relay pipes or relay goroutines, and each DATA frame's header and payload go to the child in one write.
 
 ## Memory and backpressure
 
-Payload storage, path/mapping metadata, reserved progress buffers, cache, and estimated
-session overhead share one budget per multipath inbound or outbound. The default is
-`min(512 MiB, available memory * 0.5)`. On Linux, available memory is the smaller of
-`MemAvailable` and the remaining capacity of visible cgroup v1/v2 memory limits,
-including ancestor groups. Explicit limits are not automatically reduced. New booster assignments and ordinary receive-window
-growth pause at 7/8 and resume below 3/4; head progress remains reserved. Advertised
-but unused window space is not an allocation. This budget is not process RSS and
-does not include child TCP/QUIC buffers.
+Each Multipath inbound or outbound has one host-local budget covering send payload, receive pages, metadata, caches and fixed session overhead. The default is `min(512 MiB, available memory × 0.5)`; on Linux the available memory is the smaller of `MemAvailable` and the visible cgroup v1/v2 headroom. An explicit budget is never shrunk automatically.
 
-Checked-out cache entries release their old references immediately; sparse cache
-indexes shrink, and large sender/path indexes are released when fully acknowledged.
-Returning a buffer to the budget makes it reusable or collectible; it does not
-force Go to return physical pages to the OS immediately. No periodic forced GC is
-used. A high RSS alone is therefore not evidence of retained live buffers.
+One sixteenth of the budget is an emergency margin; the rest is a shared pool with three accounts: transmit payload (tx), receive pages (rx) and other (session reservations, UDP reassembly and so on).
 
-On a 1 GiB host, a conservative starting point is `"memory_limit": "256MB"`, with
-headroom for child protocols, other processes and the OS. Multiple multipath
-instances have separate budgets. Large QUIC windows can add substantial memory
-outside them. If neither `GOMEMLIMIT` nor an existing runtime limit (including
-sing-box's `debug.memory_limit`) is set, starting the first multipath instance
-sets a process-wide Go **soft** limit to its current Go footprint plus 80% of
-detected available memory. All multipath instances share it. Stopping the last
-instance restores the previous setting unless it was subsequently overridden.
-The startup log reports the effective value and its source. There is no periodic
-memory polling or forced collection; normal Go GC uses this limit when needed.
-Explicit `GOMEMLIMIT`, including `GOMEMLIMIT=off`, takes precedence. A soft limit
-controls transient GC headroom, not RSS, and cannot fit a larger live working set
-into RAM; see the [Go GC guide](https://go.dev/doc/gc-guide#Memory_limit).
+- Transmit and receive borrow whatever the other does not use, but always leave it a reserve: half of the pool while the other direction has active sessions, otherwise an eighth, plus a 1/16 band so one side filling the pool never prevents the other from starting.
+- Send history gets a fair share of the transmit region divided by active senders; receive windows get three quarters of the receive region divided by active receivers (at least 256 KiB). The remaining quarter absorbs page overhead and arrivals at the window edge. A session counts as active while it moved data within the last second.
+- When receive pages run out, data within 16 pages of the next expected byte are still admitted and evict the farthest unacknowledged page; refused or evicted ranges are reported to the sender for repair.
+- After refusing data, or with room for less than two frames, the receiver sets a "full" flag in its feedback: the sender pauses new data (keeping at most two frames in flight) and only repairs holes until the receiver reports room again.
+- Bytes already covered by Data ACK and waiting for the application are never discarded.
 
-Omitted receive/send-history ceilings are derived from the node budget: half of
-its ordinary allocation region (7/16 of the total, capped at 512 MiB and at least
-one frame). With a 512 MiB budget this is 224 MiB per direction. These are ceilings,
-not allocations or per-session reservations; concurrent sessions still share the
-same global allocator. Explicit byte limits remain hard caps. There is no frame-count receive limit; only the byte window and shared memory budget apply.
+"Pressure" only means the emergency margin is in use. It is logged and reported, but it **never disables leg 1, freezes receive windows or changes any session's path selection**.
+
+Every admitted session reserves reader scratch, one head receive page and one reusable transmit buffer, so head-of-line progress never depends on another session releasing memory first. Returning a buffer to the budget makes it reusable or collectable; Go does not necessarily return physical pages to the operating system immediately.
+
+On a 1 GiB host, start with `"memory_limit": "256MB"` to leave room for child protocols, other processes and the kernel. Separate Multipath instances have separate budgets, and large QUIC windows use memory outside the budget.
+
+Without `GOMEMLIMIT` or an existing runtime memory limit (including sing-box `debug.memory_limit`), the first Multipath instance sets the process Go soft limit to "current Go memory + 80% of detected available memory". All instances share it and the previous setting is restored when the last one stops. An explicit `GOMEMLIMIT`, including `off`, takes precedence. It is not a hard RSS limit; see the [Go GC guide](https://go.dev/doc/gc-guide#Memory_limit).
+
+## Traffic-saving mode
+
+With `leg0_traffic_saving`, new data after activation go exclusively to leg 1 instead of being aggregated. Before activation, and while leg 1 is not ready, leg 0 is used. Write backpressure on a healthy leg 1 makes data wait rather than spill onto leg 0; a missing or stalled leg 1 lets leg 0 take over until leg 1 recovers. While leg 1 is healthy, tail reinjection does not use leg 0 either. Data already assigned to leg 0 complete normally, and control frames and repairs after a failure may still use leg 0, so the mode does not guarantee zero leg 0 traffic.
 
 ## Optional path failover
 
-`failover_enabled` is a **client-only** option and defaults to `false`. Disabled
-outbounds create no shared recovery probes or UDP relay sockets; their existing
-aggregation and direct child UDP forwarding remain unchanged. The server always
-listens on TCP and UDP and accepts both ordinary and recovery-enabled sessions.
-It creates recovery groups only when requested by a client and has no
-`failover_enabled` configuration field.
+`failover_enabled` is a client-only option and defaults to false. Without it, a session already survives on either leg (see above); failover adds shared health checks, path selection for new sessions, a UDP relay with UDP path switching, and session retention across long outages of both legs. The server always listens on TCP and UDP and creates a recovery group only when the client asks for one.
 
-Enable the flag on the client outbound. The client also sets `failover_timeout`
-(default `"5s"`) and `failback_delay` (default `"30s"`). Each
-outbound maintains one TCP control connection and one native UDP association per
-child, shared across all business connections. A path is healthy only while both
-transports have fresh challenge replies from the multipath server. A full failure
-timeout declares it unavailable; a delayed old reply does not establish recovery.
-Checks normally run once per second. Detection and session reattachment add time
-to the configured timeout; it is not a bound on application-visible interruption.
-At startup, either confirmed healthy path can carry traffic immediately. The
-preferred path is selected as soon as it first becomes healthy, without a failback
-hold. Once that path has been healthy and then failed, subsequent returns require
-the configured stability period. This applies separately to TCP and UDP preference.
+When enabled, each outbound keeps one shared TCP control connection and one native UDP association per child for all business connections. A path is healthy only with fresh TCP and UDP challenge responses; it becomes unavailable after a full `failover_timeout` (default 5 s) without a valid response. Probes normally run once per second, and detection plus session reconnection add time, so the timeout is not an upper bound on interruption.
 
-When leg 0 fails, existing TCP sessions retain their target connections, byte
-sequence numbers, receive windows and unacknowledged send history. Data, cumulative
-ACKs and FIN can use leg 1 without enabling aggregation. New sessions can also start
-on leg 1. The client reconnects lost transports; the server does not redial the
-target. A recovered leg 0 must remain healthy for the failback delay before normal
-leg roles resume. One missed probe does not reset that period; a full failure
-timeout does. If the fallback fails while the preferred path is available, the
-stability hold is bypassed. Explicit application closure, server restart, or loss
-of both paths beyond the recovery-group lease can still terminate a connection.
+The preferred path is used as soon as it is first confirmed healthy. After it has failed once, a recovering preferred path must stay healthy before it returns to its normal role: 3 s at first, doubling with repeated failures up to `failback_delay` (default 30 s). A single missed probe does not restart the hold; a full failure timeout does. If the backup also fails, a healthy preferred path is used immediately. TCP and UDP each follow their own preferred path.
 
-With recovery enabled, `udp_outbound` is the **preferred UDP leg**, independently
-of TCP's leg 0 preference, and must name one of the two children. Both children must
-support TCP and UDP. UDP uses the server relay from the first packet, so switching
-paths does not replace the target-facing socket or its source port. Choosing leg 1
-for UDP keeps it on leg 1 when leg 0 fails and recovers; only a failure of the UDP
-preferred path triggers its own fallback. The same failure and return durations
-apply. Client-selected path epochs also direct server replies, including one-way
-application traffic; delayed messages cannot revert a newer selection.
+With failover, `udp_outbound` is the UDP preferred path, independent of the TCP leg 0, and must be one of the two children. UDP goes through the server relay from the first packet, and switching paths keeps the target-facing socket and source port. The server answers according to the path epoch synchronized by the client, and late old messages cannot undo a newer selection.
 
-UDP payloads remain unreliable datagrams, not UDP-over-TCP. The relay fragments
-large packets into small outer datagrams and reassembles each independently, without
-retransmission. Missing fragments expire after five seconds. Buffers use the shared
-memory budget; pressure drops UDP packets rather than accumulating reliable queues.
-UDP associations expire after five minutes without application packets. Closed session
-IDs are retained for two minutes to reject delayed packets and joins; these records
-also consume the shared budget. Group state expires after no control or UDP
-traffic for `max(2 minutes, 4 * failover_timeout + failback_delay)`.
+UDP keeps unreliable datagram semantics and is not carried over TCP. The relay splits large datagrams into smaller outer datagrams and reassembles each independently without Multipath-level retransmission; incomplete datagrams expire after five seconds. Reassembly buffers count against the shared budget, and pressure drops UDP datagrams instead of building a reliable queue. UDP associations expire after five minutes without application datagrams. A recovery group expires after `max(2 minutes, 4 × failover_timeout + failback_delay)` without control or UDP traffic.
 
-Recovery control heartbeats also verify TCP session ownership. The server rotates
-through at most 64 IDs per heartbeat; the client reports which IDs it no longer
-owns in the next request on that control connection. Only an explicit absence
-releases a server session. Lost control connections discard their outstanding
-query batch and retry through fresh queries, without accumulating a close queue.
-Client ownership begins before sending the first hello, including fast open, and
-ends when the logical core terminates. A connection still owned by the client is
-not removed merely because both data legs are temporarily unavailable.
+Recovery heartbeats also confirm TCP session ownership. Each round the server asks about at most 64 IDs, cycling through active sessions; the client reports IDs it no longer holds, and only an explicit "gone" releases a server session. The client registers ownership before the first hello (including fast open) and unregisters it when the logical connection ends, so a session the client still holds is not reclaimed merely because both data legs are temporarily down.
 
-After the application calls full `Close`, buffered TX is allowed to drain, but
-two minutes without cumulative Data ACK progress ends the remaining session.
-This bounds abandoned FIN/ACK waits even if all control paths are unavailable.
-It does not apply to `CloseWrite`, `CloseRead`, or an open idle connection. Normal
-FIN acknowledgement completes the close immediately.
-Pending child handshakes are interrupted when their context is canceled. Session
-cleanup waits for secondary-join and recovery-rejoin workers before returning
-their memory reservation.
-
-The server's listening port must be reachable over **both TCP and UDP** through both
-children. The server's normal routing rules determine the final TCP and UDP exit.
-The protocol adds no authentication or encryption; keep this listener on trusted
-paths. Failover cannot prevent a game from disconnecting if its own timeout expires
-during detection, or preserve a socket across server restart.
+Both children must reach the server port over TCP and UDP. Failover cannot prevent a game's own timeout from disconnecting, and it cannot preserve sockets across a server restart.
 
 ## Connection shutdown
 
-DATA_FIN occupies one byte-sequence position at the end of each sending direction.
-A cumulative Data ACK covers it only after all preceding bytes have been received. An application
-close rejects further local I/O but drains accepted TX in the background; session-close
-is sent only after the peer acknowledges that final sequence. Half-closing one
-direction leaves the reverse direction usable, including through connection wrappers.
+DATA_FIN occupies one sequence number at the end of each direction, and the cumulative Data ACK covers it only after every earlier byte has arrived. After an application close, new local I/O is rejected while accepted TX keeps draining; session close is sent after the peer acknowledges the final sequence. A half close does not close the reverse direction.
 
-If FIN and all its preceding data have arrived, a subsequent session-close or control
-leg transport failure preserves buffered RX until the application reads it. Receipt ACKs therefore
-remain valid even when the application is slow. Session accounting is finalized after
-that drain and buffer release. Errors, resets, and service shutdown can still abort
-immediately; a local application close may discard its own unread RX. Normal draining
-uses protocol confirmation rather than a fixed delay and remains subject to peer
-backpressure and child transport failure. Service shutdown can interrupt a drain.
+If FIN and all preceding data have arrived, a later session close or path failure does not discard buffered RX; the application can read to the end. Errors, resets and service shutdown can still abort immediately, and a local application close may discard its own unread RX.
 
-Application read/write deadlines also cover the initial fast-open write wait.
-An application timeout does not reset the session; the accepted prefix remains
-queued and the caller can resume with the unwritten suffix after clearing or
-extending the deadline. An incomplete stream terminated without FIN reports an
-error rather than a clean EOF, while local close interrupts pending application I/O.
+After a full application `Close`, two minutes without cumulative Data ACK progress end the remaining session, so a FIN/ACK is never awaited forever when no path works. This limit does not apply to `CloseWrite`, `CloseRead` or open idle connections.
 
-## Runtime telemetry
+Application read and write deadlines also cover the first fast-open write. A write timeout returns the accepted prefix; accepted bytes stay queued and the caller may extend the deadline and write the rest. A stream that ends without FIN returns an error rather than a clean EOF.
 
-When the client enables `status_file`, protocol v12 requests a compact sender-status
-frame from the server on the control path (leg 0 normally, leg 1 during failover).
-It reports the server-side downlink queues, replay and fallback counters,
-write stalls, and memory pressure for the matching logical session. Status frames
-are coalesced and do not consume data sequence numbers, replay space, or the payload
-memory budget. The client marks remote status stale when updates stop rather than
-interpreting missing telemetry as zero.
-Telemetry still has metadata and transport overhead; it is not cost-free.
+## Runtime telemetry (status schema 5)
 
-Active paths send low-rate PING/PONG probes independently of `status_file` for
-observability. Data reinjection timing uses DATA receipt samples, not probe success alone.
-An idle unused secondary does not receive per-flow probes just because it is attached.
-Optional failover separately uses shared TCP/UDP health probes on both children.
-Reported RTT is the effective application-layer round trip and
-therefore includes transport and proxy queueing. Probe timeouts and reinjection/stall
-counters describe multipath-visible events; they are not raw IP or UDP packet-loss
-measurements. Traffic peaks are the highest one-second averages since process start,
-while memory peaks are updated directly by the allocator.
+With `status_file` set, the client asks the server in its hello for sender-status frames (schema 4, 372 bytes) on either leg. They report, per logical session, the server's downlink queues, send history, live limits, repairs and reinjections, write stalls and memory pressure. Updates are coalesced and consume no DATA sequence numbers or payload budget. Remote data older than three seconds are marked stale rather than read as zero.
 
-Leg joins count successfully attached transports independently of local TX
-activation. Joins, attempts and reported remote failures retain closed-session
-totals; probe statistics cover active connections only. With failover enabled, attempts
-count business TCP dials on each leg, excluding shared health connections. Without it,
-leg 0 attempts count created logical connections. A lazy primary transport
-can be attached before its deferred handshake finishes. Remote failure totals
-include only events actually reported by the peer.
+| Location | Main fields |
+| --- | --- |
+| `node.memory` | `tx_bytes`, `rx_bytes`, `reserved_bytes`, `cached_bytes`, `active_senders`, `active_receivers`, `receive_share_bytes`, `pressure_threshold_bytes` and their peaks |
+| `logical.local_sender` / `remote_sender` | `unsent_limit_bytes`, `history_limit_bytes` (largest current value among open sessions), `replay_bytes`, `fallback_*` (repairs), `opportunistic_reinjections`, `tail_reinjections`, `tail_reinjection_bytes`, backpressure count and duration |
+| Each leg | `pipeline_limit_bytes` and `outstanding_bytes` (local sender), `remote_pipeline_limit_bytes` and `remote_outstanding_bytes` (peer sender), `feedback_frames_sent/received`, `join_count`, delivery rate and RTT |
 
-Leg events include `last_error_source`: `local_endpoint`, `remote_endpoint`,
-`transport`, `shutdown`, or `unknown`. Closing a healthy logical connection marks
-an application-endpoint shutdown; a preceding multipath failure keeps its original
-source. Session-close frames carry this provenance to the peer on both legs.
-Only close-related I/O errors inherit endpoint attribution; timeouts and protocol
-errors remain visible. A missing close marker leaves the source unknown rather
-than guessing from EOF, reset or QUIC cancellation text. The marker is diagnostic
-only: it does not change FIN handling, scheduling, recovery or close timing.
-Status schema 4 includes error provenance, directional policies and sender modes. Confirmed endpoint-close events do not
-increment leg failure/event counters; other events, including unattributed and
-harmless closures, retain their existing counting semantics. Protocol v12 requires
-updating both endpoints.
+Active paths send low-rate PING/PONG probes independently of `status_file`. Reported RTT is the effective application-layer round trip including proxy and transport queueing. Probe timeouts, stalls and reinjections are Multipath-visible events, not raw packet loss. Traffic peaks are the highest one-second averages since start. Remote scheduler rate estimates are not one-second throughput or physical capacity.
 
-Current aggregate and traffic-saving modes require an attached leg 1 on the same
-client connection. A fresh remote mode cannot override local path absence; the
-direction becomes unknown and an activated connection with no booster is reported
-as degraded. An attached idle connection remains eligible regardless of its current
-transfer rate. Remote modes older than three seconds are unknown.
+Leg joins count successfully attached transports, reconnections included; joins, attempts and remote failures keep the totals of closed connections. Error events carry `last_error_source` (`local_endpoint`, `remote_endpoint`, `transport`, `shutdown` or `unknown`), which is diagnostic only and never changes scheduling or close timing.
 
-Remote scheduler rate estimates are not one-second throughput or physical link
-capacity. DATA-feedback RTT follows the selected data leg outward and leg0 for
-the return feedback. Stall detection need not result in reinjection, and sender
-backpressure duration is accumulated across connections, not a single pause.
-
-At startup, each multipath inbound or outbound logs its resolved memory limit, high
-and resume watermarks, and cache limit. Crossing the high watermark and recovering
-below the resume watermark each emit one informational transition log.
+At startup each Multipath inbound or outbound logs its budget, emergency margin and cache limit, and it logs once when entering and once when leaving pressure.
 
 ## Source map
 
-| Area | Source |
+| Topic | Source |
 | --- | --- |
-| Client-selected directional policies and validation | [policy.go](../protocol/multipath/policy.go), [option/multipath.go](../option/multipath.go) |
-| Assignment, delivery feedback and reinjection | [scheduler.go](../protocol/multipath/scheduler.go), [stream/path.go](../protocol/multipath/stream/path.go) |
-| Connection send history and receive storage | [stream/send.go](../protocol/multipath/stream/send.go), [stream/receive.go](../protocol/multipath/stream/receive.go) |
-| Shared budget, cgroup detection and Go limit | [memory.go](../protocol/multipath/memory.go), [memory_available_linux.go](../protocol/multipath/memory_available_linux.go), [memory_runtime.go](../protocol/multipath/memory_runtime.go) |
-| Shared recovery health and session ownership | [recovery_client.go](../protocol/multipath/recovery_client.go), [recovery_policy.go](../protocol/multipath/recovery_policy.go), [recovery_sessions.go](../protocol/multipath/recovery_sessions.go) |
-| Shutdown and half-close | [lifecycle.go](../protocol/multipath/lifecycle.go), [logical_conn.go](../protocol/multipath/logical_conn.go) |
+| Client direction policy and validation | [policy.go](../protocol/multipath/policy.go), [option/multipath.go](../option/multipath.go) |
+| Hello, authentication and version rejection | [protocol.go](../protocol/multipath/protocol.go), [inbound.go](../protocol/multipath/inbound.go) |
+| Session creation and leg management | [recovery_tcp.go](../protocol/multipath/recovery_tcp.go), [outbound.go](../protocol/multipath/outbound.go) |
+| Activation | [activation.go](../protocol/multipath/activation.go) |
+| Scheduling, feedback and reinjection | [scheduler.go](../protocol/multipath/scheduler.go), [stream/path.go](../protocol/multipath/stream/path.go) |
+| Send history and receive storage | [stream/send.go](../protocol/multipath/stream/send.go), [stream/receive.go](../protocol/multipath/stream/receive.go), [core.go](../protocol/multipath/core.go) |
+| Application I/O | [logical_conn.go](../protocol/multipath/logical_conn.go) |
+| Shared budget and Go memory limit | [memory.go](../protocol/multipath/memory.go), [memory_available_linux.go](../protocol/multipath/memory_available_linux.go), [memory_runtime.go](../protocol/multipath/memory_runtime.go) |
+| Failover and session ownership | [recovery_client.go](../protocol/multipath/recovery_client.go), [recovery_policy.go](../protocol/multipath/recovery_policy.go), [recovery_sessions.go](../protocol/multipath/recovery_sessions.go) |
+| Shutdown and half close | [lifecycle.go](../protocol/multipath/lifecycle.go) |
 | Remote telemetry and client status | [telemetry.go](../protocol/multipath/telemetry.go), [status.go](../protocol/multipath/status.go) |
 
-The [beta5 design](development/multipath-beta5.md) and [validation record](development/multipath-beta5-validation.md) are historical development documents, not the current configuration reference.
+The [beta5 design](development/multipath-beta5.md) and [validation notes](development/multipath-beta5-validation.md) are historical development documents, not the current configuration reference.
