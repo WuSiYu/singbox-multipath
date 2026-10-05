@@ -476,15 +476,55 @@ func TestPathRemainingDelivery(t *testing.T) {
 	cold := Path{Generation: 1}
 	_, _ = cold.Submitted(128<<10, time.Now())
 	// Without a rate sample 128 KiB need four slow-start rounds of 100 ms.
-	if got := cold.RemainingDelivery(128<<10, 100*time.Millisecond); got < 0.4 || got > 0.5 {
+	if got := cold.RemainingDelivery(128<<10, time.Now(), 100*time.Millisecond, time.Now()); got < 0.4 || got > 0.5 {
 		t.Fatalf("cold path estimate %.3f s", got)
 	}
 	warm := Path{Generation: 1, Rate: 1 << 20, MinimumRTT: 20 * time.Millisecond}
 	_, _ = warm.Submitted(256<<10, time.Now())
-	if got := warm.RemainingDelivery(256<<10, 0); got < 0.25 || got > 0.27 {
+	if got := warm.RemainingDelivery(256<<10, time.Now(), 0, time.Now()); got < 0.25 || got > 0.27 {
 		t.Fatalf("warm path estimate %.3f s", got)
 	}
-	if got := warm.RemainingDelivery(0, 0); got != 0 {
+	if got := warm.RemainingDelivery(0, time.Now(), 0, time.Now()); got != 0 {
 		t.Fatalf("delivered bytes still pending: %.3f", got)
+	}
+}
+
+func TestPathMinimumRTTExpires(t *testing.T) {
+	now := time.Unix(100, 0)
+	p := Path{Generation: 1}
+	sample := func(rtt time.Duration) {
+		_, _ = p.Submitted(1000, now)
+		now = now.Add(rtt)
+		_ = p.Feedback(Receipt{Generation: 1, Next: p.Sent}, now)
+	}
+	sample(10 * time.Millisecond)
+	for range 5 {
+		sample(300 * time.Millisecond)
+	}
+	if p.MinimumRTT != 10*time.Millisecond {
+		t.Fatalf("minimum replaced inside its window: %v", p.MinimumRTT)
+	}
+	for range 40 {
+		sample(300 * time.Millisecond)
+	}
+	if p.MinimumRTT != 300*time.Millisecond {
+		t.Fatalf("stale minimum kept after the path's delay grew: %v", p.MinimumRTT)
+	}
+}
+
+func TestPathObservedDelayBoundsEstimates(t *testing.T) {
+	now := time.Now()
+	// Bursts suggest 100 MB/s, but frames have been taking 600 ms.
+	p := Path{Generation: 1, Rate: 100 << 20, SRTT: 610 * time.Millisecond, MinimumRTT: 20 * time.Millisecond}
+	_, _ = p.Submitted(64<<10, now)
+	if got := p.CompletionTime(64<<10, 0, 0, now); got < 0.59 {
+		t.Fatalf("queued path completion ignores observed delay: %.3f s", got)
+	}
+	if got := p.RemainingDelivery(64<<10, now.Add(-500*time.Millisecond), 0, now); got < 0.09 || got > 0.11 {
+		t.Fatalf("remaining delivery ignores elapsed time: %.3f s", got)
+	}
+	idle := Path{Generation: 1, Rate: 100 << 20, SRTT: 610 * time.Millisecond, MinimumRTT: 20 * time.Millisecond}
+	if got := idle.CompletionTime(64<<10, 0, 0, now); got > 0.02 {
+		t.Fatalf("empty path keeps old queueing delay: %.3f s", got)
 	}
 }

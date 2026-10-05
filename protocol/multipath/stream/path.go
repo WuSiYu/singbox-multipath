@@ -33,6 +33,7 @@ type Path struct {
 	SRTT          time.Duration
 	RTTVar        time.Duration
 	MinimumRTT    time.Duration
+	minimumAt     time.Time // when MinimumRTT was last confirmed
 	LastProgress  time.Time
 	Stale         bool
 	ReleaseFlight func(prepaid bool)
@@ -124,7 +125,7 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 	if !sent.IsZero() && now.After(sent) {
 		rtt := now.Sub(sent)
 		if p.SRTT == 0 {
-			p.SRTT, p.RTTVar, p.MinimumRTT = rtt, rtt/2, rtt
+			p.SRTT, p.RTTVar, p.MinimumRTT, p.minimumAt = rtt, rtt/2, rtt, now
 		} else {
 			delta := rtt - p.SRTT
 			if delta < 0 {
@@ -132,7 +133,11 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 			}
 			p.RTTVar = (3*p.RTTVar + delta) / 4
 			p.SRTT = (7*p.SRTT + rtt) / 8
-			p.MinimumRTT = min(p.MinimumRTT, rtt)
+			// A minimum not seen again within the window expires, as in BBR:
+			// a path whose propagation delay grew must not keep its old one.
+			if rtt <= p.MinimumRTT || now.Sub(p.minimumAt) >= MinimumRTTWindow {
+				p.MinimumRTT, p.minimumAt = rtt, now
+			}
 		}
 	}
 	if p.head == len(p.flights) {
@@ -227,7 +232,7 @@ func (p *Path) rollWindow(now time.Time) {
 // delay. A path without a rate sample is still in its first slow-start
 // rounds: one initial window per round trip of at least provisionalDelay,
 // doubling each round.
-func (p *Path) RemainingDelivery(pathEnd uint64, provisionalDelay time.Duration) float64 {
+func (p *Path) RemainingDelivery(pathEnd uint64, sentAt time.Time, provisionalDelay time.Duration, now time.Time) float64 {
 	if pathEnd <= p.Received {
 		return 0
 	}
@@ -239,12 +244,26 @@ func (p *Path) RemainingDelivery(pathEnd uint64, provisionalDelay time.Duration)
 	if p.Rate <= 0 {
 		return math.Ceil(math.Log2(1+remaining/initialWindowBytes))*delay.Seconds() + delay.Seconds()/2
 	}
-	return remaining/p.Rate + delay.Seconds()/2
+	return max(remaining/p.Rate+delay.Seconds()/2, p.observedDelay()-now.Sub(sentAt).Seconds())
 }
 
 // initialWindowBytes approximates a child transport's initial window (ten
 // segments).
 const initialWindowBytes = 12 << 10
+
+// MinimumRTTWindow is how long a minimum RTT sample stays valid.
+const MinimumRTTWindow = 10 * time.Second
+
+// observedDelay is the send-to-arrival latency recent frames actually saw:
+// smoothed send-to-receipt time less the receipt's return trip. Delivery-rate
+// samples come from bursts and miss what a window-limited or lossy child does
+// to queued data (whole extra round trips); this does not.
+func (p *Path) observedDelay() float64 {
+	if p.SRTT == 0 {
+		return 0
+	}
+	return (p.SRTT - p.MinimumRTT/2).Seconds()
+}
 
 // CompletionTime estimates when a new segment of length bytes would be fully
 // delivered on this path: queued work over the measured delivery rate plus the
@@ -270,5 +289,10 @@ func (p *Path) CompletionTime(length int, provisionalRate float64, provisionalDe
 	if rate <= 0 {
 		rate = 1
 	}
-	return float64(p.Outstanding()+uint64(length))/rate + delay.Seconds()/2
+	estimate := float64(p.Outstanding()+uint64(length))/rate + delay.Seconds()/2
+	if p.Outstanding() > 0 {
+		// Data already queued on this path wait as long as recent frames did.
+		estimate = max(estimate, p.observedDelay())
+	}
+	return estimate
 }

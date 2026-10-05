@@ -391,6 +391,16 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	if chosen == nil || exclusiveSecondary != nil || chosen == best {
 		return chosen
 	}
+	bestRate := best.path.Rate
+	if bestRate <= 0 {
+		bestRate = provisionalRate
+	}
+	// BLEST: the receiver cannot deliver past a segment still on the slower
+	// path, so the window must hold what the best path sends meanwhile, or
+	// the best path stalls behind it. This also bounds probing.
+	if room := c.tx.WindowEnd - min(c.tx.WindowEnd, c.tx.Next+uint64(length)); bestRate*(chosenTime-bestTime) > float64(room) {
+		return nil
+	}
 	pending := c.tx.WriteNext - min(c.tx.Next, c.tx.WriteNext)
 	backlogged := c.writerBacklogged(now) || pending+uint64(c.cfg.FrameSize) > c.unsentLimitLocked()
 	// While the application is backlogged, a slower path keeps up to twice
@@ -403,10 +413,6 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	// bandwidth-delay product, which keeps it busy.
 	probing := backlogged && chosen.path.Outstanding() < max(2*uint64(c.cfg.FrameSize), 2*chosen.path.RecentDelivery(now))
 	if c.tx.HasFIN || !backlogged {
-		bestRate := best.path.Rate
-		if bestRate <= 0 {
-			bestRate = provisionalRate
-		}
 		drain := bestTime + float64(pending-min(pending, uint64(length)))/max(bestRate, 1)
 		if chosenTime > drain+0.002 {
 			return nil
@@ -504,7 +510,7 @@ func (c *mpCore) tailReinjectLocked(now time.Time) (bool, error) {
 			return false, nil
 		}
 		fastArrival := fast.path.CompletionTime(int(length), provisionalRate, provisionalDelay, now)
-		if fastArrival+0.002 >= slow.path.RemainingDelivery(mapping.pathEnd, provisionalDelay) {
+		if fastArrival+0.002 >= slow.path.RemainingDelivery(mapping.pathEnd, mapping.sentAt, provisionalDelay, now) {
 			continue
 		}
 		segment, ok := c.tx.Range(max(mapping.seq, c.tx.Una), int(length))
@@ -670,9 +676,10 @@ func (c *mpCore) repairMappingsLocked(now time.Time) (bool, error) {
 
 // opportunisticLocked implements opportunistic reinjection with penalization
 // (as in MPTCP): when new data are blocked by the receive window or the send
-// history while the connection head waits on a path that has delivered
-// nothing for a whole RTT, idle capacity on another path resends that head in
-// order, and the stuck path takes no new data for one of its RTTs.
+// history while data near the connection head wait on a path that has
+// delivered nothing for a whole RTT, or that would deliver them later than an
+// idle path can now, the idle path resends them in order, and the slow path
+// takes no new data for one of its RTTs.
 func (c *mpCore) opportunisticLocked(now time.Time) (bool, error) {
 	if c.mappingHead >= len(c.mappings) || !c.active.Load() {
 		return false, nil
@@ -689,24 +696,29 @@ func (c *mpCore) opportunisticLocked(now time.Time) (bool, error) {
 		return false, nil
 	}
 	fast := c.bestIdleLegLocked(slow, frame)
-	if fast == nil || fast.path.SRTT == 0 {
+	if fast == nil || fast.path.SRTT == 0 || slow.path.SRTT == 0 {
 		return false, nil
 	}
-	// Only a path that delivered nothing for a whole RTT of its own is holding
-	// the head back; ordinary RTT differences are left to ECF scheduling.
-	if slow.path.SRTT == 0 || now.Sub(slow.path.LastProgress) < max(slow.path.SRTT, 2*fast.path.SRTT) {
-		return false, nil
-	}
+	// A path that delivered nothing for a whole RTT of its own holds the head
+	// back; so does one whose remaining data arrive later than a resend on
+	// the idle path. Ordinary RTT differences are left to ECF scheduling.
+	stuck := now.Sub(slow.path.LastProgress) >= max(slow.path.SRTT, 2*fast.path.SRTT)
+	_, provisionalDelay := c.provisionalLocked()
 	limit := c.tx.Una + uint64(fast.path.Rate*slow.path.SRTT.Seconds())
 	for i := c.mappingHead; i < len(c.mappings) && i < c.mappingHead+64; i++ {
 		mapping := &c.mappings[i]
 		if mapping.seq >= limit && i > c.mappingHead {
 			break
 		}
-		if mapping.path != slow.id || mapping.generation != slow.path.Generation {
+		if mapping.path != slow.id || mapping.generation != slow.path.Generation || mapping.end <= c.tx.Una {
 			continue
 		}
-		if now.Sub(mapping.sentAt) < fast.path.SRTT || !mapping.repairedAt.IsZero() && now.Sub(mapping.repairedAt) < fast.path.SRTT {
+		if !mapping.repairedAt.IsZero() && now.Sub(mapping.repairedAt) < fast.path.SRTT {
+			continue
+		}
+		length := mapping.end - max(mapping.seq, c.tx.Una)
+		late := fast.path.CompletionTime(int(length), 0, provisionalDelay, now)+0.002 < slow.path.RemainingDelivery(mapping.pathEnd, mapping.sentAt, provisionalDelay, now)
+		if !late && (!stuck || now.Sub(mapping.sentAt) < fast.path.SRTT) {
 			continue
 		}
 		segment, ok := c.tx.Range(max(mapping.seq, c.tx.Una), int(mapping.end-max(mapping.seq, c.tx.Una)))
