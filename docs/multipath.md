@@ -57,6 +57,10 @@ After activation each new segment goes to the path expected to deliver it first.
 
 Delivery rate and RTT come from path receipts sent by the far Multipath endpoint, so outstanding bytes include buffering inside a local proxy and its remote transport; finishing a local socket `Write` is not delivery. There are no configured bandwidth weights or rate limits.
 
+- A minimum RTT not seen again within 10 s expires (as in BBR), so a path whose propagation delay grew is estimated with its new delay.
+- Rate samples come from bursts and miss the extra round trips a lossy or window-limited child adds to queued data. For a path with data in flight, the completion estimate is therefore at least the send-to-arrival latency recent frames actually saw (smoothed RTT less the receipt's return trip).
+- BLEST window check: the receiver cannot deliver past a segment still on a slower path, so a slower path takes a segment (probing included) only if the receive window can hold what the best path sends until that segment arrives; otherwise the best path would stall behind it.
+
 - While the application is backlogged (its writes block, or blocked within the last 10 ms), a slower idle path may take a segment that completes within 1.5 times the best path's completion, so that both paths stay busy.
 - Once the application has finished (DATA_FIN queued) or has nothing more for now, the rule is strict ECF: a slower path takes a segment only if it delivers it before the best path could deliver everything pending, so the tail of a transfer does not end up on a slow path.
 - A path without a rate sample borrows the best measured rate and the longest measured delay, and holds at most four frames until its first sample.
@@ -69,7 +73,7 @@ Every resend borrows from the one connection-level send history: it consumes no 
 
 - **Receiver drops**: a receiver that refused data for lack of memory reports up to four dropped ranges in WINDOW feedback (never merged across gaps). The sender repairs a range at most once per RTO and spends at most a quarter of the delivery rate per RTT on repairs.
 - **Failed paths**: when a leg is replaced (new generation) or stalls, its unacknowledged mappings are resent on another usable path.
-- **Opportunistic reinjection with penalty**: when new data are blocked by the receive window or the send history, and the path holding the connection head has delivered nothing for one of its RTTs (and at least twice the fast path's RTT), an idle path resends the data near the head in order, and the stuck path takes no new data for one of its RTTs.
+- **Opportunistic reinjection with penalty**: when new data are blocked by the receive window or the send history, and data near the connection head sit on a path that has delivered nothing for one of its RTTs (and at least twice the fast path's RTT), or that would deliver them later than an idle path could now, the idle path resends them in order and the slow path takes no new data for one of its RTTs.
 - **Tail reinjection**: when nothing new is left to send and data near the head are still queued on a slower or still-starting path that would deliver them later than an idle faster path could now, the faster path sends another copy; whichever arrives first is used. This covers a child connection in slow start holding data for several round trips.
 
 ### Stall detection
