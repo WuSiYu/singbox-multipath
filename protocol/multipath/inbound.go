@@ -54,6 +54,12 @@ type Inbound struct {
 	recoveryClosed bool
 	recoveryCancel context.CancelFunc
 
+	// closed (access) stops new sessions and joins once Close starts;
+	// handshakes (access) are accepted connections still before their hello
+	// response, which Close shuts so none can complete afterwards.
+	closed     bool
+	handshakes map[net.Conn]struct{}
+
 	psk        string
 	allowedIPs []netip.Prefix
 	// Closed session IDs (access) reject delayed creates and joins; seen
@@ -147,16 +153,46 @@ func (i *Inbound) Close() error {
 	}
 	listenerErr := i.listener.Close()
 	i.access.Lock()
+	i.closed = true
 	sessions := make([]*serverSession, 0, len(i.sessions))
 	for _, session := range i.sessions {
 		sessions = append(sessions, session)
 	}
 	i.sessions = make(map[[16]byte]*serverSession)
+	handshakes := make([]net.Conn, 0, len(i.handshakes))
+	for conn := range i.handshakes {
+		handshakes = append(handshakes, conn)
+	}
+	clear(i.handshakes)
 	i.access.Unlock()
+	for _, conn := range handshakes {
+		_ = conn.Close()
+	}
 	for _, session := range sessions {
 		session.core.Close()
 	}
 	return listenerErr
+}
+
+// trackHandshake registers an accepted connection until its hello is
+// answered, or reports false once the inbound is closed.
+func (i *Inbound) trackHandshake(conn net.Conn) bool {
+	i.access.Lock()
+	defer i.access.Unlock()
+	if i.closed {
+		return false
+	}
+	if i.handshakes == nil {
+		i.handshakes = make(map[net.Conn]struct{})
+	}
+	i.handshakes[conn] = struct{}{}
+	return true
+}
+
+func (i *Inbound) untrackHandshake(conn net.Conn) {
+	i.access.Lock()
+	delete(i.handshakes, conn)
+	i.access.Unlock()
 }
 
 func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -164,6 +200,11 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		N.CloseOnHandshakeFailure(conn, onClose, E.New("multipath client ", metadata.Source, " is not in allowed_ips"))
 		return
 	}
+	if !i.trackHandshake(conn) {
+		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
+		return
+	}
+	defer i.untrackHandshake(conn)
 	_ = conn.SetDeadline(time.Now().Add(i.handshakeTimeout))
 	hello, auth, err := readHelloWithAuth(conn)
 	if err != nil {
@@ -186,6 +227,8 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		return
 	}
 	if hello.Control {
+		// Recovery groups own control connections and close them on Close.
+		i.untrackHandshake(conn)
 		i.serveRecoveryControl(conn, hello, onClose)
 		return
 	}
@@ -205,6 +248,11 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 
 	i.access.Lock()
+	if i.closed {
+		i.access.Unlock()
+		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
+		return
+	}
 	session := i.sessions[hello.Session]
 	if session != nil {
 		if session.destination.String() != destination.String() || session.frameSize != hello.FrameSize || session.policy != hello.Policy || session.requestStatus != hello.RequestStatus || session.group != group {
@@ -362,6 +410,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		<-core.released
 		i.removeSession(hello.Session, session)
 	}()
+	i.untrackHandshake(conn)
 	i.router.RouteConnectionEx(ctx, appConn, metadata, logicalOnClose)
 }
 

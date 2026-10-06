@@ -24,6 +24,9 @@ const (
 	recoveryUDPClose  = 4
 )
 
+// recoveryAssemblySlots bounds incomplete datagrams per association.
+const recoveryAssemblySlots = 4
+
 // Recovery UDP is datagram transport, never a reliable MP DATA stream. Small
 // fragments avoid depending on outer IP fragmentation; incomplete packets are
 // discarded without retransmission or head-of-line blocking.
@@ -136,14 +139,19 @@ func (c *recoveryPacketConn) deliver(d recoveryDatagram, now time.Time) {
 		return
 	default:
 	}
-	if d.seq == 0 || c.recent[d.seq%128] == d.seq || (c.highest > 128 && d.seq < c.highest-128) {
+	// recent remembers one sequence per slot, so only the last 128 numbers
+	// can be told apart; highest-128 already shares highest's slot.
+	if d.seq == 0 || c.recent[d.seq%128] == d.seq || (c.highest >= 128 && d.seq <= c.highest-128) {
 		return
 	}
 	c.expireLocked(now)
 	p := c.parts[d.seq]
 	if p == nil {
-		if len(c.parts) >= 4 {
-			return
+		// A datagram that fits one fragment completes at once and needs no
+		// slot. Otherwise the oldest incomplete datagram gives way: one whose
+		// fragment was lost must not block later datagrams until it expires.
+		if len(c.parts) >= recoveryAssemblySlots && (d.offset != 0 || len(d.data) != int(d.total)) {
+			c.evictOldestLocked()
 		}
 		storage := c.memory.tryAcquireOther(max(1, int(d.total)) + 512)
 		if storage == nil {
@@ -179,6 +187,20 @@ func (c *recoveryPacketConn) deliver(d recoveryDatagram, now time.Time) {
 		}
 	default:
 		c.memory.releaseOther(p.data)
+	}
+}
+
+func (c *recoveryPacketConn) evictOldestLocked() {
+	var oldest uint64
+	var found *recoveryAssembly
+	for seq, p := range c.parts {
+		if found == nil || p.at.Before(found.at) || p.at.Equal(found.at) && seq < oldest {
+			oldest, found = seq, p
+		}
+	}
+	if found != nil {
+		c.memory.releaseOther(found.data)
+		delete(c.parts, oldest)
 	}
 }
 

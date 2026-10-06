@@ -236,9 +236,11 @@ func (c *mpCore) feedbackLockedWithoutLegs() flowMessage {
 // allocated only as data arrive and the sender's own history limit keeps
 // in-flight data near twice the path BDP, so a large window costs nothing
 // until used. The share keeps the sum of windows of active sessions within
-// the region, which is what prevents over-commitment and receive drops.
+// the region, which is what prevents over-commitment and receive drops. It
+// never falls below one frame: the peer may send a whole frame before any
+// feedback, and a smaller window would turn that first frame into an error.
 func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
-	return min(uint64(c.cfg.ReceiveWindowBytes), uint64(c.memory.receiveShare(c, now)))
+	return max(uint64(c.cfg.FrameSize), min(uint64(c.cfg.ReceiveWindowBytes), uint64(c.memory.receiveShare(c, now))))
 }
 
 // repairBudgetLocked limits receiver-requested repairs to a quarter of the

@@ -300,6 +300,12 @@ func (r *recoveryClient) runPolicy() {
 	for recoveryWait(r.ctx, 100*time.Millisecond) {
 		now := time.Now()
 		r.mu.Lock()
+		// close() may run between the timer and this lock. It already
+		// closed r.changed, which must not be closed again.
+		if r.closed {
+			r.mu.Unlock()
+			return
+		}
 		for id := range r.health {
 			r.health[id].refresh(now, r.timeout, r.delay)
 		}

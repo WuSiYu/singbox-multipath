@@ -71,6 +71,9 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 	c.tx = stream.NewSender(uint64(cfg.FrameSize))
 	capacity := uint64(cfg.ReceiveWindowBytes)
 	c.rx = stream.NewReceiver(capacity, c)
+	// Accept the peer's first frame even if no feedback precedes it, as when
+	// a session is created by leg1, which sends no startup window.
+	c.rx.Advertise(uint64(cfg.FrameSize))
 	c.txReserve <- budget.takeReservedBuffer(cfg.FrameSize + txHeadroom)
 	app.onClose = c.closeApplication
 	app.onCloseRead = c.closeApplicationRead
