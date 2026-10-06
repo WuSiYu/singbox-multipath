@@ -552,3 +552,47 @@ func TestPathObservedDelayRecovers(t *testing.T) {
 		t.Fatalf("recovered path still looks slow after four samples: %.3f s", got)
 	}
 }
+
+func TestPathRateSurvivesOutage(t *testing.T) {
+	p := Path{Generation: 1}
+	start := time.Unix(1000, 0)
+	_, _ = p.Submitted(100<<20, start)
+	var received, stamp uint64 = 0, 1_000_000
+	for i := 0; i < 100; i++ {
+		received += 50_000
+		stamp += 1000
+		_ = p.Feedback(Receipt{Generation: 1, Next: received, ReceivedAt: stamp}, start.Add(time.Duration(i+10)*time.Millisecond))
+	}
+	rate := p.Rate
+	// Nothing arrives for two seconds; then the path delivers again.
+	received += 100_000
+	stamp += 2_000_000
+	_ = p.Feedback(Receipt{Generation: 1, Next: received, ReceivedAt: stamp}, start.Add(2200*time.Millisecond))
+	if p.Rate < rate/2 {
+		t.Fatalf("outage collapsed the delivery rate: %.0f -> %.0f", rate, p.Rate)
+	}
+	received += 50_000
+	stamp += 1000
+	_ = p.Feedback(Receipt{Generation: 1, Next: received, ReceivedAt: stamp}, start.Add(2201*time.Millisecond))
+	if p.Rate < rate/2 {
+		t.Fatalf("delivery after the outage collapsed the rate: %.0f -> %.0f", rate, p.Rate)
+	}
+}
+
+func TestPathProbeRaisesCollapsedRate(t *testing.T) {
+	p := Path{Generation: 1}
+	start := time.Unix(1000, 0)
+	_, _ = p.Submitted(65536, start)
+	_ = p.Feedback(Receipt{Generation: 1, Next: 65536, ReceivedAt: 1_000_000, FirstNext: 1, FirstReceivedAt: 400_000}, start.Add(10*time.Millisecond))
+	p.Rate = 100_000 // collapsed estimate
+	// One frame at a time: each starts from idle and arrives in one receipt.
+	at := start.Add(100 * time.Millisecond)
+	for i := 0; i < 3; i++ {
+		_, _ = p.Submitted(65536, at)
+		_ = p.Feedback(Receipt{Generation: 1, Next: p.Sent, ReceivedAt: uint64(1_100_000 + i*20_000)}, at.Add(14*time.Millisecond))
+		at = at.Add(20 * time.Millisecond)
+	}
+	if p.Rate < 4_000_000 {
+		t.Fatalf("frames delivered in 14 ms left the rate at %.0f B/s", p.Rate)
+	}
+}

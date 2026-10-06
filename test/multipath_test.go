@@ -326,7 +326,7 @@ func multipathTFOTestOptions(
 			UDPOutbound:      leg0.tag,
 			Server:           "127.0.0.1",
 			ServerPort:       serverPort,
-			TCPFastOpen:      multipathTFO,
+			TCPFastOpen:      common.Ptr(multipathTFO),
 			FrameSize:        multipathMemoryBytes(fmt.Sprint(sharedMultipathOptions.frameSize)),
 			Upload:           option.MultipathDirectionOptions{ActivationAfterBytes: multipathMemoryBytes("1"), ActivationWindow: sharedMultipathOptions.activationWindow, QueueFrames: sharedMultipathOptions.queueFrames},
 			Download:         option.MultipathDirectionOptions{ActivationAfterBytes: multipathMemoryBytes("1"), ActivationWindow: sharedMultipathOptions.activationWindow, QueueFrames: sharedMultipathOptions.queueFrames},

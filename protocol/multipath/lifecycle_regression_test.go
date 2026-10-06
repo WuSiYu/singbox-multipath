@@ -3,6 +3,7 @@ package multipath
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -258,5 +259,56 @@ func TestRecoveryUDPDuplicateAtWindowBoundary(t *testing.T) {
 	c.deliver(d, now)
 	if len(c.queue) != 0 {
 		t.Fatal("datagram 2 was delivered twice")
+	}
+}
+
+// When leg0 cannot reach the server (or failover marks it unavailable), the
+// session is created on leg1. With early write, that leg sends its hello with
+// the first data and must carry data before the server answers.
+func TestEarlyWriteSessionCreatedOnLeg1(t *testing.T) {
+	cfg := testCoreConfig()
+	clientCore, clientApp := newCore(context.Background(), cfg)
+	serverCore, _ := newCore(context.Background(), cfg)
+	defer clientCore.Close()
+	defer serverCore.Close()
+
+	clientWire, serverWire := net.Pipe()
+	defer serverWire.Close()
+	_ = serverWire.SetDeadline(time.Now().Add(5 * time.Second))
+	message := helloMessage{Session: [16]byte{1}, LegID: 1, FrameSize: uint32(cfg.FrameSize), Destination: "example.com:443", Create: true}
+	fastOpenConn, err := newClientFastOpenConn(clientWire, message, time.Now().Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readResponse := func(conn net.Conn) error {
+		if err := fastOpenConn.waitStarted(); err != nil {
+			return err
+		}
+		if _, err := readHelloResponse(conn); err != nil {
+			return err
+		}
+		return conn.SetDeadline(time.Time{})
+	}
+	if _, err = clientCore.addLegWithReadPreamble(1, fastOpenConn, nil, readResponse); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("first bytes on leg1")
+	if _, err = clientApp.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	received, err := readHello(serverWire)
+	if err != nil {
+		t.Fatal("hello was not sent with the first data: ", err)
+	}
+	if received != message {
+		t.Fatal("unexpected hello")
+	}
+	// The creating leg announces the client's receive window first.
+	frame, err := readStartupDataFrame(serverWire, serverCore)
+	if err == nil && (frame.typ != frameTypeData || !bytes.Equal(frame.data, payload)) {
+		err = errors.New("unexpected early data frame")
+	}
+	if err != nil {
+		t.Fatal(err)
 	}
 }

@@ -65,7 +65,7 @@ Delivery rate and RTT come from path receipts sent by the far Multipath endpoint
 - Once the application has finished (DATA_FIN queued) or has nothing more for now, the rule is strict ECF: a slower path takes a segment only if it delivers it before the best path could deliver everything pending, so the tail of a transfer does not end up on a slow path.
 - A path without a rate sample borrows the best measured rate and the longest measured delay, and holds at most four frames until its first sample.
 - While the application is backlogged, a slower path may always keep twice what it delivered in its last propagation round trip (at least two frames) in flight, regardless of its estimate. Otherwise a late-joining or recovering path would have its estimate held down by the scheduler's own restraint and never show its capacity. This grows its in-flight data per round trip like the child's own slow start, up to about twice its bandwidth-delay product.
-- A path idle for `max(2 × SRTT, 100 ms)` is probed with an optimistic rate, and the first receipt after an idle period starts a new rate sample instead of averaging over the gap.
+- A path idle for `max(2 × SRTT, 100 ms)` is probed with an optimistic rate, and the first receipt after an idle period, or after an outage that delivered nothing for at least a second (and an RTO), starts a new rate sample instead of averaging over the gap. Such a receipt still raises the rate to at least its bytes over their send-to-receipt time, so a path probed one frame at a time after its estimate collapsed is measured again.
 
 ### Repair and reinjection
 

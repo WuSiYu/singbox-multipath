@@ -34,10 +34,12 @@ func (p *recoveryPolicy) update(epoch uint64, mask, udp byte) bool {
 	return true
 }
 
-// usableLeg reports whether leg can carry new data now. Leg0 may carry the
-// first bytes of a lazy fast-open session before its hello is answered.
+// usableLeg reports whether leg can carry new data now. A leg still waiting
+// for its hello response qualifies only if that hello creates the session
+// with early write: it is sent with the first data, on leg0 or, when leg0
+// cannot reach the server, on leg1.
 func (c *mpCore) usableLeg(leg *mpLeg) bool {
-	return leg != nil && (leg.id == 0 || leg.ready.Load()) && !leg.path.Stale &&
+	return leg != nil && (leg.ready.Load() || leg.readPreamble != nil) && !leg.path.Stale &&
 		(c.cfg.Recovery == nil || c.cfg.Recovery.allows(leg.id))
 }
 

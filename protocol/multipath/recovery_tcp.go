@@ -130,7 +130,12 @@ func (o *Outbound) dialSession(ctx context.Context, destination M.Socksaddr) (ne
 		}
 		return nil, err
 	}
-	if _, err = core.addLegWithReadPreamble(id, conn, nil, preamble); err != nil {
+	if !o.trackSession(core) {
+		err = net.ErrClosed
+	} else {
+		_, err = core.addLegWithReadPreamble(id, conn, nil, preamble)
+	}
+	if err != nil {
 		core.Close()
 		conn.Close()
 		if lazyCancel != nil {

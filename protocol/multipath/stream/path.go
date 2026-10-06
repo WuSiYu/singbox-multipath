@@ -81,6 +81,18 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 		return nil
 	}
 	p.rollWindow(now)
+	// After an outage (nothing delivered for an RTO, and at least a second,
+	// although data were outstanding) the first receipt spans the outage.
+	// Delivery averaged over it says nothing about capacity and would
+	// collapse the estimate, so it only re-anchors the sample, as after an
+	// idle period. Shorter stalls, such as loss recovery on a lossy path,
+	// are part of its delivery rate.
+	if p.sampleTime != 0 && receipt.ReceivedAt > p.sampleTime &&
+		time.Duration(receipt.ReceivedAt-p.sampleTime)*time.Microsecond >= max(p.RTO(0), time.Second) {
+		p.restart = true
+	}
+	restarted := p.restart
+	previous := p.Received
 	p.Received = receipt.Next
 	p.LastProgress = now
 	p.Stale = false
@@ -114,14 +126,25 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 	// Use the last fully received mapping, avoiding the oldest mapping's extra
 	// wait inside a coalesced acknowledgement. Queueing is still part of this
 	// end-to-end delivery sample; a local Write is never used as an RTT sample.
-	var sent time.Time
+	var sent, firstSent time.Time
 	for p.head < len(p.flights) && p.flights[p.head].End <= receipt.Next {
 		sent = p.flights[p.head].SentAt
+		if firstSent.IsZero() {
+			firstSent = sent
+		}
 		if p.ReleaseFlight != nil {
 			p.ReleaseFlight(p.flights[p.head].Prepaid)
 		}
 		p.flights[p.head] = Flight{}
 		p.head++
+	}
+	// A re-anchored receipt gives no rate sample, but the bytes it covers
+	// arrived within their send-to-receipt time, which bounds the rate from
+	// below. Without this, a path probed one frame at a time after its
+	// estimate collapsed would never be measured again: each frame starts
+	// from idle, and a frame delivered in one receipt yields no sample.
+	if restarted && !firstSent.IsZero() && now.After(firstSent) {
+		p.Rate = max(p.Rate, float64(receipt.Next-previous)/now.Sub(firstSent).Seconds())
 	}
 	if !sent.IsZero() && now.After(sent) {
 		rtt := now.Sub(sent)

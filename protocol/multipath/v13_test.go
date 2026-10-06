@@ -131,6 +131,7 @@ func TestPreferredDataLegFallsBackToLeg1(t *testing.T) {
 	core, _ := newCore(context.Background(), testCoreConfig())
 	defer core.Close()
 	primary, secondary := &mpLeg{id: 0}, &mpLeg{id: 1}
+	primary.ready.Store(true)
 	secondary.ready.Store(true)
 	core.stateMu.Lock()
 	defer core.stateMu.Unlock()

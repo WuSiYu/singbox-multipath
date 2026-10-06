@@ -179,8 +179,11 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 			c.memory.releaseSession(128)
 		}
 	}
+	// The leg that creates the session announces the receive window at once,
+	// whichever leg it is; so does every leg that may carry control.
+	creates := len(c.legs) == 0
 	c.legs[id] = leg
-	if id == 0 || c.cfg.Recovery != nil {
+	if id == 0 || creates || c.cfg.Recovery != nil {
 		initial := wireFrame{typ: frameTypeWindow, flow: c.feedbackLockedWithoutLegs()}
 		if early, ok := conn.(*clientFastOpenConn); ok {
 			early.initialWindow = encodeFlow(initial)

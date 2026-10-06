@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,12 @@ type Outbound struct {
 	recovery         *recoveryClient
 	psk              string
 	legAttempts      [2]atomic.Uint64
+
+	// Sessions outlive the loss of their legs, so Close ends them itself
+	// instead of leaving them to redial through closed children.
+	sessionsMu sync.Mutex
+	sessions   map[*mpCore]struct{}
+	closed     bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathOutboundOptions) (adapter.Outbound, error) {
@@ -194,10 +201,41 @@ func (o *Outbound) Start() error {
 
 func (o *Outbound) Close() error {
 	o.cfg.Memory.stopLogging()
+	o.sessionsMu.Lock()
+	o.closed = true
+	sessions := make([]*mpCore, 0, len(o.sessions))
+	for core := range o.sessions {
+		sessions = append(sessions, core)
+	}
+	o.sessionsMu.Unlock()
+	for _, core := range sessions {
+		core.Close()
+	}
 	if o.recovery != nil {
 		o.recovery.close()
 	}
 	return o.status.close()
+}
+
+// trackSession registers a live session until it is released, or reports
+// false once the outbound is closed.
+func (o *Outbound) trackSession(core *mpCore) bool {
+	o.sessionsMu.Lock()
+	defer o.sessionsMu.Unlock()
+	if o.closed {
+		return false
+	}
+	if o.sessions == nil {
+		o.sessions = make(map[*mpCore]struct{})
+	}
+	o.sessions[core] = struct{}{}
+	go func() {
+		<-core.released
+		o.sessionsMu.Lock()
+		delete(o.sessions, core)
+		o.sessionsMu.Unlock()
+	}()
+	return true
 }
 
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
