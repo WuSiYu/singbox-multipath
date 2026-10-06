@@ -431,13 +431,17 @@ func (b *memoryBudget) rxRelease(size int64) {
 	b.access.Unlock()
 }
 
-// receiveShare marks key as an active receiver and returns its fair window
-// share in payload bytes.
-func (b *memoryBudget) receiveShare(key any, now time.Time) int64 {
+// receiveShare returns key's fair window share in payload bytes, and marks key
+// as an active receiver when it is receiving data. A session that only sends
+// feedback for an idle direction is not active: counting it would reserve
+// half of the node's pool for receiving and halve the transmit region.
+func (b *memoryBudget) receiveShare(key any, now time.Time, active bool) int64 {
 	b.access.Lock()
 	defer b.access.Unlock()
 	nanos := now.UnixNano()
-	b.receivers.mark(key, nanos)
+	if active {
+		b.receivers.mark(key, nanos)
+	}
 	if b.pressure {
 		// Stored data already exceed the pool: grow no window beyond the
 		// floor until applications drain it.

@@ -9,6 +9,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 )
 
 func TestHelloAuthentication(t *testing.T) {
@@ -198,5 +200,49 @@ func TestFeedbackMergeAcrossLegs(t *testing.T) {
 	core.stateMu.Unlock()
 	if window != 4096 || !pressure {
 		t.Fatalf("stale feedback overrode newer state: window=%d pressure=%v", window, pressure)
+	}
+}
+
+// While the application is backlogged, a slower path whose completion is far
+// behind (a lossy QUIC child with data waiting for retransmissions) still
+// takes data when the faster one is busy, within the window and skew limits.
+func TestBackloggedSlowerPathKeepsCarrying(t *testing.T) {
+	core, _ := newCore(context.Background(), testCoreConfig())
+	defer core.Close()
+	core.active.Store(true)
+	core.writerWaiting.Store(true)
+	fast, slow := &mpLeg{id: 0}, &mpLeg{id: 1}
+	fast.ready.Store(true)
+	slow.ready.Store(true)
+	fast.busy = true
+	fast.path = stream.Path{Rate: 100e6, SRTT: 40 * time.Millisecond, MinimumRTT: 40 * time.Millisecond, Sent: 8 << 20}
+	slow.path = stream.Path{Rate: 45e6, SRTT: 220 * time.Millisecond, MinimumRTT: 57 * time.Millisecond, Sent: 12 << 20}
+	core.stateMu.Lock()
+	defer core.stateMu.Unlock()
+	core.tx.WindowEnd = 1 << 30
+	core.legsMu.Lock()
+	core.legs[0], core.legs[1] = fast, slow
+	core.legsMu.Unlock()
+	defer func() {
+		core.legsMu.Lock()
+		clear(core.legs)
+		core.legsMu.Unlock()
+	}()
+	// Completion 0.30 s against 0.10 s: three times the best path, but the
+	// segment arrives about 0.2 s later, within eight 57 ms round trips.
+	if got := core.choosePathLocked(65536); got != slow {
+		t.Fatal("backlogged slower path was starved")
+	}
+	// The same backlog on a 10 ms path is seconds of queue for it.
+	slow.path.MinimumRTT, slow.path.SRTT = 10*time.Millisecond, 10*time.Millisecond
+	if got := core.choosePathLocked(65536); got != nil {
+		t.Fatal("slower path took data beyond the skew limit")
+	}
+	// Without a backlog the tail rule stays strict.
+	slow.path.MinimumRTT, slow.path.SRTT = 57*time.Millisecond, 220*time.Millisecond
+	core.writerWaiting.Store(false)
+	core.writerReleasedAt.Store(0)
+	if got := core.choosePathLocked(65536); got != nil {
+		t.Fatal("idle application handed the tail to a slower path")
 	}
 }

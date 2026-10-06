@@ -195,10 +195,20 @@ func TestMemoryRegionsCannotStarveEachOther(t *testing.T) {
 		budget.releaseTX(buffer)
 	}
 	budget.rxRelease(budget.snapshot().RXBytes)
-	// With active sessions in both directions each side keeps half.
+	// A session that only sends feedback for an idle receive direction does
+	// not reserve receive memory: transmit keeps the whole region.
 	now := time.Now()
 	budget.transmitShare("sender", now)
-	budget.receiveShare("receiver", now)
+	budget.receiveShare("receiver", now, false)
+	held = fillTX()
+	if tx := budget.snapshot().TXBytes; tx < pool-pool/8-pool/16-(128<<10) {
+		t.Fatalf("idle receiver halved transmit: %d of %d", tx, pool)
+	}
+	for _, buffer := range held {
+		budget.releaseTX(buffer)
+	}
+	// With active sessions in both directions each side keeps half.
+	budget.receiveShare("receiver", now, true)
 	held = fillTX()
 	if tx := budget.snapshot().TXBytes; tx > pool/2 || tx < pool/2-pool/16-(128<<10) {
 		t.Fatalf("transmit took %d of %d with both directions active", tx, pool)

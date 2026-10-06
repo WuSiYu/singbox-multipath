@@ -45,11 +45,6 @@ type Path struct {
 	// restart marks that the path went idle: the next receipt starts a new
 	// rate sample instead of averaging delivery over the idle gap.
 	restart bool
-	// Bytes delivered per round trip: the previous complete window and the
-	// start of the current one.
-	windowStart time.Time
-	windowBase  uint64
-	recentBytes uint64
 }
 
 func (p *Path) Outstanding() uint64 { return p.Sent - p.Received }
@@ -80,7 +75,6 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 	if receipt.Next <= p.Received {
 		return nil
 	}
-	p.rollWindow(now)
 	// After an outage (nothing delivered for an RTO, and at least a second,
 	// although data were outstanding) the first receipt spans the outage.
 	// Delivery averaged over it says nothing about capacity and would
@@ -218,38 +212,6 @@ func (p *Path) Pipeline(initial, maximum uint64) uint64 {
 	// derived from reliable-stream delivery would throttle QUIC twice and
 	// mistake in-order loss-recovery bursts for a physical congestion window.
 	return maximum
-}
-
-// RecentDelivery returns the bytes this path delivered in about its last
-// round trip: the larger of the previous window and the current one so far.
-func (p *Path) RecentDelivery(now time.Time) uint64 {
-	p.rollWindow(now)
-	return max(p.recentBytes, p.Received-p.windowBase)
-}
-
-// rollWindow closes the delivery window after one propagation round trip.
-// Smoothed RTT would include queueing that this window itself causes, so
-// windows (and the in-flight data sized from them) would grow without bound.
-// A window that saw no delivery for a whole extra round trip leaves nothing.
-func (p *Path) rollWindow(now time.Time) {
-	length := p.MinimumRTT
-	if length == 0 {
-		length = p.SRTT
-	}
-	length = max(length, 10*time.Millisecond)
-	if p.windowStart.IsZero() {
-		p.windowStart, p.windowBase = now, p.Received
-		return
-	}
-	elapsed := now.Sub(p.windowStart)
-	if elapsed < length {
-		return
-	}
-	p.recentBytes = p.Received - p.windowBase
-	if elapsed >= 2*length {
-		p.recentBytes = 0
-	}
-	p.windowStart, p.windowBase = now, p.Received
 }
 
 // RemainingDelivery estimates the seconds until this path delivers its bytes

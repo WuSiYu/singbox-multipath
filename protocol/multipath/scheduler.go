@@ -240,7 +240,12 @@ func (c *mpCore) feedbackLockedWithoutLegs() flowMessage {
 // never falls below one frame: the peer may send a whole frame before any
 // feedback, and a smaller window would turn that first frame into an error.
 func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
-	return max(uint64(c.cfg.FrameSize), min(uint64(c.cfg.ReceiveWindowBytes), uint64(c.memory.receiveShare(c, now))))
+	// Receiving means data arrived since the last feedback or still wait to
+	// be read; periodic feedback for an idle direction does not count.
+	buffered, _, _ := c.rx.Buffered()
+	active := c.rx.MaxSeen != c.receivedSeen || buffered > 0
+	c.receivedSeen = c.rx.MaxSeen
+	return max(uint64(c.cfg.FrameSize), min(uint64(c.cfg.ReceiveWindowBytes), uint64(c.memory.receiveShare(c, now, active))))
 }
 
 // repairBudgetLocked limits receiver-requested repairs to a quarter of the
@@ -321,21 +326,25 @@ func (c *mpCore) initialPipeline() uint64 {
 	return min(uint64(c.cfg.QueueBytes), uint64(c.cfg.FrameSize)*4)
 }
 
-// ecfSlack bounds how much later than the best path a segment may complete
-// when it is handed to a slower path that happens to be idle, while the
-// application keeps the connection backlogged.
-const ecfSlack = 1.5
+// maxSkewRTTs bounds, in the slower path's propagation round trips, how much
+// later than the best path a segment handed to it may arrive.
+const maxSkewRTTs = 8
 
 // choosePathLocked implements earliest-completion-first scheduling (ECF, as in
 // BLEST and Linux MPTCP's linger-time rule): each path's completion time is
 // its queued work over its delivery rate plus its one-way delay. The best
-// available path is used, but a slower path only while its completion time
-// stays within ecfSlack of the best path overall; otherwise new data waits for
-// the faster path instead of queueing behind a slow one and blocking in-order
-// delivery. Once the application has finished (DATA_FIN queued) or handed
-// over everything it has for now, the rule is strict ECF: a slower path only
-// takes a segment it delivers before the best path could deliver all pending
-// data, so the tail of a transfer is not left on a slow or starting path.
+// available path is used. While the application keeps the connection
+// backlogged, a slower path that is free takes data too, as long as the
+// receive window can hold what the best path delivers before the slower
+// segment arrives (BLEST) and the segment arrives within maxSkewRTTs of the
+// slower path's round trips after the best path's; every path then stays
+// busy, as with MPTCP's default scheduler. A lossy or high-latency path is not
+// starved because its completion estimate is far behind: data waiting there
+// for retransmissions delay in-order delivery only within those bounds. Once
+// the application has finished (DATA_FIN queued) or handed over everything it
+// has for now, the rule is strict ECF: a slower path only takes a segment it
+// delivers before the best path could deliver all pending data, so the tail
+// of a transfer is not left on a slow or starting path.
 func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	legs := c.availableLegs()
 	provisionalRate, provisionalDelay := c.provisionalLocked()
@@ -399,29 +408,30 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	}
 	// BLEST: the receiver cannot deliver past a segment still on the slower
 	// path, so the window must hold what the best path sends meanwhile, or
-	// the best path stalls behind it. This also bounds probing.
+	// the best path stalls behind it.
 	if room := c.tx.WindowEnd - min(c.tx.WindowEnd, c.tx.Next+uint64(length)); bestRate*(chosenTime-bestTime) > float64(room) {
+		return nil
+	}
+	// A large window alone would let a slower path hold seconds of data, as
+	// in the send buffer of a TCP child whose window collapsed after loss,
+	// stalling in-order delivery that long. The segment may arrive at most
+	// maxSkewRTTs of the slower path's own round trips after the best path
+	// could deliver it: enough for a lossy QUIC child, whose data wait a few
+	// round trips for retransmissions while it still has capacity to spare.
+	rtt := chosen.path.MinimumRTT
+	if rtt == 0 {
+		rtt = max(chosen.path.SRTT, provisionalDelay)
+	}
+	if chosenTime-bestTime > maxSkewRTTs*rtt.Seconds() {
 		return nil
 	}
 	pending := c.tx.WriteNext - min(c.tx.Next, c.tx.WriteNext)
 	backlogged := c.writerBacklogged(now) || pending+uint64(c.cfg.FrameSize) > c.unsentLimitLocked()
-	// While the application is backlogged, a slower path keeps up to twice
-	// what it delivered in its last round trip (at least two frames) in
-	// flight regardless of its estimate. Its delivery-rate estimate would
-	// otherwise be capped by the scheduler's own restraint (an application-
-	// limited sample): a path that joins late, or recovers from a degradation,
-	// would never show its capacity. This grows its in-flight data
-	// geometrically, like the child's own slow start, up to twice its
-	// bandwidth-delay product, which keeps it busy.
-	probing := backlogged && chosen.path.Outstanding() < max(2*uint64(c.cfg.FrameSize), 2*chosen.path.RecentDelivery(now))
 	if c.tx.HasFIN || !backlogged {
 		drain := bestTime + float64(pending-min(pending, uint64(length)))/max(bestRate, 1)
 		if chosenTime > drain+0.002 {
 			return nil
 		}
-	}
-	if !probing && chosenTime > max(bestTime*ecfSlack, bestTime+0.002) {
-		return nil
 	}
 	return chosen
 }
@@ -731,9 +741,17 @@ func (c *mpCore) opportunisticLocked(now time.Time) (bool, error) {
 			return false, err
 		}
 		// The original copy stays in flight on the slow path; whichever
-		// arrives first is used. Only the repair time is recorded.
+		// arrives first is used. Only the repair time is recorded. The slow
+		// path takes no new data for one of its RTTs: its smoothed RTT if it
+		// stopped delivering, otherwise its propagation RTT. A lossy path's
+		// smoothed RTT includes its retransmission waits, and idling it that
+		// long would leave its capacity unused.
 		mapping.repairedAt = now
-		slow.penaltyUntil = now.Add(slow.path.SRTT)
+		penalty := slow.path.SRTT
+		if !stuck && slow.path.MinimumRTT > 0 {
+			penalty = slow.path.MinimumRTT
+		}
+		slow.penaltyUntil = now.Add(penalty)
 		c.opportunisticE.Add(1)
 		c.fallbackB.Add(uint64(segment.Length))
 		c.fallbackF.Add(1)

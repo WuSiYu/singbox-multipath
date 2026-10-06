@@ -441,37 +441,6 @@ func TestBufferHeadroom(t *testing.T) {
 	}
 }
 
-func TestPathRecentDelivery(t *testing.T) {
-	start := time.Unix(100, 0)
-	p := Path{Generation: 1, SRTT: 50 * time.Millisecond, MinimumRTT: 50 * time.Millisecond}
-	if got := p.RecentDelivery(start); got != 0 {
-		t.Fatalf("fresh path delivered %d", got)
-	}
-	for range 4 {
-		_, _ = p.Submitted(64<<10, start)
-	}
-	at := func(ms int, next uint64) uint64 {
-		now := start.Add(time.Duration(ms) * time.Millisecond)
-		_ = p.Feedback(Receipt{Generation: 1, Next: next}, now)
-		return p.RecentDelivery(now)
-	}
-	if got := at(50, 64<<10); got != 64<<10 {
-		t.Fatalf("first window: %d", got)
-	}
-	if got := at(75, 128<<10); got != 128<<10 {
-		t.Fatalf("growing window: %d", got)
-	}
-	// One round trip later the window closes; the larger of the closed
-	// window and the new one counts.
-	if got := at(100, 256<<10); got != 128<<10 {
-		t.Fatalf("closed window: %d", got)
-	}
-	// Two silent round trips leave nothing recent, as after an idle period.
-	if got := p.RecentDelivery(start.Add(300 * time.Millisecond)); got != 0 {
-		t.Fatalf("idle path still reports %d", got)
-	}
-}
-
 func TestPathRemainingDelivery(t *testing.T) {
 	cold := Path{Generation: 1}
 	_, _ = cold.Submitted(128<<10, time.Now())
