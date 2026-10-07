@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -35,6 +36,9 @@ type serverSession struct {
 	requestStatus bool
 	core          *mpCore
 	appConn       net.Conn
+	// tombstone (Inbound.access): the closed-session record reserved at
+	// admission, so that the ID is remembered even when memory is short.
+	tombstone bool
 }
 
 type Inbound struct {
@@ -73,6 +77,7 @@ const (
 	closedSessionRetention = 2 * time.Minute
 	closedSessionCharge    = 128
 	maxHelloNonces         = 1 << 16
+	nonceCharge            = 64 // budget charge of one remembered hello nonce
 )
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathInboundOptions) (adapter.Inbound, error) {
@@ -102,7 +107,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		handshakeTimeout: handshakeTimeout,
 		recoveryGroups:   make(map[[16]byte]*recoveryServerGroup),
 		psk:              options.PSK,
-		allowedIPs:       options.AllowedIPs,
+		allowedIPs:       allowedPrefixes(options.AllowedIPs),
 		closedSessions:   make(map[[16]byte]time.Time),
 		nonces:           make(map[[16]byte]time.Time),
 		cfg:              coreConfig{Memory: memory, HandshakeTimeout: handshakeTimeout}}
@@ -327,11 +332,20 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			" ", info.String(),
 		)
 	}
+	// Reserve the closed-session record now: a client that missed this
+	// reply may retry Create with the same ID, which must be refused even if
+	// memory is short when the session ends.
+	if !i.cfg.Memory.reservePage(closedSessionCharge, true) {
+		i.access.Unlock()
+		i.rejectHello(conn, onClose, helloRejectLegUnavailable, errMemoryLimit)
+		return
+	}
 	if group != nil {
 		group.mu.Lock()
 		if group.closed || !i.cfg.Memory.reservePage(128, true) {
 			group.mu.Unlock()
 			i.access.Unlock()
+			i.cfg.Memory.releaseSession(closedSessionCharge)
 			i.rejectHello(conn, onClose, helloRejectLegUnavailable, errMemoryLimit)
 			return
 		}
@@ -348,6 +362,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			group.mu.Unlock()
 		}
 		i.access.Unlock()
+		i.cfg.Memory.releaseSession(closedSessionCharge)
 		i.rejectHello(conn, onClose, helloRejectLegUnavailable, E.Cause(err, "create multipath session"))
 		return
 	}
@@ -360,10 +375,12 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		requestStatus: hello.RequestStatus,
 		core:          core,
 		appConn:       appConn,
+		tombstone:     true,
 	}
 	if err = core.reserveLeg(hello.LegID); err != nil {
 		i.access.Unlock()
 		appConn.Close()
+		i.cfg.Memory.releaseSession(closedSessionCharge)
 		i.rejectHello(conn, onClose, helloRejectLegUnavailable, err)
 		return
 	}
@@ -426,9 +443,14 @@ func (i *Inbound) removeSession(id [16]byte, session *serverSession) {
 		if i.closedSessions == nil {
 			i.closedSessions = make(map[[16]byte]time.Time)
 		}
-		if _, exists := i.closedSessions[id]; !exists && i.cfg.Memory.reservePage(closedSessionCharge, true) {
+		if _, exists := i.closedSessions[id]; exists {
+			if session.tombstone {
+				i.cfg.Memory.releaseSession(closedSessionCharge)
+			}
+		} else if session.tombstone || i.cfg.Memory.reservePage(closedSessionCharge, true) {
 			i.closedSessions[id] = time.Now()
 		}
+		session.tombstone = false
 		if session.group != nil {
 			session.group.mu.Lock()
 			if session.recoveryEntry != nil {
@@ -444,6 +466,15 @@ func (i *Inbound) removeSession(id [16]byte, session *serverSession) {
 	i.access.Unlock()
 }
 
+// allowedPrefixes accepts prefixes and single addresses (a /32 or /128).
+func allowedPrefixes(values []badoption.Prefixable) []netip.Prefix {
+	prefixes := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		prefixes = append(prefixes, netip.Prefix(value))
+	}
+	return prefixes
+}
+
 func (i *Inbound) sourceAllowed(source M.Socksaddr) bool {
 	if len(i.allowedIPs) == 0 {
 		return true
@@ -457,30 +488,38 @@ func (i *Inbound) sourceAllowed(source M.Socksaddr) bool {
 	return false
 }
 
-// rememberNonce records a hello nonce; it reports false for a replay.
-func (i *Inbound) rememberNonce(nonce [16]byte, now time.Time) bool {
+var (
+	errHelloReplayed     = errors.New("multipath hello replayed")
+	errHelloNonceStorage = errors.New("multipath hello nonce cannot be recorded within the memory limit")
+)
+
+// rememberNonce records a hello nonce for the replay window. Each entry is
+// charged to the memory budget; a nonce that cannot be recorded is refused
+// like a replay, never accepted unrecorded.
+func (i *Inbound) rememberNonce(nonce [16]byte, now time.Time) error {
 	i.nonceMu.Lock()
 	defer i.nonceMu.Unlock()
 	if i.nonces == nil {
 		i.nonces = make(map[[16]byte]time.Time)
 	}
 	if _, seen := i.nonces[nonce]; seen {
-		return false
+		return errHelloReplayed
 	}
 	if len(i.nonces) >= maxHelloNonces {
 		i.pruneNoncesLocked(now)
-		if len(i.nonces) >= maxHelloNonces {
-			return false
-		}
+	}
+	if len(i.nonces) >= maxHelloNonces || !i.cfg.Memory.reservePage(nonceCharge, false) {
+		return errHelloNonceStorage
 	}
 	i.nonces[nonce] = now
-	return true
+	return nil
 }
 
 func (i *Inbound) pruneNoncesLocked(now time.Time) {
 	for nonce, at := range i.nonces {
 		if now.Sub(at) >= 2*helloAuthSkew {
 			delete(i.nonces, nonce)
+			i.cfg.Memory.releaseSession(nonceCharge)
 		}
 	}
 }

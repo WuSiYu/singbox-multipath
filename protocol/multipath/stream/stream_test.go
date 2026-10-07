@@ -565,3 +565,27 @@ func TestPathProbeRaisesCollapsedRate(t *testing.T) {
 		t.Fatalf("frames delivered in 14 ms left the rate at %.0f B/s", p.Rate)
 	}
 }
+
+// Partial repairs inside a dropped range split it; the set keeps its bound and
+// the lowest gaps.
+func TestDroppedRangeSplitsStayBounded(t *testing.T) {
+	memory := &testMemory{limit: 0}
+	r := NewReceiver(PageSize, memory)
+	defer r.Close()
+	if accepted, err := r.Insert(0, make([]byte, PageSize)); err != nil || accepted != 0 {
+		t.Fatalf("initial drop: accepted=%d err=%v", accepted, err)
+	}
+	memory.limit = 1
+	for seq := uint64(1); seq < 128; seq += 2 {
+		if accepted, err := r.Insert(seq, []byte{42}); err != nil || accepted != 1 {
+			t.Fatalf("repair %d: accepted=%d err=%v", seq, accepted, err)
+		}
+	}
+	ranges := r.DroppedRanges(1000, math.MaxUint64)
+	if len(ranges) > maxDroppedRanges {
+		t.Fatalf("dropped-range set grew to %d entries", len(ranges))
+	}
+	if ranges[0] != (Range{0, 1}) {
+		t.Fatalf("lowest gap not kept: %+v", ranges[0])
+	}
+}

@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -235,5 +237,23 @@ func TestAllowedIPsFilterRecoveryUDP(t *testing.T) {
 	i.NewPacket(buf.As(append([]byte(nil), datagram...)), M.ParseSocksaddr("198.51.100.7:4000"))
 	if g.lastSeen.IsZero() {
 		t.Fatal("datagram from an allowed source was dropped")
+	}
+}
+
+// allowed_ips accepts single addresses as well as prefixes.
+func TestAllowedIPsAcceptSingleAddresses(t *testing.T) {
+	var options option.MultipathInboundOptions
+	if err := json.Unmarshal([]byte(`{"allowed_ips":["192.0.2.1","2001:db8::1","198.51.100.0/24"]}`), &options); err != nil {
+		t.Fatal(err)
+	}
+	prefixes := allowedPrefixes(options.AllowedIPs)
+	want := []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32"), netip.MustParsePrefix("2001:db8::1/128"), netip.MustParsePrefix("198.51.100.0/24")}
+	if len(prefixes) != len(want) {
+		t.Fatalf("parsed %v", prefixes)
+	}
+	for index := range want {
+		if prefixes[index] != want[index] {
+			t.Fatalf("parsed %v, want %v", prefixes, want)
+		}
 	}
 }

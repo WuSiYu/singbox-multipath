@@ -196,18 +196,7 @@ func (c *earlyLogicalConn) Write(payload []byte) (int, error) {
 			return 0, os.ErrDeadlineExceeded
 		default:
 		}
-		c.helloOnce.Do(func() {
-			c.core.startWorkers(func() {
-				if err := c.primary.writeHelloOnly(); err != nil {
-					// The session can still be created on the other leg.
-					for _, leg := range c.core.availableLegs() {
-						if leg.conn == c.primary {
-							c.core.legFailed(leg, legFailureHandshake, err)
-						}
-					}
-				}
-			})
-		})
+		c.startHello()
 		return 0, c.waitInitialWrite()
 	}
 	pending := c.primary.NeedHandshakeForWrite()
@@ -218,6 +207,22 @@ func (c *earlyLogicalConn) Write(payload []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// startHello sends the pending hello without payload, once.
+func (c *earlyLogicalConn) startHello() {
+	c.helloOnce.Do(func() {
+		c.core.startWorkers(func() {
+			if err := c.primary.writeHelloOnly(); err != nil {
+				// The session can still be created on the other leg.
+				for _, leg := range c.core.availableLegs() {
+					if leg.conn == c.primary {
+						c.core.legFailed(leg, legFailureHandshake, err)
+					}
+				}
+			}
+		})
+	})
 }
 
 func (c *earlyLogicalConn) waitInitialWrite() error {
@@ -244,8 +249,14 @@ func (c *earlyLogicalConn) CloseRead() error {
 	return N.CloseRead(c.Conn)
 }
 
+// CloseWrite before any payload still has to reach the server: DATA_FIN
+// needs a ready leg, and the leg becomes ready only after its hello.
 func (c *earlyLogicalConn) CloseWrite() error {
-	return N.CloseWrite(c.Conn)
+	err := N.CloseWrite(c.Conn)
+	if c.primary.NeedHandshakeForWrite() {
+		c.startHello()
+	}
+	return err
 }
 
 func (c *earlyLogicalConn) Upstream() any {

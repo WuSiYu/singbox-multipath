@@ -1,8 +1,6 @@
 package option
 
 import (
-	"net/netip"
-
 	"github.com/sagernet/sing/common/byteformats"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -69,9 +67,9 @@ type MultipathOutboundOptions struct {
 
 type MultipathInboundOptions struct {
 	ListenOptions
-	MemoryLimit      *byteformats.MemoryBytes         `json:"memory_limit,omitempty"`
-	HandshakeTimeout badoption.Duration               `json:"handshake_timeout,omitempty"`
-	PSK              string                           `json:"psk,omitempty"`
-	AllowedIPs       badoption.Listable[netip.Prefix] `json:"allowed_ips,omitempty"`
+	MemoryLimit      *byteformats.MemoryBytes                 `json:"memory_limit,omitempty"`
+	HandshakeTimeout badoption.Duration                       `json:"handshake_timeout,omitempty"`
+	PSK              string                                   `json:"psk,omitempty"`
+	AllowedIPs       badoption.Listable[badoption.Prefixable] `json:"allowed_ips,omitempty"`
 	MultipathDeprecatedFlatOptions
 }

@@ -73,6 +73,10 @@ func (s *rangeSet) remove(r Range) {
 			out = append(out, Range{r.End, x.End})
 		}
 	}
+	// Splits can exceed the bound; the lowest gaps stay reported.
+	if len(out) > maxDroppedRanges {
+		out = out[:maxDroppedRanges]
+	}
 	*s = out
 }
 
@@ -388,6 +392,9 @@ func (r *Receiver) DroppedRanges(n int, limit uint64) []Range {
 // HeadPageEnd is the end of the page holding the next expected byte. Bytes
 // below it are always admitted, even under memory pressure.
 func (r *Receiver) HeadPageEnd() uint64 { return (r.Next/PageSize + 1) * PageSize }
+
+// Pages returns the number of receive pages allocated, in order or not.
+func (r *Receiver) Pages() int { return len(r.pages) }
 
 func (r *Receiver) Buffered() (bytes, outOfOrder uint64, pages int) {
 	if len(r.pages) == 0 {

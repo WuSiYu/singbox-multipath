@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,8 @@ import (
 	L "github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 )
 
 // A sender may put one whole frame in flight before any feedback. Frames
@@ -310,5 +313,224 @@ func TestEarlyWriteSessionCreatedOnLeg1(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A session may run on leg1 alone (leg0 lost, or created on leg1). A full
+// Close must still deliver the data the application wrote, then DATA_FIN.
+func TestCloseOnLeg1OnlyDeliversAcceptedData(t *testing.T) {
+	cfg := testCoreConfig()
+	left, leftApp := newCore(context.Background(), cfg)
+	right, rightApp := newCore(context.Background(), cfg)
+	defer left.Close()
+	defer right.Close()
+	a, b := net.Pipe()
+	connectTestLeg(t, left, right, 1, a, b)
+	payload := flowPayload(256 << 10)
+	if n, err := leftApp.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("write: n=%d err=%v", n, err)
+	}
+	if err := leftApp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = rightApp.SetReadDeadline(time.Now().Add(10 * time.Second))
+	received, err := io.ReadAll(rightApp)
+	if err != nil || !bytes.Equal(received, payload) {
+		t.Fatalf("received %d of %d bytes: %v", len(received), len(payload), err)
+	}
+}
+
+// Unread in-order data hold receive pages too; they count toward what the
+// session holds when the receive region is shared.
+func TestReceiveShareCountsUnreadPages(t *testing.T) {
+	budget := newMemoryBudget(64<<20, false)
+	cfg := testCoreConfig()
+	cfg.FrameSize = 64 << 10
+	cfg.ReceiveWindowBytes = 32 << 20
+	cfg.Memory = budget
+	core, _ := newCore(context.Background(), cfg)
+	defer core.Close()
+	const payload = 4 << 20
+	core.stateMu.Lock()
+	core.rx.Advertise(32 << 20)
+	if accepted, err := core.rx.Insert(0, make([]byte, payload)); err != nil || accepted != payload {
+		core.stateMu.Unlock()
+		t.Fatalf("insert: accepted=%d err=%v", accepted, err)
+	}
+	core.receiveTargetLocked(time.Now())
+	core.stateMu.Unlock()
+	budget.access.Lock()
+	held := budget.receivers.seen[core].held
+	budget.access.Unlock()
+	if held < payload/stream.PageSize*stream.PageCharge {
+		t.Fatalf("4 MiB of unread pages reported as %d held bytes", held)
+	}
+}
+
+// Repeated feedback must not queue copies of a repair that is still waiting
+// to be sent, nor of one sent within a retransmission timeout, and the queue
+// stays bounded.
+func TestRepairQueueStaysBounded(t *testing.T) {
+	c := &mpCore{cfg: flowTestConfig(), tx: stream.NewSender(1 << 20), legs: make(map[uint8]*mpLeg), pumpWake: make(chan struct{}, 1)}
+	c.tx.WriteNext, c.tx.Next = 1<<20, 1<<20
+	leg := &mpLeg{id: 0, busy: true}
+	leg.ready.Store(true)
+	c.legs[0] = leg
+	now := time.Now()
+	for i := 0; i < 1000; i++ {
+		c.queueRepairsLocked([]stream.Range{{Start: 0, End: 4096}}, now.Add(time.Duration(i)*time.Second))
+	}
+	if len(c.repairQueue) != 1 {
+		t.Fatalf("one unsent repair queued %d times", len(c.repairQueue))
+	}
+	// A repair sent just now is not queued again until its timeout passes.
+	c.repairQueue = nil
+	c.repairSent = []repairRecord{{Range: stream.Range{Start: 0, End: 4096}, at: now}}
+	c.queueRepairsLocked([]stream.Range{{Start: 0, End: 4096}}, now.Add(time.Millisecond))
+	if len(c.repairQueue) != 0 {
+		t.Fatal("a repair still in flight was queued again")
+	}
+	// A gap that moved past a partial repair is queued at once, minus the
+	// part already in flight.
+	c.queueRepairsLocked([]stream.Range{{Start: 2048, End: 8192}}, now.Add(time.Millisecond))
+	if len(c.repairQueue) != 1 || c.repairQueue[0] != (stream.Range{Start: 4096, End: 8192}) {
+		t.Fatalf("moved gap queued as %+v", c.repairQueue)
+	}
+	c.repairQueue = nil
+	c.queueRepairsLocked([]stream.Range{{Start: 0, End: 4096}}, now.Add(time.Minute))
+	if len(c.repairQueue) != 1 {
+		t.Fatal("a repair was not queued again after its timeout")
+	}
+	for i := 0; i < 200; i++ {
+		start := uint64(8192 + i*4096)
+		c.queueRepairsLocked([]stream.Range{{Start: start, End: start + 1024}}, now.Add(time.Minute))
+	}
+	if len(c.repairQueue) > maxRepairRecords {
+		t.Fatalf("repair queue grew to %d entries", len(c.repairQueue))
+	}
+}
+
+// Like a socket, a Read whose deadline already passed fails even when data
+// are buffered.
+func TestExpiredReadDeadlineFailsWithBufferedData(t *testing.T) {
+	core, app := newCore(context.Background(), flowTestConfig())
+	defer core.Close()
+	core.stateMu.Lock()
+	_, err := core.rx.Insert(0, []byte{42})
+	core.stateMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = app.SetReadDeadline(time.Now().Add(-time.Second))
+	if n, err := app.Read(make([]byte, 1)); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("read after the deadline: n=%d err=%v", n, err)
+	}
+	_ = app.SetReadDeadline(time.Time{})
+	if n, err := app.Read(make([]byte, 1)); n != 1 || err != nil {
+		t.Fatalf("read after clearing the deadline: n=%d err=%v", n, err)
+	}
+}
+
+// With early write, CloseWrite before any payload must still send the hello:
+// DATA_FIN needs a ready leg, and the leg is ready only after its hello.
+func TestEarlyCloseWriteStartsHandshake(t *testing.T) {
+	cfg := testCoreConfig()
+	core, app := newCore(context.Background(), cfg)
+	defer core.Close()
+	local, peer := net.Pipe()
+	defer peer.Close()
+	message := helloMessage{Session: [16]byte{9}, FrameSize: uint32(cfg.FrameSize), Destination: "example.com:443", Create: true}
+	early, err := newClientFastOpenConn(local, message, time.Now().Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preamble := func(conn net.Conn) error {
+		if err := early.waitStarted(); err != nil {
+			return err
+		}
+		_, err := readHelloResponse(conn)
+		return err
+	}
+	if _, err = core.addLegWithReadPreamble(0, early, nil, preamble); err != nil {
+		t.Fatal(err)
+	}
+	logical := &earlyLogicalConn{Conn: app, core: core, primary: early}
+	if err = logical.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, err := readHello(peer)
+	if err != nil {
+		t.Fatal("CloseWrite before payload did not send the hello: ", err)
+	}
+	if got.Session != message.Session {
+		t.Fatal("unexpected hello")
+	}
+}
+
+// Remembered hello nonces are charged to the memory budget and released when
+// they expire; a nonce that cannot be recorded is refused, never accepted.
+func TestHelloNoncesChargeBudget(t *testing.T) {
+	budget := newMemoryBudget(1<<20, false)
+	i := &Inbound{cfg: coreConfig{Memory: budget}}
+	now := time.Now()
+	for n := 0; n < 1024; n++ {
+		if err := i.rememberNonce([16]byte{byte(n), byte(n >> 8)}, now); err != nil {
+			t.Fatalf("nonce %d: %v", n, err)
+		}
+	}
+	if used := budget.snapshot().UsedBytes; used < 1024*nonceCharge {
+		t.Fatalf("1024 nonces charged %d bytes", used)
+	}
+	if err := i.rememberNonce([16]byte{1}, now); !errors.Is(err, errHelloReplayed) {
+		t.Fatal("replayed nonce accepted: ", err)
+	}
+	i.expireClosedSessions(now.Add(2*helloAuthSkew + time.Second))
+	if used := budget.snapshot().UsedBytes; used != 0 {
+		t.Fatalf("expired nonces still charge %d bytes", used)
+	}
+	if !budget.reserveSession(budget.limit - budget.snapshot().UsedBytes) {
+		t.Fatal("fill budget")
+	}
+	if err := i.rememberNonce([16]byte{0xee}, now); !errors.Is(err, errHelloNonceStorage) {
+		t.Fatal("nonce accepted without being recorded: ", err)
+	}
+}
+
+// The closed-session record is reserved when a session is admitted, so its ID
+// is remembered even if memory is full when the session ends: a retried
+// Create with that ID must never dial the target a second time.
+func TestClosedSessionTombstoneReservedAtAdmission(t *testing.T) {
+	router := &routeRecorder{routed: make(chan net.Conn, 1)}
+	i := newClosableInbound(router)
+	defer i.Close()
+	client, server := net.Pipe()
+	defer client.Close()
+	go i.NewConnection(i.ctx, server, adapter.InboundContext{}, nil)
+	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+	id := [16]byte{5}
+	if err := writeHello(client, helloMessage{Session: id, FrameSize: 65536, Destination: "example.com:443", Create: true}); err != nil {
+		t.Fatal(err)
+	}
+	if response, err := readHelloResponse(client); err != nil || response.Status != helloStatusOK {
+		t.Fatalf("create: %+v %v", response, err)
+	}
+	<-router.routed
+	i.access.Lock()
+	session := i.sessions[id]
+	i.access.Unlock()
+	if session == nil || !session.tombstone {
+		t.Fatal("admitted session has no reserved closed-session record")
+	}
+	budget := i.cfg.Memory
+	if !budget.reserveSession(budget.limit - budget.snapshot().UsedBytes) {
+		t.Fatal("fill budget")
+	}
+	i.removeSession(id, session)
+	i.access.Lock()
+	_, remembered := i.closedSessions[id]
+	i.access.Unlock()
+	if !remembered {
+		t.Fatal("closed session forgotten while memory was full")
 	}
 }

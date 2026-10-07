@@ -311,8 +311,9 @@ func readHelloWithAuth(conn net.Conn) (helloMessage, *helloAuth, error) {
 }
 
 // verifyHelloAuth checks the MAC, clock skew and replay of an authenticated
-// hello against psk. seen records nonces for the skew period.
-func verifyHelloAuth(auth *helloAuth, psk string, now time.Time, seen func([16]byte, time.Time) bool) error {
+// hello against psk. remember records nonces for the skew period and
+// rejects a replay, or a nonce it cannot record.
+func verifyHelloAuth(auth *helloAuth, psk string, now time.Time, remember func([16]byte, time.Time) error) error {
 	if auth == nil {
 		return errors.New("multipath hello is not authenticated")
 	}
@@ -322,10 +323,7 @@ func verifyHelloAuth(auth *helloAuth, psk string, now time.Time, seen func([16]b
 	if skew := now.Sub(auth.time); skew > helloAuthSkew || skew < -helloAuthSkew {
 		return errors.New("multipath hello timestamp outside the allowed clock skew")
 	}
-	if !seen(auth.nonce, now) {
-		return errors.New("multipath hello replayed")
-	}
-	return nil
+	return remember(auth.nonce, now)
 }
 
 func writeHelloResponse(conn net.Conn, response helloResponse) error {

@@ -1,8 +1,10 @@
 package multipath
 
 import (
+	"cmp"
 	"errors"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/sagernet/sing-box/protocol/multipath/stream"
@@ -244,12 +246,12 @@ func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
 	// be read; periodic feedback for an idle direction does not count. The
 	// sender wants a larger window once it has used three quarters of it; a
 	// keep-alive connection never comes close.
-	buffered, _, pages := c.rx.Buffered()
+	buffered, _, _ := c.rx.Buffered()
 	active := c.rx.MaxSeen != c.receivedSeen || buffered > 0
 	c.receivedSeen = c.rx.MaxSeen
 	window := c.rx.WindowEnd - min(c.rx.ReadNext, c.rx.WindowEnd)
 	wanting := c.rx.MaxSeen+window/4 >= c.rx.WindowEnd
-	share := c.memory.receiveShare(c, now, active, int64(pages)*stream.PageCharge, wanting)
+	share := c.memory.receiveShare(c, now, active, int64(c.rx.Pages())*stream.PageCharge, wanting)
 	return max(uint64(c.cfg.FrameSize), min(uint64(c.cfg.ReceiveWindowBytes), uint64(share)))
 }
 
@@ -568,6 +570,10 @@ func (c *mpCore) repairDroppedLocked(now time.Time) (bool, error) {
 			return false, err
 		}
 		r.Start = segment.End()
+		if len(c.repairSent) >= maxRepairRecords {
+			c.repairSent = c.repairSent[1:]
+		}
+		c.repairSent = append(c.repairSent, repairRecord{Range: stream.Range{Start: segment.Seq, End: segment.End()}, at: now})
 		c.repairWindowBytes += uint64(segment.Length)
 		c.fallbackB.Add(uint64(segment.Length))
 		c.fallbackF.Add(1)
@@ -577,27 +583,71 @@ func (c *mpCore) repairDroppedLocked(now time.Time) (bool, error) {
 	return false, nil
 }
 
-// queueRepairsLocked accepts the receiver's dropped ranges, at most once per
-// range start within a retransmission timeout.
+// repairRecord is a repair sent at a time: the receiver keeps reporting its
+// range until the repair arrives, which must not queue it again.
+type repairRecord struct {
+	stream.Range
+	at time.Time
+}
+
+// maxRepairRecords bounds queued and recently sent repairs. Ranges beyond it
+// are reported again by later feedback.
+const maxRepairRecords = 64
+
+// uncoveredRanges returns the parts of r that no range in covered overlaps.
+func uncoveredRanges(r stream.Range, covered []stream.Range) []stream.Range {
+	slices.SortFunc(covered, func(a, b stream.Range) int { return cmp.Compare(a.Start, b.Start) })
+	var out []stream.Range
+	cursor := r.Start
+	for _, c := range covered {
+		if c.End <= cursor {
+			continue
+		}
+		if c.Start >= r.End {
+			break
+		}
+		if c.Start > cursor {
+			out = append(out, stream.Range{Start: cursor, End: c.Start})
+		}
+		cursor = c.End
+	}
+	if cursor < r.End {
+		out = append(out, stream.Range{Start: cursor, End: r.End})
+	}
+	return out
+}
+
+// queueRepairsLocked accepts the receiver's dropped ranges. Bytes already
+// waiting in the queue, or sent within a retransmission timeout, are not
+// queued again: a writer that cannot send repairs yet must not let repeated
+// feedback pile up copies of the same work. The rest of a range is queued,
+// so a gap that moved after a partial repair is repaired at once.
 func (c *mpCore) queueRepairsLocked(nacks []stream.Range, now time.Time) {
-	for start := range c.repairAt {
-		if start < c.tx.Una {
-			delete(c.repairAt, start)
+	timeout := c.repairTimeoutLocked()
+	sent := c.repairSent[:0]
+	for _, record := range c.repairSent {
+		if record.End > c.tx.Una && now.Sub(record.at) < timeout {
+			sent = append(sent, record)
 		}
 	}
+	clear(c.repairSent[len(sent):])
+	c.repairSent = sent
 	for _, r := range nacks {
 		r.Start, r.End = max(r.Start, c.tx.Una), min(r.End, c.tx.Next)
 		if r.Start >= r.End {
 			continue
 		}
-		if at, ok := c.repairAt[r.Start]; ok && now.Sub(at) < c.repairTimeoutLocked() {
-			continue
+		covered := make([]stream.Range, 0, len(c.repairQueue)+len(c.repairSent))
+		covered = append(covered, c.repairQueue...)
+		for _, record := range c.repairSent {
+			covered = append(covered, record.Range)
 		}
-		if c.repairAt == nil {
-			c.repairAt = make(map[uint64]time.Time)
+		for _, piece := range uncoveredRanges(r, covered) {
+			if len(c.repairQueue) >= maxRepairRecords {
+				break
+			}
+			c.repairQueue = append(c.repairQueue, piece)
 		}
-		c.repairAt[r.Start] = now
-		c.repairQueue = append(c.repairQueue, r)
 	}
 	if len(c.repairQueue) > 0 {
 		wakeFlow(c.pumpWake)

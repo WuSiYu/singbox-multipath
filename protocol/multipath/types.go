@@ -164,18 +164,18 @@ type mpLeg struct {
 }
 
 type mpCore struct {
-	finPath           *mpLeg               // stateMu; leg that carried the latest DATA_FIN copy
-	finSentAt         time.Time            // stateMu
-	legsAbsentSince   time.Time            // stateMu; zero while any leg is attached or joining
-	repairQueue       []stream.Range       // stateMu; receiver-dropped ranges to resend
-	repairAt          map[uint64]time.Time // stateMu; last repair per dropped-range start
-	repairScan        bool                 // stateMu; a leg failed or stalled: scan all mappings
-	repairWindowAt    time.Time            // stateMu
-	repairWindowBytes uint64               // stateMu
-	droppedReported   uint64               // stateMu; receiver drops already reported
-	reportedFull      bool                 // stateMu; last feedback asked the sender to pause
-	receivedSeen      uint64               // stateMu; rx.MaxSeen at the last feedback
-	txHeld            atomic.Int64         // transmit payload this session holds in the node budget
+	finPath           *mpLeg         // stateMu; leg that carried the latest DATA_FIN copy
+	finSentAt         time.Time      // stateMu
+	legsAbsentSince   time.Time      // stateMu; zero while any leg is attached or joining
+	repairQueue       []stream.Range // stateMu; receiver-dropped ranges to resend
+	repairSent        []repairRecord // stateMu; repairs sent within a retransmission timeout
+	repairScan        bool           // stateMu; a leg failed or stalled: scan all mappings
+	repairWindowAt    time.Time      // stateMu
+	repairWindowBytes uint64         // stateMu
+	droppedReported   uint64         // stateMu; receiver drops already reported
+	reportedFull      bool           // stateMu; last feedback asked the sender to pause
+	receivedSeen      uint64         // stateMu; rx.MaxSeen at the last feedback
+	txHeld            atomic.Int64   // transmit payload this session holds in the node budget
 	opportunisticE    atomic.Uint64
 	tailE             atomic.Uint64 // tail reinjections
 	tailB             atomic.Uint64

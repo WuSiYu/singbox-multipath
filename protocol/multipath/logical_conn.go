@@ -62,6 +62,10 @@ func (c *logicalConn) Read(buffer []byte) (int, error) {
 		select {
 		case <-c.readTerminated:
 			return 0, c.terminalReadError()
+		case <-c.readDeadline.Wait():
+			// As with a socket, an expired deadline fails the Read even when
+			// data are buffered.
+			return 0, os.ErrDeadlineExceeded
 		default:
 		}
 		core.stateMu.Lock()

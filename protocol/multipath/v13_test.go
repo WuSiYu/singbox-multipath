@@ -31,12 +31,12 @@ func TestHelloAuthentication(t *testing.T) {
 		return got, auth
 	}
 	nonces := make(map[[16]byte]bool)
-	remember := func(nonce [16]byte, _ time.Time) bool {
+	remember := func(nonce [16]byte, _ time.Time) error {
 		if nonces[nonce] {
-			return false
+			return errHelloReplayed
 		}
 		nonces[nonce] = true
-		return true
+		return nil
 	}
 	got, auth := read(message)
 	if got.Session != message.Session || !got.Create || got.LegID != 1 || got.Destination != message.Destination || got.PSK != "" {

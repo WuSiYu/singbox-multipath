@@ -61,7 +61,13 @@ func (c *mpCore) closeApplication() error {
 	c.localClosing.Store(true)
 	c.discardReceive()
 	err, _ := c.appConn.closeInternal()
-	if c.getLeg(0) == nil && c.cfg.Recovery == nil {
+	// Accepted data drain on whichever legs remain, then DATA_FIN. Without
+	// any leg, data still waiting for a leg to rejoin are kept until the
+	// leg-absent timeout; with nothing left to deliver the session ends now.
+	c.stateMu.Lock()
+	idle := c.tx.Buffered() == 0
+	c.stateMu.Unlock()
+	if idle && c.cfg.Recovery == nil && len(c.availableLegs()) == 0 && !c.joiningLegs() {
 		c.fail(io.EOF)
 	} else {
 		c.finishApplicationClose()
