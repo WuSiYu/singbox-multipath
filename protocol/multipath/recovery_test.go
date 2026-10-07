@@ -5,9 +5,11 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -209,5 +211,29 @@ func TestRecoveryPrimaryLossAndRejoin(t *testing.T) {
 		}
 		a.Close()
 		b.Close()
+	}
+}
+
+// allowed_ips filters the recovery UDP relay as well as TCP legs: a datagram
+// from elsewhere never reaches its recovery group, even with a valid group ID.
+func TestAllowedIPsFilterRecoveryUDP(t *testing.T) {
+	id := [16]byte{9}
+	i := &Inbound{
+		allowedIPs:     []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+		recoveryGroups: make(map[[16]byte]*recoveryServerGroup),
+	}
+	g := &recoveryServerGroup{i: i, id: id, packets: make(map[[16]byte]*recoveryPacketConn), closedPackets: make(map[[16]byte]time.Time), closedTCP: make(map[[16]byte]time.Time)}
+	i.recoveryGroups[id] = g
+	datagram, err := recoveryDatagram{kind: recoveryUDPClose, group: id, session: [16]byte{1}}.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	i.NewPacket(buf.As(append([]byte(nil), datagram...)), M.ParseSocksaddr("203.0.113.7:4000"))
+	if !g.lastSeen.IsZero() {
+		t.Fatal("datagram from outside allowed_ips reached its recovery group")
+	}
+	i.NewPacket(buf.As(append([]byte(nil), datagram...)), M.ParseSocksaddr("198.51.100.7:4000"))
+	if g.lastSeen.IsZero() {
+		t.Fatal("datagram from an allowed source was dropped")
 	}
 }

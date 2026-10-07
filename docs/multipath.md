@@ -17,7 +17,7 @@ Packet-level congestion control, pacing and retransmission remain inside the chi
 Multipath does not encrypt data; the child protocols or private links do. An unprotected listener lets anyone who can reach it use the server to connect to arbitrary targets.
 
 - **`psk`**: with the same pre-shared key on both endpoints, every hello carries an HMAC-SHA256 tag over the session ID, policy, destination, a timestamp and a random nonce. The server rejects a wrong tag, a clock skew above two minutes or a replayed nonce. The PSK protects session setup; it does not encrypt the data that follows.
-- **`allowed_ips`** (server only): accept child connections only from these prefixes, judged by the source address the server sees.
+- **`allowed_ips`** (server only): accept child connections and failover UDP relay datagrams only from these prefixes, judged by the source address the server sees. Other connections are closed before their hello is read; other datagrams are dropped.
 - A server with neither `psk` nor `allowed_ips` listening on a non-private address logs a warning at startup.
 
 Both endpoints must run protocol v13. On a version mismatch the server answers with an explicit rejection carrying its version, and the client logs the reason instead of failing obscurely. Other rejections (authentication, parameter mismatch, closed session) also carry a reason code.

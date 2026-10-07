@@ -111,6 +111,10 @@ func (i *Inbound) serveRecoveryControl(conn net.Conn, h helloMessage, onClose N.
 
 func (i *Inbound) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
 	defer buffer.Release()
+	// allowed_ips covers the recovery UDP relay as well as TCP legs.
+	if !i.sourceAllowed(source) {
+		return
+	}
 	d, err := decodeRecoveryDatagram(buffer.Bytes())
 	if err != nil {
 		return

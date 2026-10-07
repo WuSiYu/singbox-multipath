@@ -144,7 +144,7 @@ child 可以是任何支持 TCP 的 outbound，例如加密的 Shadowsocks、Hys
 | `handshake_timeout` | 各主机独立的 leg 握手时限；默认 10 秒，范围 1–60 秒。 | `"10s"` |
 | `listen`、`listen_port` | 仅服务端，标准 sing-box TCP/UDP 监听字段。 | `"::"`、`39000` |
 | 服务端 `psk` | 与客户端一致的预共享密钥；设置后拒绝未认证或签名错误的 hello。 | `"a-long-random-string"` |
-| 服务端 `allowed_ips` | 只接受这些来源前缀的 child 连接；为空时不限制。 | `["198.51.100.0/24"]` |
+| 服务端 `allowed_ips` | 只接受这些来源前缀的 child 连接和故障接管 UDP 中继报文；为空时不限制。 | `["198.51.100.0/24"]` |
 | 服务端 `tcp_fast_open` | 服务端 TCP socket 选项。 | `true`、`false` |
 
 服务端既没有 `psk`、`allowed_ips`，又监听在非私有地址时，启动日志会警告。
@@ -316,7 +316,7 @@ Activation is **master switch AND (condition 1 OR condition 2 OR condition 3)**,
 | `handshake_timeout` | Leg handshake deadline on each host, default 10 s, range 1–60 s. | `"10s"` |
 | `listen`, `listen_port` | Server only; standard sing-box TCP/UDP listen fields. | `"::"`, `39000` |
 | Server `psk` | Pre-shared key matching the client; unauthenticated or wrongly signed hellos are rejected. | `"a-long-random-string"` |
-| Server `allowed_ips` | Accept child connections only from these source prefixes; empty means unrestricted. | `["198.51.100.0/24"]` |
+| Server `allowed_ips` | Accept child connections and failover UDP relay datagrams only from these source prefixes; empty means unrestricted. | `["198.51.100.0/24"]` |
 | Server `tcp_fast_open` | Server TCP socket option. | `true`, `false` |
 
 A server without `psk` or `allowed_ips` listening on a non-private address logs a warning.
