@@ -130,8 +130,8 @@ child 可以是任何支持 TCP 的 outbound，例如加密的 Shadowsocks、Hys
 | `activation_after_bytes_min_mbps` | 条件 3 内部的“且”条件，默认 0；非零时还要求完整窗口内的平均速率达标。 | `0`、`120` |
 | `activation_window` | 排队持续期和速率采样窗口，默认 200 ms，范围 20 ms–10 秒。 | `"200ms"`、`"1s"` |
 | `queue_frames` | 本地未发送数据的**上限**（以 `frame_size` 计），默认 256。实际值约为路径交付速率 × 10 ms，至少 1 MiB。范围 8–4096，乘积不超过 64 MiB。 | `256` |
-| `send_buffer_bytes` | 连接发送历史（两条路径共用、含未发送数据）的**上限**；省略时为 512 MiB。实际值约为两倍带宽时延积并受本机公平份额约束。 | `0`、`"64MB"` |
-| `receive_window_bytes` | 接收窗口的**上限**；省略时为 512 MiB。实际值为本会话在接收端的公平份额。 | `0`、`"128MB"` |
+| `send_buffer_bytes` | 连接发送历史（两条路径共用、含未发送数据）的**上限**；省略时为 512 MiB。实际值约为两倍带宽时延积，并受本机按需求公平分配（max-min）的份额约束。 | `0`、`"64MB"` |
+| `receive_window_bytes` | 接收窗口的**上限**；省略时为 512 MiB。实际值为本会话在接收端按需求公平分配（max-min）的份额。 | `0`、`"128MB"` |
 | `path_stall_timeout_min` | 无进展检测的下限；省略时自适应，非零范围 100 ms–5 分钟。不是固定重传间隔。 | `"500ms"` |
 
 激活逻辑是 **总开关开启，且（条件 1 或条件 2 或条件 3）**，按每条连接、每个方向独立判断。三个条件全部关闭就不会激活。激活后不会因速率下降而退回。需要 beta10 之前“1 秒内 150 Mbps 才激活”的行为，可显式写 `"activation_threshold_mbps": 150, "activation_window": "1s"`。
@@ -302,8 +302,8 @@ These fields are set **only on the client** and applied by the direction's sende
 | `activation_after_bytes_min_mbps` | Extra AND gate within condition 3, default 0; otherwise also requires that average rate over a complete window. | `0`, `120` |
 | `activation_window` | Queue duration and rate sampling window, default 200 ms, range 20 ms–10 s. | `"200ms"`, `"1s"` |
 | `queue_frames` | **Ceiling** of unsent data in `frame_size` units, default 256. The working value is about 10 ms of delivery rate, at least 1 MiB. Range 8–4096; the product may not exceed 64 MiB. | `256` |
-| `send_buffer_bytes` | **Ceiling** of the send history shared by both paths, unsent data included; 512 MiB when omitted. The working value is about twice the bandwidth-delay product within the host's fair share. | `0`, `"64MB"` |
-| `receive_window_bytes` | **Ceiling** of the receive window; 512 MiB when omitted. The working value is the session's fair share on the receiver. | `0`, `"128MB"` |
+| `send_buffer_bytes` | **Ceiling** of the send history shared by both paths, unsent data included; 512 MiB when omitted. The working value is about twice the bandwidth-delay product within the host's max-min fair share. | `0`, `"64MB"` |
+| `receive_window_bytes` | **Ceiling** of the receive window; 512 MiB when omitted. The working value is the session's max-min fair share on the receiver. | `0`, `"128MB"` |
 | `path_stall_timeout_min` | Floor of no-progress detection; adaptive when omitted, otherwise 100 ms–5 min. Not a fixed retransmission interval. | `"500ms"` |
 
 Activation is **master switch AND (condition 1 OR condition 2 OR condition 3)**, per connection and direction. Disabling all three prevents activation, and an activated direction stays activated. For the pre-beta10 "150 Mbps over one second" behavior, set `"activation_threshold_mbps": 150, "activation_window": "1s"` explicitly.

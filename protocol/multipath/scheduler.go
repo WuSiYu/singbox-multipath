@@ -241,11 +241,16 @@ func (c *mpCore) feedbackLockedWithoutLegs() flowMessage {
 // feedback, and a smaller window would turn that first frame into an error.
 func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
 	// Receiving means data arrived since the last feedback or still wait to
-	// be read; periodic feedback for an idle direction does not count.
-	buffered, _, _ := c.rx.Buffered()
+	// be read; periodic feedback for an idle direction does not count. The
+	// sender wants a larger window once it has used three quarters of it; a
+	// keep-alive connection never comes close.
+	buffered, _, pages := c.rx.Buffered()
 	active := c.rx.MaxSeen != c.receivedSeen || buffered > 0
 	c.receivedSeen = c.rx.MaxSeen
-	return max(uint64(c.cfg.FrameSize), min(uint64(c.cfg.ReceiveWindowBytes), uint64(c.memory.receiveShare(c, now, active))))
+	window := c.rx.WindowEnd - min(c.rx.ReadNext, c.rx.WindowEnd)
+	wanting := c.rx.MaxSeen+window/4 >= c.rx.WindowEnd
+	share := c.memory.receiveShare(c, now, active, int64(pages)*stream.PageCharge, wanting)
+	return max(uint64(c.cfg.FrameSize), min(uint64(c.cfg.ReceiveWindowBytes), uint64(share)))
 }
 
 // repairBudgetLocked limits receiver-requested repairs to a quarter of the

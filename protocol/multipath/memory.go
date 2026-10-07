@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,18 +58,32 @@ type memoryPressureEvent struct {
 	duration time.Duration
 }
 
-// activitySet counts sessions which used one direction within activityWindow.
-// Callers hold memoryBudget.access.
+// activitySet counts sessions which used one direction within activityWindow,
+// with what each holds and whether it wants more. Callers hold
+// memoryBudget.access.
 type activitySet struct {
-	seen      map[any]int64
+	seen      map[any]activity
 	lastPrune int64
+	// level caches maxMinLevel for levelTTL; it changes with demand, not
+	// with every write.
+	level, levelRegion, levelAt int64
+}
+
+type activity struct {
+	at      int64
+	held    int64
+	wanting bool
 }
 
 func (s *activitySet) mark(key any, now int64) {
+	s.report(key, now, 0, false)
+}
+
+func (s *activitySet) report(key any, now, held int64, wanting bool) {
 	if s.seen == nil {
-		s.seen = make(map[any]int64)
+		s.seen = make(map[any]activity)
 	}
-	s.seen[key] = now
+	s.seen[key] = activity{at: now, held: held, wanting: wanting}
 }
 
 func (s *activitySet) remove(key any) {
@@ -78,13 +93,49 @@ func (s *activitySet) remove(key any) {
 func (s *activitySet) count(now int64) int {
 	if now-s.lastPrune >= int64(activityWindow/10) {
 		s.lastPrune = now
-		for key, at := range s.seen {
-			if now-at >= int64(activityWindow) {
+		for key, a := range s.seen {
+			if now-a.at >= int64(activityWindow) {
 				delete(s.seen, key)
 			}
 		}
 	}
 	return len(s.seen)
+}
+
+const levelTTL = 5 * time.Millisecond
+
+// maxMinLevel divides region max-min fairly among the active sessions: one
+// that wants no more and holds less than an equal share keeps what it holds,
+// and the rest is split equally among the others. A bulk transfer beside
+// dozens of keep-alive connections thus gets nearly the whole region, two
+// bulk transfers get half each, and a transfer that starts wanting more
+// makes the others give way. Without contention the whole region is open.
+func (s *activitySet) maxMinLevel(region, now int64) int64 {
+	if now-s.levelAt < int64(levelTTL) && s.levelRegion == region {
+		return s.level
+	}
+	n := s.count(now)
+	light := make([]int64, 0, n)
+	for _, a := range s.seen {
+		if !a.wanting {
+			light = append(light, a.held)
+		}
+	}
+	slices.Sort(light)
+	remaining, k := region, int64(n)
+	for _, held := range light {
+		if held*k > remaining {
+			break
+		}
+		remaining -= held
+		k--
+	}
+	level := region
+	if k > 0 {
+		level = remaining / k
+	}
+	s.level, s.levelRegion, s.levelAt = level, region, now
+	return level
 }
 
 // memoryBudget is one node's accounting region. It separates unsent/unacked
@@ -435,12 +486,12 @@ func (b *memoryBudget) rxRelease(size int64) {
 // as an active receiver when it is receiving data. A session that only sends
 // feedback for an idle direction is not active: counting it would reserve
 // half of the node's pool for receiving and halve the transmit region.
-func (b *memoryBudget) receiveShare(key any, now time.Time, active bool) int64 {
+func (b *memoryBudget) receiveShare(key any, now time.Time, active bool, held int64, wanting bool) int64 {
 	b.access.Lock()
 	defer b.access.Unlock()
 	nanos := now.UnixNano()
 	if active {
-		b.receivers.mark(key, nanos)
+		b.receivers.report(key, nanos, held, wanting)
 	}
 	if b.pressure {
 		// Stored data already exceed the pool: grow no window beyond the
@@ -450,23 +501,26 @@ func (b *memoryBudget) receiveShare(key any, now time.Time, active bool) int64 {
 	return b.receiveShareLocked(nanos)
 }
 
-// receiveShareLocked divides three quarters of the receive region among the
-// active receivers. The remaining quarter absorbs page-granularity overhead
-// and arrivals beyond a window edge, so a slow application can fill its own
-// window without pushing out-of-order data elsewhere into the drop path.
+// receiveShareLocked divides three quarters of the receive region max-min
+// fairly among the active receivers: one whose sender does not fill its
+// window keeps the pages it holds, and window-limited transfers share the
+// rest. The remaining quarter absorbs page-granularity overhead and arrivals
+// beyond a window edge, so a slow application can fill its own window
+// without pushing out-of-order data elsewhere into the drop path.
 func (b *memoryBudget) receiveShareLocked(nanos int64) int64 {
-	share := b.rxRegionLocked() / 4 * 3 / int64(max(1, b.receivers.count(nanos)))
+	share := b.receivers.maxMinLevel(b.rxRegionLocked()/4*3, nanos)
 	return max(receiveWindowFloor, share/stream.PageCharge*stream.PageSize)
 }
 
-// transmitShare marks key as an active sender and returns its fair share of
-// the transmit region.
-func (b *memoryBudget) transmitShare(key any, now time.Time) int64 {
+// transmitShare records key as an active sender holding held bytes of
+// transmit payload, and whether it wants more, and returns its max-min fair
+// share of the transmit region.
+func (b *memoryBudget) transmitShare(key any, now time.Time, held int64, wanting bool) int64 {
 	b.access.Lock()
 	defer b.access.Unlock()
 	nanos := now.UnixNano()
-	b.senders.mark(key, nanos)
-	return b.txRegionLocked() / int64(max(1, b.senders.count(nanos)))
+	b.senders.report(key, nanos, held, wanting)
+	return b.senders.maxMinLevel(b.txRegionLocked(), nanos)
 }
 
 func (b *memoryBudget) forget(key any) {

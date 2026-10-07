@@ -198,8 +198,8 @@ func TestMemoryRegionsCannotStarveEachOther(t *testing.T) {
 	// A session that only sends feedback for an idle receive direction does
 	// not reserve receive memory: transmit keeps the whole region.
 	now := time.Now()
-	budget.transmitShare("sender", now)
-	budget.receiveShare("receiver", now, false)
+	budget.transmitShare("sender", now, 0, true)
+	budget.receiveShare("receiver", now, false, 0, false)
 	held = fillTX()
 	if tx := budget.snapshot().TXBytes; tx < pool-pool/8-pool/16-(128<<10) {
 		t.Fatalf("idle receiver halved transmit: %d of %d", tx, pool)
@@ -208,7 +208,7 @@ func TestMemoryRegionsCannotStarveEachOther(t *testing.T) {
 		budget.releaseTX(buffer)
 	}
 	// With active sessions in both directions each side keeps half.
-	budget.receiveShare("receiver", now, true)
+	budget.receiveShare("receiver", now, true, 0, true)
 	held = fillTX()
 	if tx := budget.snapshot().TXBytes; tx > pool/2 || tx < pool/2-pool/16-(128<<10) {
 		t.Fatalf("transmit took %d of %d with both directions active", tx, pool)
@@ -302,5 +302,54 @@ func TestCoreMemoryPressureKeepsBothLegs(t *testing.T) {
 	core.getLeg(0).busy = false
 	if selected == nil || selected.id != 1 {
 		t.Fatalf("pressure disabled the secondary: %v", selected)
+	}
+}
+
+// Transmit memory is shared max-min fairly: keep-alive connections keep what
+// they hold, a single bulk transfer gets the rest, and bulk transfers that
+// all want more split it evenly.
+func TestTransmitShareFollowsDemand(t *testing.T) {
+	budget := newMemoryBudget(512<<20, false)
+	now := time.Now()
+	budget.access.Lock()
+	region := budget.txRegionLocked()
+	budget.access.Unlock()
+	for i := 0; i < 52; i++ {
+		budget.transmitShare(i, now, 4096, false)
+	}
+	if share := budget.transmitShare("bulk", now, 8<<20, true); share < region-52*4096 {
+		t.Fatalf("bulk transfer beside 52 idle connections got %d of %d", share, region)
+	}
+	later := now.Add(levelTTL)
+	budget.transmitShare("second", later, 0, true)
+	if share := budget.transmitShare("bulk", later, 200<<20, true); share > (region-52*4096)/2 || share < (region-52*4096)/2-1 {
+		t.Fatalf("two bulk transfers: first got %d of %d", share, region)
+	}
+	// A steady flow that holds less than an equal share keeps it.
+	later = later.Add(levelTTL)
+	budget.transmitShare("second", later, region/5, false)
+	if share := budget.transmitShare("bulk", later, 200<<20, true); share < region-region/5-52*4096 {
+		t.Fatalf("bulk beside a steady flow got %d of %d", share, region)
+	}
+}
+
+// A window-limited download beside keep-alive connections that receive a few
+// bytes now and then gets nearly the whole receive share.
+func TestReceiveShareFollowsDemand(t *testing.T) {
+	budget := newMemoryBudget(512<<20, false)
+	now := time.Now()
+	budget.access.Lock()
+	whole := budget.rxRegionLocked() / 4 * 3
+	budget.access.Unlock()
+	for i := 0; i < 50; i++ {
+		budget.receiveShare(i, now, true, 0, false)
+	}
+	if share := budget.receiveShare("bulk", now, true, 4<<20, true); share < (whole-stream.PageCharge)/stream.PageCharge*stream.PageSize {
+		t.Fatalf("download beside 50 keep-alive connections got a %d byte window of %d", share, whole)
+	}
+	later := now.Add(levelTTL)
+	budget.receiveShare("second", later, true, 0, true)
+	if share := budget.receiveShare("bulk", later, true, 4<<20, true); share > whole/2 {
+		t.Fatalf("two window-limited downloads: first got %d of %d", share, whole)
 	}
 }

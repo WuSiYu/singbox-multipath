@@ -244,7 +244,12 @@ func (c *mpCore) nextTXBuffer(app *logicalConn, length int) (*stream.Buffer, err
 		}
 		buffer, changed := c.memory.tryAcquireTX(size)
 		if buffer != nil {
-			return stream.NewBufferWithHeadroom(buffer, txHeadroom, length, func() { c.memory.releaseTX(buffer) }), nil
+			held := int64(cap(buffer))
+			c.txHeld.Add(held)
+			return stream.NewBufferWithHeadroom(buffer, txHeadroom, length, func() {
+				c.txHeld.Add(-held)
+				c.memory.releaseTX(buffer)
+			}), nil
 		}
 		select {
 		case <-c.done:
@@ -374,7 +379,7 @@ func (c *mpCore) historyLimitLocked(now time.Time) uint64 {
 	c.historyGrant = max(c.historyGrant, target)
 	c.historyAt = now
 	limit := min(c.historyGrant, uint64(max(c.cfg.SendBufferBytes, int64(c.cfg.FrameSize))))
-	share := uint64(max(0, c.memory.transmitShare(c, now)))
+	share := uint64(max(0, c.memory.transmitShare(c, now, c.txHeld.Load(), c.writerBacklogged(now))))
 	return min(limit, max(share, c.unsentLimitLocked()+uint64(c.cfg.FrameSize)))
 }
 

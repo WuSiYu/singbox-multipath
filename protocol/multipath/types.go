@@ -175,6 +175,7 @@ type mpCore struct {
 	droppedReported   uint64               // stateMu; receiver drops already reported
 	reportedFull      bool                 // stateMu; last feedback asked the sender to pause
 	receivedSeen      uint64               // stateMu; rx.MaxSeen at the last feedback
+	txHeld            atomic.Int64         // transmit payload this session holds in the node budget
 	opportunisticE    atomic.Uint64
 	tailE             atomic.Uint64 // tail reinjections
 	tailB             atomic.Uint64
