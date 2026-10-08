@@ -74,6 +74,7 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 	// Accept the peer's first frame even if no feedback precedes it, as when
 	// a session is created by leg1, which sends no startup window.
 	c.rx.Advertise(uint64(cfg.FrameSize))
+	c.arrivalAt = c.startedAt
 	c.txReserve <- budget.takeReservedBuffer(cfg.FrameSize + txHeadroom)
 	app.onClose = c.closeApplication
 	app.onCloseRead = c.closeApplicationRead

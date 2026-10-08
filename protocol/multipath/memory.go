@@ -502,11 +502,12 @@ func (b *memoryBudget) receiveShare(key any, now time.Time, active bool, held in
 }
 
 // receiveShareLocked divides three quarters of the receive region max-min
-// fairly among the active receivers: one whose sender does not fill its
-// window keeps the pages it holds, and window-limited transfers share the
-// rest. The remaining quarter absorbs page-granularity overhead and arrivals
-// beyond a window edge, so a slow application can fill its own window
-// without pushing out-of-order data elsewhere into the drop path.
+// fairly among the active receivers: one whose sender is not limited by its
+// window keeps what it holds (stored pages, or the window its sender keeps
+// filling), and window-limited transfers share the rest. The remaining
+// quarter absorbs page-granularity overhead and arrivals beyond a window
+// edge, so a slow application can fill its own window without pushing
+// out-of-order data elsewhere into the drop path.
 func (b *memoryBudget) receiveShareLocked(nanos int64) int64 {
 	share := b.receivers.maxMinLevel(b.rxRegionLocked()/4*3, nanos)
 	return max(receiveWindowFloor, share/stream.PageCharge*stream.PageSize)

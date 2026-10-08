@@ -353,3 +353,151 @@ func TestReceiveShareFollowsDemand(t *testing.T) {
 		t.Fatalf("two window-limited downloads: first got %d of %d", share, whole)
 	}
 }
+
+// An open window is a promise: a sender may fill all of it, out of order
+// across paths. Transfers whose application reads at once hold no pages, yet
+// their windows together must stay within the receive region, or out-of-order
+// data from a few path skews fill it and every hole waits for a repair round
+// trip (a 128 MB client with eight duplex transfers fell to tens of Mbps).
+func TestReceiveWindowsStayWithinRegion(t *testing.T) {
+	budget := newMemoryBudget(16<<20, false)
+	cfg := testCoreConfig()
+	cfg.FrameSize = 64 << 10
+	cfg.ReceiveWindowBytes = 512 << 20
+	cfg.Memory = budget
+	const sessions, transfers = 8, 6
+	cores := make([]*mpCore, sessions)
+	first := make([]uint64, sessions)
+	now := time.Now()
+	for i := range cores {
+		cores[i], _ = newCore(context.Background(), cfg)
+		defer cores[i].Close()
+		cores[i].stateMu.Lock()
+		first[i] = cores[i].receiveTargetLocked(now)
+		cores[i].rx.Advertise(first[i])
+		cores[i].stateMu.Unlock()
+	}
+	// fill delivers data in order up to end and lets the application read
+	// them at once, so the session holds no pages afterwards.
+	fill := func(c *mpCore, end uint64) {
+		chunk := make([]byte, cfg.FrameSize)
+		for c.rx.Next < end {
+			n := min(uint64(len(chunk)), end-c.rx.Next)
+			if _, err := c.rx.Insert(c.rx.Next, chunk[:n]); err != nil {
+				t.Fatal(err)
+			}
+			for data := c.rx.Readable(); data != nil; data = c.rx.Readable() {
+				c.rx.Consume(len(data))
+			}
+		}
+	}
+	for round := 0; round < 12; round++ {
+		for i, c := range cores {
+			c.stateMu.Lock()
+			// The transfers take turns delivering most of their window
+			// between two feedback frames; the others are keep-alive
+			// connections.
+			if i < transfers && (round+i)%3 == 0 {
+				fill(c, c.rx.WindowEnd-(c.rx.WindowEnd-c.rx.ReadNext)/8)
+			} else if i >= transfers {
+				fill(c, c.rx.Next+100)
+			}
+			c.rx.Advertise(c.receiveTargetLocked(now))
+			c.stateMu.Unlock()
+			now = now.Add(levelTTL)
+		}
+	}
+	budget.access.Lock()
+	region := uint64(budget.rxRegionLocked() / 4 * 3 / stream.PageCharge * stream.PageSize)
+	budget.access.Unlock()
+	var promised uint64
+	for i, c := range cores {
+		c.stateMu.Lock()
+		window := c.rx.WindowEnd - c.rx.ReadNext
+		c.stateMu.Unlock()
+		if i < transfers {
+			promised += window
+		} else if window > first[i] {
+			t.Fatalf("keep-alive session %d grew its window from %d to %d", i, first[i], window)
+		}
+	}
+	if promised > region+transfers*uint64(cfg.FrameSize) {
+		t.Fatalf("open windows of transfers total %d bytes, receive region %d", promised, region)
+	}
+}
+
+// Keep-alive connections are not counted for the windows their senders never
+// fill, so a transfer that wants more still gets nearly all of the region
+// beside them.
+func TestBulkReceiverBesideKeepAliveSessions(t *testing.T) {
+	budget := newMemoryBudget(64<<20, false)
+	cfg := testCoreConfig()
+	cfg.FrameSize = 64 << 10
+	cfg.ReceiveWindowBytes = 512 << 20
+	cfg.Memory = budget
+	now := time.Now()
+	for i := 0; i < 20; i++ {
+		c, _ := newCore(context.Background(), cfg)
+		defer c.Close()
+		c.stateMu.Lock()
+		if _, err := c.rx.Insert(0, make([]byte, 100)); err != nil {
+			t.Fatal(err)
+		}
+		c.rx.Consume(100)
+		c.rx.Advertise(c.receiveTargetLocked(now))
+		c.stateMu.Unlock()
+	}
+	bulk, _ := newCore(context.Background(), cfg)
+	defer bulk.Close()
+	bulk.stateMu.Lock()
+	defer bulk.stateMu.Unlock()
+	if _, err := bulk.rx.Insert(0, make([]byte, stream.InitialWindow)); err != nil {
+		t.Fatal(err)
+	}
+	for data := bulk.rx.Readable(); data != nil; data = bulk.rx.Readable() {
+		bulk.rx.Consume(len(data))
+	}
+	target := bulk.receiveTargetLocked(now.Add(levelTTL))
+	budget.access.Lock()
+	region := uint64(budget.rxRegionLocked() / 4 * 3 / stream.PageCharge * stream.PageSize)
+	budget.access.Unlock()
+	if keepAlive := uint64(20 * stream.InitialWindow); target+keepAlive+uint64(cfg.FrameSize) < region {
+		t.Fatalf("bulk transfer beside 20 keep-alive sessions got %d of a %d byte region", target, region)
+	}
+}
+
+// A window-limited transfer whose application reads at once never shows its
+// sender at the window edge when feedback is sent: each round trip delivers
+// one window, spread over several feedback intervals. Its window must still
+// grow.
+func TestPromptReaderWindowGrows(t *testing.T) {
+	budget := newMemoryBudget(64<<20, false)
+	cfg := testCoreConfig()
+	cfg.FrameSize = 64 << 10
+	cfg.ReceiveWindowBytes = 512 << 20
+	cfg.Memory = budget
+	core, _ := newCore(context.Background(), cfg)
+	defer core.Close()
+	core.stateMu.Lock()
+	defer core.stateMu.Unlock()
+	now := time.Now()
+	chunk := make([]byte, cfg.FrameSize)
+	for i := 0; i < 8; i++ {
+		// Half of the window arrives between two feedback frames.
+		end := core.rx.ReadNext + (core.rx.WindowEnd-core.rx.ReadNext)/2
+		for core.rx.Next < end {
+			n := min(uint64(len(chunk)), end-core.rx.Next)
+			if _, err := core.rx.Insert(core.rx.Next, chunk[:n]); err != nil {
+				t.Fatal(err)
+			}
+			for data := core.rx.Readable(); data != nil; data = core.rx.Readable() {
+				core.rx.Consume(len(data))
+			}
+		}
+		core.rx.Advertise(core.receiveTargetLocked(now))
+		now = now.Add(5 * time.Millisecond)
+	}
+	if window := core.rx.WindowEnd - core.rx.ReadNext; window <= 4*stream.InitialWindow {
+		t.Fatalf("window-limited transfer stayed at a %d byte window", window)
+	}
+}
