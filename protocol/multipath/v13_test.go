@@ -201,6 +201,16 @@ func TestFeedbackMergeAcrossLegs(t *testing.T) {
 	if window != 4096 || !pressure {
 		t.Fatalf("stale feedback overrode newer state: window=%d pressure=%v", window, pressure)
 	}
+	// A newer limit may be lower: the receiver took back an unused window.
+	if err := core.handleWindow(flowMessage{Next: 0, Limit: 1024, Seq: 6}); err != nil {
+		t.Fatal(err)
+	}
+	core.stateMu.Lock()
+	window = core.tx.WindowEnd
+	core.stateMu.Unlock()
+	if window != 1024 {
+		t.Fatalf("newer feedback did not lower the window: %d", window)
+	}
 }
 
 // While the application is backlogged, a slower path whose completion is far

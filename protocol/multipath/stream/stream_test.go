@@ -139,8 +139,8 @@ func TestPressureKeepsAcknowledgedBytesAndAdmitsHead(t *testing.T) {
 		t.Fatal("receiver failed to resume after application read")
 	}
 	end := r.WindowEnd
-	if r.Advertise(0) != end {
-		t.Fatal("pressure shrank window")
+	if r.Advertise(0) != r.Ack() || r.WindowEnd != end {
+		t.Fatal("a smaller limit must stop at the acknowledged prefix and keep sent bytes acceptable")
 	}
 	r.Close()
 	if memory.used != 0 {
@@ -169,7 +169,7 @@ func TestSenderPartialACKAndWriterOwnership(t *testing.T) {
 	if err := s.Sent(part); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Acknowledge(6, 100); err != nil {
+	if err := s.Acknowledge(6, 100, true); err != nil {
 		t.Fatal(err)
 	}
 	if data, ok := s.Range(6, 100); !ok || string(data.Data()) != "ghijklmnop" {
@@ -182,7 +182,7 @@ func TestSenderPartialACKAndWriterOwnership(t *testing.T) {
 	if err := s.Sent(part2); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Acknowledge(16, 100); err != nil {
+	if err := s.Acknowledge(16, 100, true); err != nil {
 		t.Fatal(err)
 	}
 	if released != 0 {
@@ -209,10 +209,10 @@ func TestSenderWindowAndFIN(t *testing.T) {
 	if _, ok := s.NextRange(100); ok || s.SendFIN() {
 		t.Fatal("overran window")
 	}
-	if err := s.Acknowledge(3, 7); err != nil {
+	if err := s.Acknowledge(3, 7, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Acknowledge(2, 4); err != nil || s.WindowEnd != 7 || s.Una != 3 {
+	if err := s.Acknowledge(2, 4, false); err != nil || s.WindowEnd != 7 || s.Una != 3 {
 		t.Fatal("stale ACK shrank state")
 	}
 	part, _ = s.NextRange(100)
@@ -220,11 +220,54 @@ func TestSenderWindowAndFIN(t *testing.T) {
 	if !s.SendFIN() || s.Next != 7 {
 		t.Fatal("FIN did not consume one byte")
 	}
-	if err := s.Acknowledge(8, 9); err == nil {
+	if err := s.Acknowledge(8, 9, true); err == nil {
 		t.Fatal("accepted future ACK")
 	}
-	if err := s.Acknowledge(7, 7); err != nil || !s.FINAcked {
+	if err := s.Acknowledge(7, 7, true); err != nil || !s.FINAcked {
 		t.Fatal("FIN acknowledgement lost")
+	}
+}
+
+// A receiver may lower its limit to take back an unused window. The sender
+// stops new data at the newest limit; bytes it sent before hearing of it
+// stay acceptable up to the highest limit ever advertised.
+func TestWindowLimitShrinks(t *testing.T) {
+	r := NewReceiver(64*PageSize, nil)
+	r.Advertise(8 * PageSize)
+	if limit := r.Advertise(2 * PageSize); limit != 2*PageSize || r.WindowEnd != 64*PageSize {
+		t.Fatalf("limit=%d edge=%d", limit, r.WindowEnd)
+	}
+	if _, err := r.Insert(6*PageSize, make([]byte, PageSize)); err != nil {
+		t.Fatal("bytes sent before the shrink were refused:", err)
+	}
+	if _, err := r.Insert(64*PageSize, []byte{1}); err == nil {
+		t.Fatal("bytes beyond every advertised limit were accepted")
+	}
+	if _, err := r.Insert(0, make([]byte, 3*PageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if limit := r.Advertise(PageSize); limit != r.Ack() {
+		t.Fatalf("limit %d fell below the acknowledged prefix %d", limit, r.Ack())
+	}
+
+	s := NewSender(100)
+	_ = s.Append(NewBuffer(make([]byte, 50), nil))
+	part, _ := s.NextRange(20)
+	_ = s.Sent(part)
+	if err := s.Acknowledge(0, 10, true); err != nil || s.WindowEnd != 10 {
+		t.Fatal("newest feedback did not lower the limit", err)
+	}
+	if _, ok := s.NextRange(100); ok {
+		t.Fatal("sent new data beyond a lowered limit")
+	}
+	if err := s.Acknowledge(0, 100, false); err != nil || s.WindowEnd != 10 {
+		t.Fatal("stale feedback raised the limit")
+	}
+	if err := s.Acknowledge(20, 40, true); err != nil {
+		t.Fatal(err)
+	}
+	if part, ok := s.NextRange(100); !ok || part.Seq != 20 || part.Length != 20 {
+		t.Fatal("sender did not resume at the raised limit")
 	}
 }
 

@@ -360,9 +360,10 @@ func TestReceiveShareCountsUnreadPages(t *testing.T) {
 	core.receiveTargetLocked(time.Now())
 	core.stateMu.Unlock()
 	budget.access.Lock()
-	held := budget.receivers.seen[core].held
+	held := budget.windows.seen[core].held
 	budget.access.Unlock()
-	if held < payload/stream.PageSize*stream.PageCharge {
+	// The head page is prepaid by the session, not taken from the region.
+	if held < (payload/stream.PageSize-1)*stream.PageCharge {
 		t.Fatalf("4 MiB of unread pages reported as %d held bytes", held)
 	}
 }
@@ -494,6 +495,35 @@ func TestHelloNoncesChargeBudget(t *testing.T) {
 	}
 	if err := i.rememberNonce([16]byte{0xee}, now); !errors.Is(err, errHelloNonceStorage) {
 		t.Fatal("nonce accepted without being recorded: ", err)
+	}
+}
+
+// A hello whose nonce cannot be recorded for lack of memory is refused, but as
+// a retryable resource rejection: an authentication failure would end the
+// client's healthy session when a leg rejoins under memory pressure.
+func TestNonceStorageRejectionIsRetryable(t *testing.T) {
+	router := &routeRecorder{routed: make(chan net.Conn, 1)}
+	i := newClosableInbound(router)
+	i.psk = "secret"
+	defer i.Close()
+	budget := i.cfg.Memory
+	for budget.reservePage(4096, false) {
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	go i.NewConnection(i.ctx, server, adapter.InboundContext{}, nil)
+	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := writeHello(client, helloMessage{Session: [16]byte{9}, LegID: 1, FrameSize: 65536, Destination: "example.com:443", PSK: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := readHelloResponse(client)
+	if reason, rejected := helloRejectReasonFromError(err); !rejected || reason != helloRejectLegUnavailable || reason.fatal(true) {
+		t.Fatalf("nonce storage failure answered with %v", err)
+	}
+	select {
+	case <-router.routed:
+		t.Fatal("unrecorded hello was accepted")
+	default:
 	}
 }
 

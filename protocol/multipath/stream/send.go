@@ -72,6 +72,8 @@ type Sender struct {
 	Una       uint64
 	Next      uint64
 	WriteNext uint64
+	// WindowEnd is the receiver's latest limit. It may fall below Next after
+	// the receiver shrank its window; no new data are sent until it passes.
 	WindowEnd uint64
 	FIN       uint64
 	HasFIN    bool
@@ -153,13 +155,17 @@ func (s *Sender) SendFIN() bool {
 	return true
 }
 
-// Acknowledge handles duplicate/reordered window updates without shrinking the
-// right edge. Partial byte ACKs trim the queue without retaining frame indexes.
-func (s *Sender) Acknowledge(next, windowEnd uint64) error {
+// Acknowledge handles duplicate and reordered feedback: the acknowledgement
+// only advances, and the window limit follows only the newest feedback, so a
+// stale copy never overrides a limit the receiver has since lowered or
+// raised. Partial byte ACKs trim the queue without retaining frame indexes.
+func (s *Sender) Acknowledge(next, windowEnd uint64, newest bool) error {
 	if next > s.Next || windowEnd < next {
 		return ErrSequence
 	}
-	s.WindowEnd = max(s.WindowEnd, windowEnd)
+	if newest {
+		s.WindowEnd = windowEnd
+	}
 	if next <= s.Una {
 		return nil
 	}

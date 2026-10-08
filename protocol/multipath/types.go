@@ -176,6 +176,8 @@ type mpCore struct {
 	reportedFull      bool           // stateMu; last feedback asked the sender to pause
 	receivedSeen      uint64         // stateMu; rx.MaxSeen at the last feedback
 	receiveGrant      uint64         // stateMu; window size granted at the last feedback; 0 before the first
+	windowReview      atomic.Bool    // the node asked for the receive window to be recomputed
+	receiveReviewed   bool           // stateMu; the next window is computed for a review
 	arrivalAt         time.Time      // stateMu; start of the current arrival second
 	arrivalBase       uint64         // stateMu; rx.MaxSeen at arrivalAt
 	arrivalPrev       uint64         // stateMu; bytes that arrived in the previous second

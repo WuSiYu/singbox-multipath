@@ -124,8 +124,12 @@ func freePage(page *receivePage) { pagePool.Put(page) }
 // Its sparse, byte-addressed pages bound metadata even for one-byte frames.
 // Individual path receipts do not belong to this state machine.
 type Receiver struct {
-	Next      uint64
-	ReadNext  uint64
+	Next     uint64
+	ReadNext uint64
+	// Limit is the latest window edge advertised; it may shrink. WindowEnd is
+	// the highest edge ever advertised: a sender may have sent up to it before
+	// it learned of a smaller limit, so bytes below it are always acceptable.
+	Limit     uint64
 	WindowEnd uint64
 	Capacity  uint64
 	FIN       uint64
@@ -152,7 +156,7 @@ func NewReceiver(capacity uint64, memory PageMemory) *Receiver {
 	if memory != nil {
 		window = min(capacity, InitialWindow)
 	}
-	return &Receiver{WindowEnd: window, Capacity: capacity, pages: make(map[uint64]*receivePage), memory: memory}
+	return &Receiver{Limit: window, WindowEnd: window, Capacity: capacity, pages: make(map[uint64]*receivePage), memory: memory}
 }
 
 func (r *Receiver) Ack() uint64 {
@@ -334,16 +338,20 @@ func (r *Receiver) Consume(length int) {
 	}
 }
 
-// Advertise slides the window to ReadNext+target, bounded by Capacity. The
-// right edge never retracts. Storage is allocated lazily as bytes arrive.
+// Advertise sets the limit to ReadNext+target, bounded by Capacity and never
+// below the acknowledged prefix, and returns it. The limit may shrink: the
+// sender stops sending new data beyond it once it hears of it, which lets an
+// idle session give its window back. Storage is allocated lazily as bytes
+// arrive.
 func (r *Receiver) Advertise(target uint64) uint64 {
 	target = min(target, r.Capacity)
 	end := uint64(math.MaxUint64)
 	if target <= math.MaxUint64-r.ReadNext {
 		end = r.ReadNext + target
 	}
-	r.WindowEnd = max(r.WindowEnd, end)
-	return r.WindowEnd
+	r.Limit = max(end, r.Ack())
+	r.WindowEnd = max(r.WindowEnd, r.Limit)
+	return r.Limit
 }
 
 func (r *Receiver) pruneTail(keep uint64) bool {

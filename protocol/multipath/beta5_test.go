@@ -326,8 +326,9 @@ type beta5HeldConn struct {
 	once    sync.Once
 }
 
+// Write holds the first DATA frame; feedback and other control frames pass.
 func (c *beta5HeldConn) Write(data []byte) (int, error) {
-	if len(data) > dataFrameHeaderSize {
+	if len(data) > dataFrameHeaderSize && data[0] == frameTypeData {
 		c.once.Do(func() { close(c.entered); <-c.hold })
 	}
 	return c.Conn.Write(data)
@@ -375,7 +376,9 @@ func TestBeta5HeldSecondaryWriterDoesNotOwnACKedBuffer(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatal("reinjection or buffer ownership corrupted data")
 	}
-	if a.fallbackB.Load() == 0 {
+	// Whichever repair reached the data first, opportunistic (fallbackB) or
+	// at the tail (tailB), the held writer's buffer was resent.
+	if a.fallbackB.Load()+a.tailB.Load() == 0 {
 		t.Fatal("held secondary did not exercise reinjection")
 	}
 }

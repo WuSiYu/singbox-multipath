@@ -16,7 +16,7 @@ func TestIdleSenderReleasesLargeIndexes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.Acknowledge(s.Next, s.WindowEnd); err != nil {
+	if err := s.Acknowledge(s.Next, s.WindowEnd, true); err != nil {
 		t.Fatal(err)
 	}
 	if cap(s.segments) > 1024 {

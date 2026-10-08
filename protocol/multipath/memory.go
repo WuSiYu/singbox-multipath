@@ -59,11 +59,14 @@ type memoryPressureEvent struct {
 }
 
 // activitySet counts sessions which used one direction within activityWindow,
-// with what each holds and whether it wants more. Callers hold
-// memoryBudget.access.
+// with what each holds and whether it wants more. A persistent set keeps every
+// session until it is removed. Callers hold memoryBudget.access.
 type activitySet struct {
-	seen      map[any]activity
-	lastPrune int64
+	seen       map[any]activity
+	persistent bool
+	total      int64 // sum of held
+	wanting    int   // sessions that want more
+	lastPrune  int64
 	// level caches maxMinLevel for levelTTL; it changes with demand, not
 	// with every write.
 	level, levelRegion, levelAt int64
@@ -71,6 +74,7 @@ type activitySet struct {
 
 type activity struct {
 	at      int64
+	since   int64 // when held last grew
 	held    int64
 	wanting bool
 }
@@ -83,18 +87,48 @@ func (s *activitySet) report(key any, now, held int64, wanting bool) {
 	if s.seen == nil {
 		s.seen = make(map[any]activity)
 	}
-	s.seen[key] = activity{at: now, held: held, wanting: wanting}
+	old, ok := s.seen[key]
+	s.total += held - old.held
+	s.wanting += boolInt(wanting) - boolInt(old.wanting)
+	since := old.since
+	if !ok || held > old.held {
+		since = now
+	}
+	s.seen[key] = activity{at: now, since: since, held: held, wanting: wanting}
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// hold updates what a reported session holds.
+func (s *activitySet) hold(key any, now, held int64) {
+	if a, ok := s.seen[key]; ok {
+		s.total += held - a.held
+		if held > a.held {
+			a.since = now
+		}
+		a.held = held
+		s.seen[key] = a
+	}
 }
 
 func (s *activitySet) remove(key any) {
+	s.total -= s.seen[key].held
+	s.wanting -= boolInt(s.seen[key].wanting)
 	delete(s.seen, key)
 }
 
 func (s *activitySet) count(now int64) int {
-	if now-s.lastPrune >= int64(activityWindow/10) {
+	if !s.persistent && now-s.lastPrune >= int64(activityWindow/10) {
 		s.lastPrune = now
 		for key, a := range s.seen {
 			if now-a.at >= int64(activityWindow) {
+				s.total -= a.held
+				s.wanting -= boolInt(a.wanting)
 				delete(s.seen, key)
 			}
 		}
@@ -115,14 +149,28 @@ func (s *activitySet) maxMinLevel(region, now int64) int64 {
 		return s.level
 	}
 	n := s.count(now)
-	light := make([]int64, 0, n)
-	for _, a := range s.seen {
+	// Sessions that want nothing and hold nothing (idle connections) keep
+	// their nothing; only the others need sorting.
+	light := make([]int64, 0)
+	k := int64(n)
+	for key, a := range s.seen {
+		if a.wanting && now-a.at >= int64(activityWindow) {
+			// A session that wanted more but has not reported for a
+			// second (its transfer paused) no longer does.
+			a.wanting = false
+			s.seen[key] = a
+			s.wanting--
+		}
 		if !a.wanting {
-			light = append(light, a.held)
+			if a.held <= 0 {
+				k--
+			} else {
+				light = append(light, a.held)
+			}
 		}
 	}
 	slices.Sort(light)
-	remaining, k := region, int64(n)
+	remaining := region
 	for _, held := range light {
 		if held*k > remaining {
 			break
@@ -155,7 +203,11 @@ type memoryBudget struct {
 	tx, rx, other, cached int64
 	cache                 map[int][][]byte
 
-	senders, receivers activitySet
+	// receivers are the sessions that received data within activityWindow;
+	// windows holds every live session's receive window, idle or not.
+	senders, receivers, windows activitySet
+	reviewAt                    int64 // last time sessions above their share were asked to give way
+	fullReviewAt                int64 // last time idle windows were asked back for a full region
 
 	pressure      bool
 	pressureSince time.Time
@@ -211,6 +263,7 @@ func newMemoryBudget(limit int64, automatic bool) *memoryBudget {
 		cache:      make(map[int][][]byte),
 		changed:    make(chan struct{}),
 		events:     make(chan memoryPressureEvent, 4),
+		windows:    activitySet{persistent: true},
 	}
 }
 
@@ -482,45 +535,112 @@ func (b *memoryBudget) rxRelease(size int64) {
 	b.access.Unlock()
 }
 
-// receiveShare returns key's fair window share in payload bytes, and marks key
-// as an active receiver when it is receiving data. A session that only sends
-// feedback for an idle direction is not active: counting it would reserve
-// half of the node's pool for receiving and halve the transmit region.
-func (b *memoryBudget) receiveShare(key any, now time.Time, active bool, held int64, wanting bool) int64 {
+// receiveRoom is what a session's receive window may take, in payload bytes.
+type receiveRoom struct {
+	share int64 // max-min share of the receive region
+	free  int64 // part of the region no other session holds
+	start int64 // a first window that free cannot cover may still take this
+	busy  bool  // another session wants more
+}
+
+// receiveShare records key's receive window: held is the storage it may
+// still need (its stored pages, or its open window), and wanting whether that
+// window limits its sender. It returns the room its window has, and marks key
+// as an active receiver when data arrived. A session that only sends feedback
+// for an idle direction is not active: counting it would reserve half of the
+// node's pool for receiving and halve the transmit region.
+func (b *memoryBudget) receiveShare(key any, now time.Time, active bool, held int64, wanting, first bool) receiveRoom {
 	b.access.Lock()
 	defer b.access.Unlock()
 	nanos := now.UnixNano()
 	if active {
-		b.receivers.report(key, nanos, held, wanting)
+		b.receivers.mark(key, nanos)
 	}
+	b.windows.report(key, nanos, held, wanting)
+	whole := b.rxRegionLocked()
+	region := whole / 4 * 3
+	free := max(0, region-b.windows.total+held)
 	if b.pressure {
 		// Stored data already exceed the pool: grow no window beyond the
 		// floor until applications drain it.
-		return receiveWindowFloor
+		return receiveRoom{share: receiveWindowFloor}
 	}
-	return b.receiveShareLocked(nanos)
+	level := b.windows.maxMinLevel(region, nanos)
+	bytes := func(charge int64) int64 { return charge / stream.PageCharge * stream.PageSize }
+	// A first window of 1/128 of the region (at least 256 KiB) may use the
+	// spare quarter, so connections that start together, or beside
+	// transfers holding the whole region, are not left with one frame. All
+	// promises together still fit the receive region.
+	startCharge := max(receiveWindowFloor/stream.PageSize*stream.PageCharge, region/128)
+	start := min(bytes(startCharge), bytes(max(0, whole-b.windows.total+held)))
+	// Windows are given back on demand, since a session lowers its limit
+	// only at its own next feedback. A transfer waiting for memory asks the
+	// sessions above their share, and those whose senders do not need their
+	// windows; a new connection whose first window does not fit asks the
+	// latter once they have held their windows for a second.
+	starved := wanting && free < level && nanos-b.reviewAt >= int64(levelTTL)
+	full := first && whole-b.windows.total+held < startCharge && nanos-b.fullReviewAt >= int64(fullReviewInterval)
+	if starved || full {
+		if starved {
+			b.reviewAt = nanos
+		}
+		if full {
+			b.fullReviewAt = nanos
+		}
+		for other, a := range b.windows.seen {
+			unused := !a.wanting && a.held > 0
+			if reviewer, ok := other.(windowReviewer); ok && other != key &&
+				(starved && (a.held > level || unused) || full && unused && nanos-a.since >= int64(activityWindow)) {
+				reviewer.reviewReceiveWindow()
+			}
+		}
+	}
+	busy := b.windows.wanting > boolInt(wanting)
+	return receiveRoom{share: max(receiveWindowFloor, bytes(level)), free: bytes(free), start: start, busy: busy}
+}
+
+// fullReviewInterval spaces requests to give idle windows back while the
+// receive region is full of them, so sessions that do use their windows are
+// not asked with every new connection.
+const fullReviewInterval = 100 * time.Millisecond
+
+// windowReviewer is a session that can be asked to recompute its receive
+// window promptly. It must not block.
+type windowReviewer interface {
+	reviewReceiveWindow()
+}
+
+// holdReceive records the window key has just granted.
+func (b *memoryBudget) holdReceive(key any, now time.Time, held int64) {
+	b.access.Lock()
+	b.windows.hold(key, now.UnixNano(), held)
+	b.access.Unlock()
 }
 
 // receiveShareLocked divides three quarters of the receive region max-min
-// fairly among the active receivers: one whose sender is not limited by its
-// window keeps what it holds (stored pages, or the window its sender keeps
-// filling), and window-limited transfers share the rest. The remaining
-// quarter absorbs page-granularity overhead and arrivals beyond a window
-// edge, so a slow application can fill its own window without pushing
-// out-of-order data elsewhere into the drop path.
+// fairly among the sessions' receive windows: one whose sender is not limited
+// by its window keeps what it holds, and window-limited transfers share the
+// rest. The remaining quarter absorbs page-granularity overhead and arrivals
+// beyond a lowered limit, so a slow application can fill its own window
+// without pushing out-of-order data elsewhere into the drop path.
 func (b *memoryBudget) receiveShareLocked(nanos int64) int64 {
-	share := b.receivers.maxMinLevel(b.rxRegionLocked()/4*3, nanos)
+	share := b.windows.maxMinLevel(b.rxRegionLocked()/4*3, nanos)
 	return max(receiveWindowFloor, share/stream.PageCharge*stream.PageSize)
 }
 
 // transmitShare records key as an active sender holding held bytes of
 // transmit payload, and whether it wants more, and returns its max-min fair
-// share of the transmit region.
+// share of the transmit region. A session that holds no transmit payload and
+// whose writer is not blocked is not active: status reports and scheduling
+// checks ask for every session's limit, and counting an idle direction would
+// reserve half of a download-only node's pool for sending.
 func (b *memoryBudget) transmitShare(key any, now time.Time, held int64, wanting bool) int64 {
 	b.access.Lock()
 	defer b.access.Unlock()
 	nanos := now.UnixNano()
-	b.senders.report(key, nanos, held, wanting)
+	if held > 0 || wanting {
+		b.senders.report(key, nanos, held, wanting)
+	}
 	return b.senders.maxMinLevel(b.txRegionLocked(), nanos)
 }
 
@@ -528,6 +648,7 @@ func (b *memoryBudget) forget(key any) {
 	b.access.Lock()
 	b.senders.remove(key)
 	b.receivers.remove(key)
+	b.windows.remove(key)
 	b.access.Unlock()
 }
 

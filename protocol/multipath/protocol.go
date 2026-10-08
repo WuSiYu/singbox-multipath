@@ -127,7 +127,7 @@ func (r helloRejectReason) String() string {
 	case helloRejectDuplicateControl:
 		return "session already has a control leg"
 	case helloRejectLegUnavailable:
-		return "leg already attached or joining"
+		return "leg already attached or joining, or server memory limit reached"
 	case helloRejectSessionUnavailable:
 		return "control session is not established yet or is already closed"
 	case helloRejectPolicy:

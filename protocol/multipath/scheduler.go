@@ -41,6 +41,17 @@ func (c *mpCore) pumpLoop() {
 		if c.cfg.Recovery != nil && now.Sub(lastFeedback) >= time.Second {
 			c.feedbackDirty = true
 		}
+		// The node asked for the receive window to be recomputed: another
+		// session waits for memory this one may not use. Only the control
+		// leg carries such feedback: it is not urgent, and an idle
+		// connection should not touch a secondary path.
+		controlOnly := false
+		if c.windowReview.Swap(false) {
+			c.receiveReviewed = true
+			if !c.feedbackDirty {
+				c.feedbackDirty, controlOnly = true, true
+			}
+		}
 		// A sender paused by our "full" report must learn promptly when room
 		// returns, even if nothing arrives or is read meanwhile.
 		if c.reportedFull {
@@ -61,7 +72,7 @@ func (c *mpCore) pumpLoop() {
 					// carries a copy at least every 20 ms, or immediately when
 					// the chosen leg's writer is stuck, so ACKs, windows and
 					// path receipts never depend on a single path.
-					if leg == primary || leg.ready.Load() && (now.Sub(leg.feedbackAt) >= feedbackCopyInterval || blocked >= max(10*time.Millisecond, leg.path.SRTT/2)) {
+					if leg == primary || !controlOnly && leg.ready.Load() && (now.Sub(leg.feedbackAt) >= feedbackCopyInterval || blocked >= max(10*time.Millisecond, leg.path.SRTT/2)) {
 						leg.queueFeedback(frame, now)
 					}
 				}
@@ -236,56 +247,108 @@ func (c *mpCore) feedbackLockedWithoutLegs() flowMessage {
 // receiveTargetLocked returns the window to advertise: the configured ceiling
 // capped by this session's fair share of the node's receive region. Storage is
 // allocated only as data arrive, but an open window is a promise: the sender
-// may fill all of it, in any order across paths. A session's first window is
-// the share, so a response on a new connection is not held back a round trip.
-// Afterwards it grows only while the window limits the sender, and each
-// session reports the part of its window its sender is likely to fill, so
-// the windows of active transfers stay within the region and out-of-order
-// data cannot fill it. It never falls below one frame: the peer may send a
-// whole frame before any feedback, and a smaller window would turn that first
-// frame into an error.
+// may fill all of it, in any order across paths. Every session, idle or not,
+// therefore holds its open window in the region, and the windows of all
+// sessions stay within it, so out-of-order data cannot fill it. Limits may
+// shrink, so a window that is not used can be given back:
+//   - a session's first window is half of what no other session holds, so a
+//     response on a new connection is not held back a round trip, and at
+//     least a small window when others hold the whole region; only the
+//     small one while other transfers are growing;
+//   - while the window limits the sender it grows to the max-min share, into
+//     what the other sessions do not hold;
+//   - otherwise it keeps its size, within the share, until another session
+//     waits for the memory: then it follows what arrives, down to one frame
+//     for an idle connection. With memory to spare, an idle connection that
+//     resumes a transfer is not held back.
+//
+// It never falls below one frame: the peer may send a whole frame before any
+// feedback, and a smaller window would turn that first frame into an error.
 func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
 	// Receiving means data arrived since the last feedback or still wait to
 	// be read; periodic feedback for an idle direction does not count.
 	buffered, _, _ := c.rx.Buffered()
 	active := c.rx.MaxSeen != c.receivedSeen || buffered > 0
 	c.receivedSeen = c.rx.MaxSeen
-	window := c.rx.WindowEnd - min(c.rx.ReadNext, c.rx.WindowEnd)
+	window := c.rx.Limit - min(c.rx.ReadNext, c.rx.Limit)
 	recent := c.recentArrivalsLocked(now)
+	first := c.receiveGrant == 0
+	grant := c.receiveGrant
+	if first {
+		grant = window
+	}
 	// The window limits the sender when unread data fill three quarters of
 	// it, or when it is less than 4/3 of what arrived in about the last
 	// second. A window-limited transfer delivers one window per round trip;
 	// with an application that reads at once, the edge alone cannot show
 	// that once the round trip exceeds the feedback interval. A keep-alive
 	// connection never comes close to either.
-	grant := c.receiveGrant
-	if grant == 0 {
-		grant = window
-	}
-	wanting := c.rx.MaxSeen+window/4 >= c.rx.WindowEnd || 3*grant < 4*recent
-	// The window a transfer keeps using is held as surely as stored pages;
-	// the large first window of a keep-alive connection is not.
-	atRisk := min(window, recent+recent/3)
-	pages := max(int64(c.rx.Pages()), int64((atRisk+stream.PageSize-1)/stream.PageSize))
-	share := uint64(c.memory.receiveShare(c, now, active, pages*stream.PageCharge, wanting))
-	if !wanting && c.receiveGrant > 0 {
+	wanting := c.rx.MaxSeen+window/4 >= c.rx.Limit || 3*grant < 4*recent
+	room := c.memory.receiveShare(c, now, active, c.receiveHeldLocked(window), wanting, first)
+	share, free, frame := uint64(room.share), uint64(room.free), uint64(c.cfg.FrameSize)
+	reviewed := c.receiveReviewed
+	c.receiveReviewed = false
+	switch {
+	case first && room.busy:
+		// Transfers are growing into the region: a new connection does
+		// not take half of what they are about to use.
+		share = min(share, uint64(room.start))
+		free = max(free, uint64(room.start))
+	case first:
+		share = min(share, max(free/2, uint64(room.start)))
+		free = max(free, uint64(room.start))
+	case !wanting && reviewed && (c.rx.MaxSeen > 0 || now.Sub(c.startedAt) >= activityWindow):
+		// Another session waits for memory: keep what the sender uses. A
+		// new connection that has received nothing yet may be waiting for
+		// its first response, and keeps its window for a second.
+		share = min(share, max(frame, recent+recent/3))
+	case !wanting:
 		share = min(share, c.receiveGrant)
 	}
-	c.receiveGrant = max(uint64(c.cfg.FrameSize), min(uint64(c.cfg.ReceiveWindowBytes), share))
+	// The share says who should grow and who should give way; growth only
+	// takes what the others no longer hold, since a session above its share
+	// lowers its limit only at its own next feedback.
+	c.receiveGrant = max(frame, min(uint64(c.cfg.ReceiveWindowBytes), share, max(c.receiveGrant, free)))
+	c.memory.holdReceive(c, now, c.receiveHeldLocked(c.receiveGrant))
 	return c.receiveGrant
 }
 
-// recentArrivalsLocked returns the bytes that arrived in about the last
-// second: the larger of the previous second and the current one so far.
+// receiveHeldLocked is the region storage a window of the given size may
+// need: its pages beyond the first frame, or the pages already stored beyond
+// the head page the session prepaid. One frame per session is not counted,
+// so idle connections hold nothing; the spare quarter of the region covers
+// them.
+func (c *mpCore) receiveHeldLocked(window uint64) int64 {
+	window -= min(window, uint64(c.cfg.FrameSize))
+	stored := c.rx.Pages()
+	if c.headPages > 0 {
+		stored--
+	}
+	return max(int64(stored), int64((window+stream.PageSize-1)/stream.PageSize)) * stream.PageCharge
+}
+
+// reviewReceiveWindow asks the pump to send feedback with a recomputed
+// receive window, so a window above this session's share is given back.
+func (c *mpCore) reviewReceiveWindow() {
+	c.windowReview.Store(true)
+	wakeFlow(c.pumpWake)
+}
+
+// recentArrivalsLocked returns the bytes that arrive in about a second: the
+// larger of the previous second and the current one so far, extrapolated to a
+// second (over at least 100 ms), so a transfer that has just started is not
+// taken for an idle one.
 func (c *mpCore) recentArrivalsLocked(now time.Time) uint64 {
-	if elapsed := now.Sub(c.arrivalAt); elapsed >= activityWindow {
+	elapsed := now.Sub(c.arrivalAt)
+	if elapsed >= activityWindow {
 		c.arrivalPrev = c.rx.MaxSeen - c.arrivalBase
 		if elapsed >= 2*activityWindow {
 			c.arrivalPrev = 0
 		}
-		c.arrivalAt, c.arrivalBase = now, c.rx.MaxSeen
+		c.arrivalAt, c.arrivalBase, elapsed = now, c.rx.MaxSeen, 0
 	}
-	return max(c.arrivalPrev, c.rx.MaxSeen-c.arrivalBase)
+	current := float64(c.rx.MaxSeen-c.arrivalBase) * float64(activityWindow) / float64(max(elapsed, 100*time.Millisecond))
+	return max(c.arrivalPrev, uint64(current))
 }
 
 // repairBudgetLocked limits receiver-requested repairs to a quarter of the
@@ -302,13 +365,15 @@ func (c *mpCore) repairBudgetLocked(now time.Time) bool {
 func (c *mpCore) handleWindow(message flowMessage) error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	if err := c.tx.Acknowledge(message.Next, message.Limit); err != nil {
+	// Copies of feedback travel on both legs and may arrive out of order.
+	// The acknowledgement only advances; the rest, the window limit included,
+	// only applies when newer.
+	newest := message.Seq > c.peerFeedbackSeq
+	if err := c.tx.Acknowledge(message.Next, message.Limit, newest); err != nil {
 		return err
 	}
 	now := time.Now()
-	// Copies of feedback travel on both legs and may arrive out of order.
-	// Monotonic fields merge above; the rest only applies when newer.
-	if message.Seq > c.peerFeedbackSeq {
+	if newest {
 		c.peerFeedbackSeq = message.Seq
 		c.peerPressure = message.Flags&flowFlagPressure != 0
 		c.queueRepairsLocked(message.NACKs, now)

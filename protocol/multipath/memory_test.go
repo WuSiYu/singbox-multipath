@@ -199,7 +199,7 @@ func TestMemoryRegionsCannotStarveEachOther(t *testing.T) {
 	// not reserve receive memory: transmit keeps the whole region.
 	now := time.Now()
 	budget.transmitShare("sender", now, 0, true)
-	budget.receiveShare("receiver", now, false, 0, false)
+	budget.receiveShare("receiver", now, false, 0, false, false)
 	held = fillTX()
 	if tx := budget.snapshot().TXBytes; tx < pool-pool/8-pool/16-(128<<10) {
 		t.Fatalf("idle receiver halved transmit: %d of %d", tx, pool)
@@ -208,7 +208,7 @@ func TestMemoryRegionsCannotStarveEachOther(t *testing.T) {
 		budget.releaseTX(buffer)
 	}
 	// With active sessions in both directions each side keeps half.
-	budget.receiveShare("receiver", now, true, 0, true)
+	budget.receiveShare("receiver", now, true, 0, true, false)
 	held = fillTX()
 	if tx := budget.snapshot().TXBytes; tx > pool/2 || tx < pool/2-pool/16-(128<<10) {
 		t.Fatalf("transmit took %d of %d with both directions active", tx, pool)
@@ -342,23 +342,24 @@ func TestReceiveShareFollowsDemand(t *testing.T) {
 	whole := budget.rxRegionLocked() / 4 * 3
 	budget.access.Unlock()
 	for i := 0; i < 50; i++ {
-		budget.receiveShare(i, now, true, 0, false)
+		budget.receiveShare(i, now, true, 0, false, false)
 	}
-	if share := budget.receiveShare("bulk", now, true, 4<<20, true); share < (whole-stream.PageCharge)/stream.PageCharge*stream.PageSize {
+	if share := budget.receiveShare("bulk", now, true, 4<<20, true, false).share; share < (whole-stream.PageCharge)/stream.PageCharge*stream.PageSize {
 		t.Fatalf("download beside 50 keep-alive connections got a %d byte window of %d", share, whole)
 	}
 	later := now.Add(levelTTL)
-	budget.receiveShare("second", later, true, 0, true)
-	if share := budget.receiveShare("bulk", later, true, 4<<20, true); share > whole/2 {
+	budget.receiveShare("second", later, true, 0, true, false)
+	if share := budget.receiveShare("bulk", later, true, 4<<20, true, false).share; share > whole/2 {
 		t.Fatalf("two window-limited downloads: first got %d of %d", share, whole)
 	}
 }
 
 // An open window is a promise: a sender may fill all of it, out of order
 // across paths. Transfers whose application reads at once hold no pages, yet
-// their windows together must stay within the receive region, or out-of-order
-// data from a few path skews fill it and every hole waits for a repair round
-// trip (a 128 MB client with eight duplex transfers fell to tens of Mbps).
+// the windows of all sessions together must stay within the receive region,
+// or out-of-order data from a few path skews fill it and every hole waits for
+// a repair round trip (a 128 MB client with eight duplex transfers fell to
+// tens of Mbps). Keep-alive connections never grow their windows.
 func TestReceiveWindowsStayWithinRegion(t *testing.T) {
 	budget := newMemoryBudget(16<<20, false)
 	cfg := testCoreConfig()
@@ -366,16 +367,37 @@ func TestReceiveWindowsStayWithinRegion(t *testing.T) {
 	cfg.ReceiveWindowBytes = 512 << 20
 	cfg.Memory = budget
 	const sessions, transfers = 8, 6
+	frame := uint64(cfg.FrameSize)
 	cores := make([]*mpCore, sessions)
-	first := make([]uint64, sessions)
 	now := time.Now()
+	// Each session's reservation shrinks the region a little.
+	regionNow := func() uint64 {
+		budget.access.Lock()
+		defer budget.access.Unlock()
+		return uint64(budget.rxRegionLocked() / 4 * 3 / stream.PageCharge * stream.PageSize)
+	}
+	region := regionNow()
+	firstWindows := make([]uint64, sessions)
 	for i := range cores {
 		cores[i], _ = newCore(context.Background(), cfg)
 		defer cores[i].Close()
 		cores[i].stateMu.Lock()
-		first[i] = cores[i].receiveTargetLocked(now)
-		cores[i].rx.Advertise(first[i])
+		cores[i].rx.Advertise(cores[i].receiveTargetLocked(now))
+		firstWindows[i] = cores[i].rx.Limit - cores[i].rx.ReadNext
 		cores[i].stateMu.Unlock()
+	}
+	promised := func() uint64 {
+		var sum uint64
+		for _, c := range cores {
+			c.stateMu.Lock()
+			window := c.rx.Limit - c.rx.ReadNext
+			c.stateMu.Unlock()
+			sum += window - min(window, frame)
+		}
+		return sum
+	}
+	if sum := promised(); sum > region {
+		t.Fatalf("first windows total %d bytes, receive region %d", sum, region)
 	}
 	// fill delivers data in order up to end and lets the application read
 	// them at once, so the session holds no pages afterwards.
@@ -391,14 +413,14 @@ func TestReceiveWindowsStayWithinRegion(t *testing.T) {
 			}
 		}
 	}
-	for round := 0; round < 12; round++ {
+	for round := 0; round < 60; round++ {
 		for i, c := range cores {
 			c.stateMu.Lock()
 			// The transfers take turns delivering most of their window
 			// between two feedback frames; the others are keep-alive
 			// connections.
 			if i < transfers && (round+i)%3 == 0 {
-				fill(c, c.rx.WindowEnd-(c.rx.WindowEnd-c.rx.ReadNext)/8)
+				fill(c, c.rx.Limit-(c.rx.Limit-c.rx.ReadNext)/8)
 			} else if i >= transfers {
 				fill(c, c.rx.Next+100)
 			}
@@ -406,29 +428,25 @@ func TestReceiveWindowsStayWithinRegion(t *testing.T) {
 			c.stateMu.Unlock()
 			now = now.Add(levelTTL)
 		}
-	}
-	budget.access.Lock()
-	region := uint64(budget.rxRegionLocked() / 4 * 3 / stream.PageCharge * stream.PageSize)
-	budget.access.Unlock()
-	var promised uint64
-	for i, c := range cores {
-		c.stateMu.Lock()
-		window := c.rx.WindowEnd - c.rx.ReadNext
-		c.stateMu.Unlock()
-		if i < transfers {
-			promised += window
-		} else if window > first[i] {
-			t.Fatalf("keep-alive session %d grew its window from %d to %d", i, first[i], window)
+		if sum := promised(); sum > region+transfers*frame {
+			t.Fatalf("round %d: open windows total %d bytes, receive region %d", round, sum, region)
 		}
+		region = regionNow()
 	}
-	if promised > region+transfers*uint64(cfg.FrameSize) {
-		t.Fatalf("open windows of transfers total %d bytes, receive region %d", promised, region)
+	for i := transfers; i < sessions; i++ {
+		c := cores[i]
+		c.stateMu.Lock()
+		window := c.rx.Limit - c.rx.ReadNext
+		c.stateMu.Unlock()
+		if window > firstWindows[i] {
+			t.Fatalf("keep-alive session %d grew its window from %d to %d", i, firstWindows[i], window)
+		}
 	}
 }
 
-// Keep-alive connections are not counted for the windows their senders never
-// fill, so a transfer that wants more still gets nearly all of the region
-// beside them.
+// Keep-alive connections keep their first windows while memory is to spare.
+// A transfer that waits for memory asks them to recompute, and they give back
+// what their senders do not use, so it gets nearly all of the region.
 func TestBulkReceiverBesideKeepAliveSessions(t *testing.T) {
 	budget := newMemoryBudget(64<<20, false)
 	cfg := testCoreConfig()
@@ -436,32 +454,56 @@ func TestBulkReceiverBesideKeepAliveSessions(t *testing.T) {
 	cfg.ReceiveWindowBytes = 512 << 20
 	cfg.Memory = budget
 	now := time.Now()
-	for i := 0; i < 20; i++ {
+	keepAlive := make([]*mpCore, 20)
+	for i := range keepAlive {
 		c, _ := newCore(context.Background(), cfg)
 		defer c.Close()
+		keepAlive[i] = c
 		c.stateMu.Lock()
-		if _, err := c.rx.Insert(0, make([]byte, 100)); err != nil {
+		c.rx.Advertise(c.receiveTargetLocked(now))
+		c.stateMu.Unlock()
+	}
+	now = now.Add(2 * activityWindow)
+	bulk, _ := newCore(context.Background(), cfg)
+	defer bulk.Close()
+	grow := func() uint64 {
+		bulk.stateMu.Lock()
+		defer bulk.stateMu.Unlock()
+		bulk.rx.Advertise(bulk.receiveTargetLocked(now))
+		// The sender fills the window.
+		if _, err := bulk.rx.Insert(bulk.rx.Next, make([]byte, bulk.rx.Limit-bulk.rx.Next)); err != nil {
+			t.Fatal(err)
+		}
+		for data := bulk.rx.Readable(); data != nil; data = bulk.rx.Readable() {
+			bulk.rx.Consume(len(data))
+		}
+		now = now.Add(levelTTL)
+		return bulk.receiveTargetLocked(now)
+	}
+	grow()
+	// The keep-alive sessions were asked; each recomputes as its pump would.
+	for i, c := range keepAlive {
+		c.stateMu.Lock()
+		if c.windowReview.Swap(false) {
+			c.receiveReviewed = true
+		}
+		if !c.receiveReviewed {
+			c.stateMu.Unlock()
+			t.Fatalf("keep-alive session %d was not asked to give its window back", i)
+		}
+		if _, err := c.rx.Insert(c.rx.Next, make([]byte, 100)); err != nil {
 			t.Fatal(err)
 		}
 		c.rx.Consume(100)
 		c.rx.Advertise(c.receiveTargetLocked(now))
 		c.stateMu.Unlock()
 	}
-	bulk, _ := newCore(context.Background(), cfg)
-	defer bulk.Close()
-	bulk.stateMu.Lock()
-	defer bulk.stateMu.Unlock()
-	if _, err := bulk.rx.Insert(0, make([]byte, stream.InitialWindow)); err != nil {
-		t.Fatal(err)
-	}
-	for data := bulk.rx.Readable(); data != nil; data = bulk.rx.Readable() {
-		bulk.rx.Consume(len(data))
-	}
-	target := bulk.receiveTargetLocked(now.Add(levelTTL))
+	now = now.Add(levelTTL)
+	target := grow()
 	budget.access.Lock()
 	region := uint64(budget.rxRegionLocked() / 4 * 3 / stream.PageCharge * stream.PageSize)
 	budget.access.Unlock()
-	if keepAlive := uint64(20 * stream.InitialWindow); target+keepAlive+uint64(cfg.FrameSize) < region {
+	if target+uint64(cfg.FrameSize) < region {
 		t.Fatalf("bulk transfer beside 20 keep-alive sessions got %d of a %d byte region", target, region)
 	}
 }
@@ -481,10 +523,16 @@ func TestPromptReaderWindowGrows(t *testing.T) {
 	core.stateMu.Lock()
 	defer core.stateMu.Unlock()
 	now := time.Now()
+	// Another session holds most of the region, so the first window is small.
+	budget.access.Lock()
+	budget.windows.report("other", now.UnixNano(), budget.rxRegionLocked()/4*3-(1<<20), false)
+	budget.access.Unlock()
+	core.rx.Advertise(core.receiveTargetLocked(now))
+	first := core.rx.Limit - core.rx.ReadNext
 	chunk := make([]byte, cfg.FrameSize)
 	for i := 0; i < 8; i++ {
 		// Half of the window arrives between two feedback frames.
-		end := core.rx.ReadNext + (core.rx.WindowEnd-core.rx.ReadNext)/2
+		end := core.rx.ReadNext + (core.rx.Limit-core.rx.ReadNext)/2
 		for core.rx.Next < end {
 			n := min(uint64(len(chunk)), end-core.rx.Next)
 			if _, err := core.rx.Insert(core.rx.Next, chunk[:n]); err != nil {
@@ -494,10 +542,62 @@ func TestPromptReaderWindowGrows(t *testing.T) {
 				core.rx.Consume(len(data))
 			}
 		}
-		core.rx.Advertise(core.receiveTargetLocked(now))
 		now = now.Add(5 * time.Millisecond)
+		core.rx.Advertise(core.receiveTargetLocked(now))
 	}
-	if window := core.rx.WindowEnd - core.rx.ReadNext; window <= 4*stream.InitialWindow {
-		t.Fatalf("window-limited transfer stayed at a %d byte window", window)
+	budget.access.Lock()
+	budget.windows.remove("other")
+	budget.access.Unlock()
+	now = now.Add(levelTTL)
+	core.rx.Advertise(core.receiveTargetLocked(now))
+	if window := core.rx.Limit - core.rx.ReadNext; window <= 4*first {
+		t.Fatalf("window-limited transfer stayed at a %d byte window (first %d)", window, first)
+	}
+}
+
+// A session that wanted more and then fell silent (its transfer paused, the
+// connection kept open) no longer counts as growing after a second: it
+// neither takes an equal share from others nor holds new connections to the
+// small first window.
+func TestStaleWantingExpires(t *testing.T) {
+	budget := newMemoryBudget(64<<20, false)
+	now := time.Now()
+	budget.receiveShare("paused", now, true, 1<<20, true, false)
+	if room := budget.receiveShare("new", now, false, 0, false, false); !room.busy {
+		t.Fatal("a growing transfer was not seen")
+	}
+	later := now.Add(activityWindow + levelTTL)
+	whole := budget.receiveShare("new", later, false, 0, false, false)
+	if whole.busy {
+		t.Fatal("a paused transfer still counts as growing")
+	}
+	budget.access.Lock()
+	region := budget.rxRegionLocked() / 4 * 3
+	budget.access.Unlock()
+	if whole.share < (region-(1<<20)-stream.PageCharge)/stream.PageCharge*stream.PageSize {
+		t.Fatalf("share %d beside a paused 1 MiB window in a %d region", whole.share, region)
+	}
+}
+
+// Status reports and scheduling checks ask every session for its send history
+// limit. A download-only node whose sessions hold no transmit data must not
+// count them as senders: that reserved half of its pool for sending and
+// halved every receive window.
+func TestIdleSendersDoNotReserve(t *testing.T) {
+	budget := newMemoryBudget(512<<20, false)
+	now := time.Now()
+	for i := 0; i < 64; i++ {
+		budget.transmitShare(i, now, 0, false)
+		budget.receiveShare(i, now, true, 0, true, false)
+	}
+	snapshot := budget.snapshot()
+	if snapshot.ActiveSenders != 0 {
+		t.Fatalf("%d idle directions counted as senders", snapshot.ActiveSenders)
+	}
+	budget.access.Lock()
+	region, pool := budget.rxRegionLocked(), budget.poolLocked()
+	budget.access.Unlock()
+	if region < pool-pool/8-pool/16-budget.snapshot().ReservedBytes {
+		t.Fatalf("download-only receive region %d of a %d pool", region, pool)
 	}
 }

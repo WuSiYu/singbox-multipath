@@ -223,7 +223,14 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 	if i.psk != "" {
 		if err = verifyHelloAuth(auth, i.psk, time.Now(), i.rememberNonce); err != nil {
-			i.rejectHello(conn, onClose, helloRejectAuthentication, err)
+			reason := helloRejectAuthentication
+			if errors.Is(err, errHelloNonceStorage) {
+				// Memory, not authentication: like every other rejection
+				// for lack of memory, the client retries this leg later
+				// and keeps its session.
+				reason = helloRejectLegUnavailable
+			}
+			i.rejectHello(conn, onClose, reason, err)
 			return
 		}
 	}
