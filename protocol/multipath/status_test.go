@@ -55,7 +55,14 @@ func TestBeta8StatusPoliciesAndModes(t *testing.T) {
 		right.queueSenderStatus(time.Now(), true)
 		return left.peerSenderStatusSnapshot().status.DataMode == 3
 	})
-	doc := status.buildDocument(time.Now())
+	now := time.Now()
+	doc := status.buildDocument(now)
+	// Activated, but leg1 has carried none of its data yet.
+	if doc.Node.Logical.DownloadStates["leg1"] != 1 || doc.Node.Logical.State != "preferred_only" {
+		t.Fatalf("idle activated session reported as active: %+v", doc.Node.Logical)
+	}
+	left.legCounters[1].rxBytes.Add(1 << 20)
+	doc = status.buildDocument(now.Add(time.Second))
 	u, d := doc.Node.Parameters.Upload, doc.Node.Parameters.Download
 	if u.AggregationEnabled || !d.Leg0TrafficSaving || *u.EffectiveSendBufferBytes != maxReplayBytes || *u.EffectiveReceiveWindowBytes != maxReorderBytes || *d.EffectiveSendBufferBytes != maxReplayBytes || *d.EffectiveReceiveWindowBytes != maxReorderBytes {
 		t.Fatalf("incorrect directional limits: %+v / %+v", u, d)
@@ -582,5 +589,46 @@ func TestSenderStatusCodecRoundTrip(t *testing.T) {
 	}
 	if got != status {
 		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got, status)
+	}
+}
+
+// Activation is never undone, so an activated session that went quiet keeps
+// its mode; the node stops reporting aggregation once leg1 has carried none
+// of its data for a few seconds.
+func TestStatusAggregatingFollowsLeg1Data(t *testing.T) {
+	cfg := testCoreConfig()
+	cfg.Memory = newMemoryBudget(64<<20, false)
+	left, _ := newCore(context.Background(), cfg)
+	right, _ := newCore(context.Background(), cfg)
+	defer left.Close()
+	defer right.Close()
+	for id := uint8(0); id < 2; id++ {
+		a, b := net.Pipe()
+		connectTestLeg(t, left, right, id, a, b)
+	}
+	left.activate(activationInfo{Reason: activationReasonBytes})
+	status := newOutboundStatus(filepath.Join(t.TempDir(), "status.json"), outboundStatusConfig{cfg: cfg})
+	status.addSession([16]byte{1}, "example.com:443", left, leg1PhaseReady)
+	now := time.Now()
+	state := func(at time.Duration) string {
+		t.Helper()
+		doc := status.buildDocument(now.Add(at))
+		if doc.Node.Logical.UploadStates["aggregate"] != 1 || doc.Node.Logical.TXAggregatingConnections != 1 {
+			t.Fatalf("activated session lost its mode: %+v", doc.Node.Logical)
+		}
+		return doc.Node.Logical.State
+	}
+	if got := state(0); got != "preferred_only" {
+		t.Fatalf("activated session without leg1 data reported %s", got)
+	}
+	left.legCounters[1].txBytes.Add(1 << 20)
+	if got := state(time.Second); got != "aggregating" {
+		t.Fatalf("leg1 carrying data reported %s", got)
+	}
+	if got := state(2 * time.Second); got != "aggregating" {
+		t.Fatalf("a one-second pause reported %s", got)
+	}
+	if got := state(5 * time.Second); got != "preferred_only" {
+		t.Fatalf("quiet leg1 still reported %s", got)
 	}
 }

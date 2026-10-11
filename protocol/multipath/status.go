@@ -236,7 +236,15 @@ type statusSession struct {
 	core         *mpCore
 	leg1Phase    atomic.Int32
 	leg1Attempts atomic.Uint64
+	// When leg1 last carried this session's data in each direction (client
+	// sent, client received); sampleAccess.
+	leg1SentAt, leg1ReceivedAt time.Time
 }
+
+// statusLeg1Hold is how long after leg1 last carried a session's data the
+// node still reports that session aggregating or saving leg0 traffic, so a
+// transfer arriving in bursts does not flip the state every second.
+const statusLeg1Hold = 3 * time.Second
 
 func statusSessionID(id [16]byte) string {
 	return hex.EncodeToString(id[:4])
@@ -985,6 +993,10 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	var latestActivation time.Time
 	var latestRemote time.Time
 	var latestRemoteFailure [2]time.Time
+	// Activation is never undone, so a mode alone says what a session would
+	// do, not what it does: the node reports aggregating or saving leg0
+	// traffic only while leg1 carries data of such a session.
+	aggregatingNow, savingNow := false, false
 	for _, item := range snapshots {
 		snapshot := item.snapshot
 		// A mode sample may predate a local path detach. Validate it against
@@ -1029,14 +1041,25 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 				logical.RemoteSender.MemoryBackpressureEvents = remote.status.MemoryBackpressureEvents
 			}
 		}
+		if item.rates[1].TXBytesPS > 0 {
+			item.session.leg1SentAt = now
+		}
+		if item.rates[1].RXBytesPS > 0 {
+			item.session.leg1ReceivedAt = now
+		}
+		uploadOnLeg1 := now.Sub(item.session.leg1SentAt) < statusLeg1Hold
+		downloadOnLeg1 := now.Sub(item.session.leg1ReceivedAt) < statusLeg1Hold
 		if uploadMode == "aggregate" {
 			logical.TXAggregatingConnections++
+			aggregatingNow = aggregatingNow || uploadOnLeg1
 		} else if uploadMode == "leg0" {
 			logical.PreferredOnlyConnections++
 		}
 		if downloadMode == "aggregate" {
 			logical.RXAggregatingConnections++
+			aggregatingNow = aggregatingNow || downloadOnLeg1
 		}
+		savingNow = savingNow || uploadMode == "leg1" && uploadOnLeg1 || downloadMode == "leg1" && downloadOnLeg1
 		remoteActive := remoteFresh && (remote.status.Flags&senderStatusFlagActive != 0 || remote.status.DataMode >= 2 && remote.status.DataMode <= 4)
 		if (snapshot.active || remoteActive) && !snapshot.legPresent[1] {
 			logical.BoosterDegraded++
@@ -1174,11 +1197,11 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		logical.State = "idle"
 	} else if logical.BoosterDegraded > 0 {
 		logical.State = "booster_degraded"
-	} else if logical.UploadStates["leg1"] > 0 || logical.DownloadStates["leg1"] > 0 {
+	} else if savingNow {
 		logical.State = "traffic_saving"
 	} else if logical.UploadStates["leg0_fallback"] > 0 || logical.DownloadStates["leg0_fallback"] > 0 {
 		logical.State = "leg0_fallback"
-	} else if logical.TXAggregatingConnections > 0 || logical.RXAggregatingConnections > 0 {
+	} else if aggregatingNow {
 		logical.State = "aggregating"
 	} else {
 		logical.State = "preferred_only"

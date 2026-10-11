@@ -99,7 +99,8 @@ func TestStatusRequiresSameSessionBooster(t *testing.T) {
 			other.handlePeerSenderStatus(senderStatus{Sequence: 1, DataMode: 1}, now)
 			status.addSession([16]byte{2}, "other.example:443", other, leg1PhaseReady)
 			checkMissing()
-			// An attached idle booster is valid even with zero DATA throughput.
+			// An attached idle booster validates the mode, but the node
+			// reports it active only while leg1 carries the session's data.
 			x, y := net.Pipe()
 			connectTestLeg(t, left, right, 1, x, y)
 			doc := status.buildDocument(now)
@@ -107,8 +108,13 @@ func TestStatusRequiresSameSessionBooster(t *testing.T) {
 			if mode == 3 {
 				want = "traffic_saving"
 			}
+			if doc.Node.Logical.State != "preferred_only" || doc.Node.Logical.DownloadStates[dataModeName(mode)] != 1 {
+				t.Fatalf("attached idle booster misreported: %+v", doc.Node.Logical)
+			}
+			left.legCounters[1].rxBytes.Add(1 << 20)
+			doc = status.buildDocument(now.Add(time.Second))
 			if doc.Node.Logical.State != want || doc.Node.Logical.DownloadStates[dataModeName(mode)] != 1 {
-				t.Fatalf("attached idle booster was hidden: %+v", doc.Node.Logical)
+				t.Fatalf("booster carrying data was hidden: %+v", doc.Node.Logical)
 			}
 			doc = status.buildDocument(now.Add(4 * time.Second))
 			if doc.Node.Logical.State == want || doc.Node.Logical.DownloadStates[dataModeName(mode)] != 0 {
