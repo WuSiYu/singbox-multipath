@@ -271,7 +271,7 @@ func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
 	active := c.rx.MaxSeen != c.receivedSeen || buffered > 0
 	c.receivedSeen = c.rx.MaxSeen
 	window := c.rx.Limit - min(c.rx.ReadNext, c.rx.Limit)
-	recent := c.recentArrivalsLocked(now)
+	recent, arrived := c.recentArrivalsLocked(now)
 	first := c.receiveGrant == 0
 	grant := c.receiveGrant
 	if first {
@@ -282,8 +282,10 @@ func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
 	// second. A window-limited transfer delivers one window per round trip;
 	// with an application that reads at once, the edge alone cannot show
 	// that once the round trip exceeds the feedback interval. A keep-alive
-	// connection never comes close to either.
-	wanting := c.rx.MaxSeen+window/4 >= c.rx.Limit || 3*grant < 4*recent
+	// connection never comes close to either. Arrivals are not extrapolated
+	// here: a slow connection's burst early in a second would look like a
+	// transfer many times its rate and claim a share it never uses.
+	wanting := c.rx.MaxSeen+window/4 >= c.rx.Limit || 3*grant < 4*arrived
 	room := c.memory.receiveShare(c, now, active, c.receiveHeldLocked(window), wanting, first)
 	share, free, frame := uint64(room.share), uint64(room.free), uint64(c.cfg.FrameSize)
 	reviewed := c.receiveReviewed
@@ -298,10 +300,13 @@ func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
 		share = min(share, max(free/2, uint64(room.start)))
 		free = max(free, uint64(room.start))
 	case !wanting && reviewed && (c.rx.MaxSeen > 0 || now.Sub(c.startedAt) >= activityWindow):
-		// Another session waits for memory: keep what the sender uses. A
-		// new connection that has received nothing yet may be waiting for
-		// its first response, and keeps its window for a second.
-		share = min(share, max(frame, recent+recent/3))
+		// Another session waits for memory: keep what the sender uses,
+		// twice the arrivals of about a second, so that the window stays
+		// clear of the rule above and a slow connection does not want
+		// more at its next burst. A new connection that has received
+		// nothing yet may be waiting for its first response, and keeps
+		// its window for a second.
+		share = min(share, max(frame, 2*recent))
 	case !wanting:
 		share = min(share, c.receiveGrant)
 	}
@@ -337,8 +342,10 @@ func (c *mpCore) reviewReceiveWindow() {
 // recentArrivalsLocked returns the bytes that arrive in about a second: the
 // larger of the previous second and the current one so far, extrapolated to a
 // second (over at least 100 ms), so a transfer that has just started is not
-// taken for an idle one.
-func (c *mpCore) recentArrivalsLocked(now time.Time) uint64 {
+// taken for an idle one. It also returns what actually arrived in about the
+// last second, without extrapolation: the burst of a slow connection that
+// happens to arrive early in a second must not look like a fast transfer.
+func (c *mpCore) recentArrivalsLocked(now time.Time) (uint64, uint64) {
 	elapsed := now.Sub(c.arrivalAt)
 	if elapsed >= activityWindow {
 		c.arrivalPrev = c.rx.MaxSeen - c.arrivalBase
@@ -347,8 +354,9 @@ func (c *mpCore) recentArrivalsLocked(now time.Time) uint64 {
 		}
 		c.arrivalAt, c.arrivalBase, elapsed = now, c.rx.MaxSeen, 0
 	}
-	current := float64(c.rx.MaxSeen-c.arrivalBase) * float64(activityWindow) / float64(max(elapsed, 100*time.Millisecond))
-	return max(c.arrivalPrev, uint64(current))
+	arrived := c.rx.MaxSeen - c.arrivalBase
+	current := float64(arrived) * float64(activityWindow) / float64(max(elapsed, 100*time.Millisecond))
+	return max(c.arrivalPrev, uint64(current)), max(c.arrivalPrev, arrived)
 }
 
 // repairBudgetLocked limits receiver-requested repairs to a quarter of the

@@ -601,3 +601,55 @@ func TestIdleSendersDoNotReserve(t *testing.T) {
 		t.Fatalf("download-only receive region %d of a %d pool", region, pool)
 	}
 }
+
+// A slow connection asked to give its window back keeps about twice what it
+// receives per second. Its next burst, arriving early in a second, is not
+// taken for a window-limited transfer: dozens of such connections would
+// otherwise each claim a max-min share and leave a bulk transfer beside them
+// a sliver of the region.
+func TestReviewedSlowSessionDoesNotClaimShare(t *testing.T) {
+	budget := newMemoryBudget(64<<20, false)
+	cfg := testCoreConfig()
+	cfg.FrameSize = 64 << 10
+	cfg.ReceiveWindowBytes = 512 << 20
+	cfg.Memory = budget
+	c, _ := newCore(context.Background(), cfg)
+	defer c.Close()
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	start := c.startedAt
+	c.rx.Advertise(c.receiveTargetLocked(start))
+	receive := func(n int, at time.Time) uint64 {
+		if n > 0 {
+			if _, err := c.rx.Insert(c.rx.Next, make([]byte, n)); err != nil {
+				t.Fatal(err)
+			}
+			for data := c.rx.Readable(); data != nil; data = c.rx.Readable() {
+				c.rx.Consume(len(data))
+			}
+		}
+		target := c.receiveTargetLocked(at)
+		c.rx.Advertise(target)
+		return target
+	}
+	// About 64 KB per second, in bursts every 300 ms.
+	for i := range 4 {
+		receive(16<<10, start.Add(time.Duration(i)*300*time.Millisecond))
+	}
+	// Another transfer waits for memory and asks this session.
+	c.receiveReviewed = true
+	reviewed := receive(0, start.Add(activityWindow))
+	if reviewed > 4*uint64(cfg.FrameSize) {
+		t.Fatalf("slow session kept a %d byte window after review", reviewed)
+	}
+	// The next burst lands 100 ms into the second.
+	if got := receive(16<<10, start.Add(activityWindow+100*time.Millisecond)); got > reviewed {
+		t.Fatalf("slow session grew its window from %d to %d after one burst", reviewed, got)
+	}
+	budget.access.Lock()
+	wanting := budget.windows.wanting
+	budget.access.Unlock()
+	if wanting != 0 {
+		t.Fatal("slow session claims a share of the receive region")
+	}
+}
