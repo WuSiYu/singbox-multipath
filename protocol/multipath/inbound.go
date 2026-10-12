@@ -4,7 +4,6 @@ import (
 	"container/list"
 	"context"
 	"errors"
-	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -123,6 +122,16 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		PacketHandler:     i,
 	})
 	return i, nil
+}
+
+// endpointClosedNormally reports whether the target connection ended in a
+// way sing-box treats as an ordinary close: EOF, a reset or broken pipe, a
+// timeout or cancellation. The session then finishes as for EOF, delivering
+// what the target sent and a DATA_FIN, as a single-path proxy relays a
+// target reset as an orderly close. Other errors, such as a refused dial,
+// end the session at once.
+func endpointClosedNormally(err error) bool {
+	return err == nil || E.IsClosedOrCanceled(err)
 }
 
 func (i *Inbound) Start(stage adapter.StartStage) error {
@@ -424,7 +433,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		// calls Close on appConn. A prior MP failure is already frozen and
 		// cannot be reclassified by this application-side cleanup callback.
 		core.noteCloseSource(closeSourceLocalEndpoint)
-		if closeErr == nil || errors.Is(closeErr, io.EOF) {
+		if endpointClosedNormally(closeErr) {
 			_ = appConn.Close()
 		} else {
 			core.fail(closeErr)

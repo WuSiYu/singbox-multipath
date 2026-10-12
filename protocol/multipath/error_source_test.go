@@ -172,3 +172,20 @@ func TestPeerEndpointMarkerOnAnyLeg(t *testing.T) {
 		t.Fatalf("missing peer close provenance: %v", source)
 	}
 }
+
+// A target that resets the connection, or times out, is relayed as an orderly
+// close, as by a single-path proxy; a refused or failed dial is not.
+func TestEndpointClosedNormally(t *testing.T) {
+	reset := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
+	for _, err := range []error{nil, io.EOF, reset, syscall.EPIPE, os.ErrDeadlineExceeded, context.Canceled, net.ErrClosed} {
+		if !endpointClosedNormally(err) {
+			t.Errorf("%v ended the session abruptly", err)
+		}
+	}
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+	for _, err := range []error{refused, errors.New("dial failed"), io.ErrUnexpectedEOF} {
+		if endpointClosedNormally(err) {
+			t.Errorf("%v was taken for an orderly close", err)
+		}
+	}
+}
