@@ -2,7 +2,7 @@
 
 [中文](multipath.zh-CN.md) · [Configuration reference](../README.md#english)
 
-This document describes the Multipath data path, scheduling, memory, session lifecycle and observability of protocol v13 (beta10). The README contains deployment examples and the complete configuration reference.
+This document describes the Multipath data path, scheduling, memory, session lifecycle and observability of protocol v14 (beta10). The README contains deployment examples and the complete configuration reference.
 
 ## Scope and relationship to MPTCP
 
@@ -20,7 +20,7 @@ Multipath does not encrypt data; the child protocols or private links do. An unp
 - **`allowed_ips`** (server only): accept child connections and failover UDP relay datagrams only from these prefixes or single addresses, judged by the source address the server sees. Other connections are closed before their hello is read; other datagrams are dropped.
 - A server with neither `psk` nor `allowed_ips` listening on a non-private address logs a warning at startup.
 
-Both endpoints must run protocol v13. On a version mismatch the server answers with an explicit rejection carrying its version, and the client logs the reason instead of failing obscurely. Other rejections (authentication, parameter mismatch, closed session) also carry a reason code.
+Both endpoints must run protocol v14. On a version mismatch the server answers with an explicit rejection carrying its version, and the client logs the reason instead of failing obscurely. Other rejections (authentication, parameter mismatch, closed session) also carry a reason code.
 
 ## Sessions and legs
 
@@ -108,7 +108,7 @@ One sixteenth of the budget is an emergency margin; the rest is a shared pool wi
 - Receive windows are promises, since a sender may fill a whole window out of order across paths, so every session holds its open window in three quarters of the receive region (one frame per session is not counted), idle or not, and the windows of all sessions stay within it:
   - A session's first window is half of what no other session holds, so a response on a new connection is not held back a round trip, but at least 1/128 of the region (and 256 KiB), which may use the spare quarter, so connections that start together, or beside transfers holding the whole region, are not left with one frame. While other transfers are growing, a new connection gets only the small window.
   - While the window limits its sender (unread data fill three quarters of it, or it is less than 4/3 of what actually arrived in about the last second: a window-limited transfer delivers one window per round trip), a window grows to the max-min share, but only into what other sessions do not hold.
-  - Otherwise a window keeps its size, within the share, until memory is needed. A transfer waiting for memory asks the sessions above their share and those whose senders do not need their windows; a new connection whose first window does not fit asks the latter once they have held their windows for a second. An asked session lowers its limit at once to what it uses (twice the data arriving in about a second, extrapolated over at least 100 ms, so that a slow connection does not want more at its next burst), down to one frame for an idle connection; a new connection that has received nothing yet keeps its window for a second, since it may be waiting for its first response. With memory to spare, an idle connection that resumes a transfer is not held back.
+  - Otherwise a window keeps its size, within the share, until memory is needed. A transfer waiting for memory asks the sessions above their share and those whose senders do not need their windows; a new connection whose first window does not fit asks the latter once they have held their windows for a second. An asked session lowers its limit at once to what it uses (twice the data arriving in about a second, extrapolated over at least 100 ms, so that a slow connection does not want more at its next burst), down to one frame for an idle connection; a new connection that has received nothing yet keeps its window for a second, since it may be waiting for its first response. The space a lowered limit gives back is available to other windows at once, although the sender may still send under the old limit until the feedback reaches it; those bytes are accepted into the spare quarter of the region. With a small memory limit, a sender that starts a burst at that moment can exceed the spare quarter; the excess is dropped and repaired, not lost. With memory to spare, an idle connection that resumes a transfer is not held back.
   - A bulk transfer beside dozens of keep-alive connections thus gets nearly the whole region, and transfers that all want more split it evenly. The spare quarter of the receive region absorbs page overhead and bytes sent before a lowered limit was heard.
   - Only sessions that received data within the last second count as active receivers for the split between the transmit and receive regions; periodic feedback for an idle direction (sent every second with failover) does not count.
 - When receive pages run out, data within 16 pages of the next expected byte are still admitted and evict the farthest unacknowledged page; refused or evicted ranges are reported to the sender for repair.

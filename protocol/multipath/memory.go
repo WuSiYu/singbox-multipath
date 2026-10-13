@@ -552,7 +552,23 @@ type receiveRoom struct {
 func (b *memoryBudget) receiveShare(key any, now time.Time, active bool, held int64, wanting, first bool) receiveRoom {
 	b.access.Lock()
 	defer b.access.Unlock()
+	return b.receiveRoomLocked(key, now.UnixNano(), active, held, wanting, first)
+}
+
+// grantReceive is receiveShare followed, in the same critical section, by
+// recording the window decide grants from that room: decide returns what the
+// granted window may hold. Sessions computing their windows at once therefore
+// never grant the same free space twice. decide runs under the budget lock
+// and must not take it.
+func (b *memoryBudget) grantReceive(key any, now time.Time, active bool, held int64, wanting, first bool, decide func(receiveRoom) int64) {
+	b.access.Lock()
+	defer b.access.Unlock()
 	nanos := now.UnixNano()
+	room := b.receiveRoomLocked(key, nanos, active, held, wanting, first)
+	b.windows.hold(key, nanos, decide(room))
+}
+
+func (b *memoryBudget) receiveRoomLocked(key any, nanos int64, active bool, held int64, wanting, first bool) receiveRoom {
 	if active {
 		b.receivers.mark(key, nanos)
 	}
@@ -608,13 +624,6 @@ const fullReviewInterval = 100 * time.Millisecond
 // window promptly. It must not block.
 type windowReviewer interface {
 	reviewReceiveWindow()
-}
-
-// holdReceive records the window key has just granted.
-func (b *memoryBudget) holdReceive(key any, now time.Time, held int64) {
-	b.access.Lock()
-	b.windows.hold(key, now.UnixNano(), held)
-	b.access.Unlock()
 }
 
 // receiveShareLocked divides three quarters of the receive region max-min

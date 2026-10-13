@@ -18,7 +18,7 @@ var (
 )
 
 const (
-	helloVersion      byte = 13
+	helloVersion      byte = 14
 	helloFlagStatus   byte = 1 << 0
 	helloFlagRecovery byte = 1 << 1
 	helloFlagControl  byte = 1 << 2
@@ -133,7 +133,7 @@ func (r helloRejectReason) String() string {
 	case helloRejectPolicy:
 		return "invalid multipath session policy"
 	case helloRejectVersion:
-		return "unsupported protocol version (both endpoints must use v13)"
+		return "unsupported protocol version (both endpoints must use v14)"
 	case helloRejectAuthentication:
 		return "authentication failed (check psk on both endpoints)"
 	default:

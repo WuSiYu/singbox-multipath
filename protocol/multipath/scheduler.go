@@ -286,10 +286,21 @@ func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
 	// here: a slow connection's burst early in a second would look like a
 	// transfer many times its rate and claim a share it never uses.
 	wanting := c.rx.MaxSeen+window/4 >= c.rx.Limit || 3*grant < 4*arrived
-	room := c.memory.receiveShare(c, now, active, c.receiveHeldLocked(window), wanting, first)
-	share, free, frame := uint64(room.share), uint64(room.free), uint64(c.cfg.FrameSize)
 	reviewed := c.receiveReviewed
 	c.receiveReviewed = false
+	// The window is chosen and recorded in one budget critical section, so
+	// sessions computing theirs at once never grant the same space twice.
+	c.memory.grantReceive(c, now, active, c.receiveHeldLocked(window), wanting, first, func(room receiveRoom) int64 {
+		c.receiveGrant = c.decideReceiveGrantLocked(room, now, recent, wanting, first, reviewed)
+		return c.receiveHeldLocked(c.receiveGrant)
+	})
+	return c.receiveGrant
+}
+
+// decideReceiveGrantLocked applies the policy above to the room the node
+// offers. It runs under the node's budget lock.
+func (c *mpCore) decideReceiveGrantLocked(room receiveRoom, now time.Time, recent uint64, wanting, first, reviewed bool) uint64 {
+	share, free, frame := uint64(room.share), uint64(room.free), uint64(c.cfg.FrameSize)
 	switch {
 	case first && room.busy:
 		// Transfers are growing into the region: a new connection does
@@ -313,9 +324,7 @@ func (c *mpCore) receiveTargetLocked(now time.Time) uint64 {
 	// The share says who should grow and who should give way; growth only
 	// takes what the others no longer hold, since a session above its share
 	// lowers its limit only at its own next feedback.
-	c.receiveGrant = max(frame, min(uint64(c.cfg.ReceiveWindowBytes), share, max(c.receiveGrant, free)))
-	c.memory.holdReceive(c, now, c.receiveHeldLocked(c.receiveGrant))
-	return c.receiveGrant
+	return max(frame, min(uint64(c.cfg.ReceiveWindowBytes), share, max(c.receiveGrant, free)))
 }
 
 // receiveHeldLocked is the region storage a window of the given size may

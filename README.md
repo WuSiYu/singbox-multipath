@@ -18,13 +18,13 @@ singbox-multipath 基于 sing-box，在代理层把两条已有路径组合成�
 
 详细说明：[中文机制文档](docs/multipath.zh-CN.md) · [English mechanism guide](docs/multipath.md)。
 
-OpenWrt 用户可配合 [luci-app-homeproxy-multipath](https://github.com/WuSiYu/luci-app-homeproxy-multipath)，在 LuCI 中配置 Multipath，并查看路径、连接和流量状态。
+OpenWrt 用户可配合 [luci-app-homeproxy-multipath](https://github.com/WuSiYu/luci-app-homeproxy-multipath)，在 LuCI 中配置 Multipath，并查看路径、连接和流量状态。该 LuCI 包依赖 OpenWrt 的 `sing-box` 软件包，但软件源中的 sing-box 不含 Multipath：请用本项目对应架构的二进制替换 `/usr/bin/sing-box`。
 
 ### 部署与配置示例
 
 两条 child outbound 都必须能够到达同一个 Multipath 服务端。中间可以使用普通 sing-box 节点或其他兼容代理，无需修改中间节点；服务端再通过自己的路由访问目标。
 
-**Multipath 不加密数据，未加保护的监听端口会被任何能访问它的人用来转发流量。** 请在两端配置相同的 `psk`（每个握手都经 HMAC-SHA256 认证并防重放），并在服务端用 `allowed_ips` 或防火墙限制来源；数据加密由 child 协议或私有链路负责。双端须使用协议 v13（beta10）；版本不一致时服务端会明确拒绝并说明原因。
+**Multipath 不加密数据，未加保护的监听端口会被任何能访问它的人用来转发流量。** 请在两端配置相同的 `psk`（每个握手都经 HMAC-SHA256 认证并防重放），并在服务端用 `allowed_ips` 或防火墙限制来源；数据加密由 child 协议或私有链路负责。双端须使用协议 v14（beta10）；版本不一致时服务端会明确拒绝并说明原因。
 
 以下是配置片段，需合并到现有 sing-box 配置。客户端仍需配置本地入站，并把需要聚合的流量路由到 `mp-out`。示例中两条 leg 分别绑定两个 WAN 接口，直连到服务端；请替换接口、地址和密钥。两条 leg 走同一出口时无法聚合两条线路。
 
@@ -153,7 +153,7 @@ child 可以是任何支持 TCP 的 outbound，例如加密的 Shadowsocks、Hys
 
 ### 从 beta9 升级
 
-- **两端须同时升级**：协议升到 v13，旧版本会被明确拒绝。状态文件升到 schema 5（LuCI 须同步升级）。
+- **两端须同时升级**：协议升到 v14，旧版本（含早期 beta10 构建）会被明确拒绝。状态文件升到 schema 5（LuCI 须同步升级）。
 - **默认值变化**：`activation_window` 1 秒 → 200 ms；`activation_threshold_mbps` 默认 150 → 0（不再按速率激活，改为 leg0 成为瓶颈时激活）；客户端 `tcp_fast_open` 默认 false → true。
 - **语义变化**：`queue_frames`、`send_buffer_bytes`、`receive_window_bytes` 由容量变为上限，实际值自动跟随路径与内存；旧配置里为“调大缓冲”写的数值可以删除。内存压力不再关闭 leg1 或冻结接收窗口。
 - **会话**：leg0 丢失不再关闭连接；未开启故障接管时，两条 leg 都缺失超过 `max(30 秒, 3 × handshake_timeout)` 才结束会话。
@@ -190,13 +190,13 @@ Upload and download are configured and activated independently. Ordered delivery
 
 Details: [English mechanism guide](docs/multipath.md) · [中文机制文档](docs/multipath.zh-CN.md).
 
-On OpenWrt, [luci-app-homeproxy-multipath](https://github.com/WuSiYu/luci-app-homeproxy-multipath) provides LuCI configuration and a dashboard for Multipath paths, connections and traffic.
+On OpenWrt, [luci-app-homeproxy-multipath](https://github.com/WuSiYu/luci-app-homeproxy-multipath) provides LuCI configuration and a dashboard for Multipath paths, connections and traffic. The LuCI package depends on the OpenWrt `sing-box` package, whose build has no Multipath: replace `/usr/bin/sing-box` with this project's binary for your architecture.
 
 ### Deployment and examples
 
 Both child outbounds must reach the same Multipath server, which uses its own routing to reach application destinations. Intermediate nodes may be ordinary, unmodified proxy nodes.
 
-**Multipath does not encrypt data, and an unprotected listener lets anyone who can reach it relay traffic.** Configure the same `psk` on both endpoints (every handshake is then authenticated with HMAC-SHA256 and replay-checked) and restrict sources on the server with `allowed_ips` or a firewall; encryption is the job of the child protocols or private links. Both endpoints must run protocol v13 (beta10); a version mismatch is rejected with an explicit reason.
+**Multipath does not encrypt data, and an unprotected listener lets anyone who can reach it relay traffic.** Configure the same `psk` on both endpoints (every handshake is then authenticated with HMAC-SHA256 and replay-checked) and restrict sources on the server with `allowed_ips` or a firewall; encryption is the job of the child protocols or private links. Both endpoints must run protocol v14 (beta10); a version mismatch is rejected with an explicit reason.
 
 These are configuration fragments to merge into an existing sing-box configuration. Add a client inbound and route the desired traffic to `mp-out`. The example binds the two legs to two WAN interfaces and connects them directly to the server; replace interfaces, addresses and the key. Two legs leaving through the same uplink cannot aggregate two lines.
 
@@ -325,7 +325,7 @@ Memory strings use integers with binary units: `"2MB"` and `"2 MB"` both mean 2,
 
 ### Upgrading from beta9
 
-- **Upgrade both endpoints together**: the protocol is now v13 and older versions are rejected explicitly. The status file is schema 5 (upgrade LuCI as well).
+- **Upgrade both endpoints together**: the protocol is now v14 and older versions (including early beta10 builds) are rejected explicitly. The status file is schema 5 (upgrade LuCI as well).
 - **Changed defaults**: `activation_window` 1 s → 200 ms; `activation_threshold_mbps` 150 → 0 (activation follows leg 0 becoming the bottleneck instead of a rate); client `tcp_fast_open` false → true.
 - **Changed meaning**: `queue_frames`, `send_buffer_bytes` and `receive_window_bytes` are ceilings instead of capacities, and the working values follow paths and memory automatically; values set only to enlarge buffers can be removed. Memory pressure no longer disables leg 1 or freezes receive windows.
 - **Sessions**: losing leg 0 no longer closes a connection; without failover a session ends after both legs have been absent for `max(30 s, 3 × handshake_timeout)`.

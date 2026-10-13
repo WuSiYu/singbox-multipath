@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -651,5 +652,65 @@ func TestReviewedSlowSessionDoesNotClaimShare(t *testing.T) {
 	budget.access.Unlock()
 	if wanting != 0 {
 		t.Fatal("slow session claims a share of the receive region")
+	}
+}
+
+// A window is chosen and recorded under one budget lock, so sessions that
+// compute their windows at once never grant the same free space twice.
+func TestReceiveGrantChosenUnderBudgetLock(t *testing.T) {
+	budget := newMemoryBudget(16<<20, false)
+	locked := false
+	budget.grantReceive("session", time.Now(), false, 0, false, true, func(receiveRoom) int64 {
+		if locked = !budget.access.TryLock(); !locked {
+			budget.access.Unlock()
+		}
+		return 1 << 20
+	})
+	if !locked {
+		t.Fatal("window chosen outside the budget lock")
+	}
+	budget.access.Lock()
+	held := budget.windows.seen["session"].held
+	budget.access.Unlock()
+	if held != 1<<20 {
+		t.Fatalf("granted window recorded as %d", held)
+	}
+	// New connections starting together on an idle node: each takes half of
+	// what the others do not hold, and together they stay within the region.
+	cfg := testCoreConfig()
+	cfg.FrameSize, cfg.ReceiveWindowBytes = 64<<10, 512<<20
+	for round := range 20 {
+		budget := newMemoryBudget(16<<20, false)
+		cfg.Memory = budget
+		cores := make([]*mpCore, 8)
+		for i := range cores {
+			c, _, err := newCoreWithError(context.Background(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			cores[i] = c
+		}
+		var start, done sync.WaitGroup
+		start.Add(1)
+		now := time.Now()
+		for _, c := range cores {
+			done.Add(1)
+			go func() {
+				defer done.Done()
+				start.Wait()
+				c.stateMu.Lock()
+				c.rx.Advertise(c.receiveTargetLocked(now))
+				c.stateMu.Unlock()
+			}()
+		}
+		start.Done()
+		done.Wait()
+		budget.access.Lock()
+		promised, whole := budget.windows.total, budget.rxRegionLocked()
+		budget.access.Unlock()
+		if promised > whole {
+			t.Fatalf("round %d: concurrent first windows promised %d of a %d byte region", round, promised, whole)
+		}
 	}
 }
