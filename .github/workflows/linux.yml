@@ -11,9 +11,6 @@ on:
         description: "Version name"
         required: true
         type: string
-  release:
-    types:
-      - published
 
 jobs:
   calculate_version:

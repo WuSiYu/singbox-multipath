@@ -30,8 +30,15 @@ PROJECT=$(cd "$(dirname "$0")/.."; pwd)
 #   1.13.0-beta.8  -> 1.13.0_beta8-r0
 #   1.13.0-rc.3    -> 1.13.0_rc3-r0
 #   1.13.0         -> 1.13.0-r0
-APK_VERSION=$(echo "$VERSION" | sed -E 's/-([a-z]+)\.([0-9]+)/_\1\2/')
+#   1.14.1-multipath-beta10 -> 1.14.1_beta10-r0
+APK_VERSION=$(echo "$VERSION" | sed -E 's/-([a-z]+)\.([0-9]+)/_\1\2/; s/-multipath-([a-z]+)([0-9]+)$/_\1\2/')
 APK_VERSION="${APK_VERSION}-r0"
+# Any other version with no APK form is refused here instead of producing a
+# package apk cannot install.
+if ! echo "$APK_VERSION" | grep -Eq '^[0-9]+(\.[0-9]+)*(_(alpha|beta|pre|rc|p)[0-9]*)*-r[0-9]+$'; then
+  echo "Unsupported version for an APK package: $VERSION (converted to $APK_VERSION)" >&2
+  exit 1
+fi
 
 ROOT_DIR=$(mktemp -d)
 prepare_apk_root
@@ -84,7 +91,7 @@ done < "$PACKAGES_DIR/.conffiles" > "$PACKAGES_DIR/.conffiles_static"
 apk --root "$APK_ROOT_DIR" mkpkg \
   --info "name:sing-box" \
   --info "version:${APK_VERSION}" \
-  --info "description:The universal proxy platform." \
+  --info "description:The universal proxy platform, with Multipath (singbox-multipath)." \
   --info "arch:${ARCHITECTURE}" \
   --info "license:GPL-3.0-or-later with name use or association addition" \
   --info "origin:sing-box" \
