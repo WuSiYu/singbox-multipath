@@ -137,6 +137,85 @@ func TestMaintainLegEndsSessionClosedByServer(t *testing.T) {
 	}
 }
 
+// An endpoint that ends a session while its secondary leg is still attaching
+// cancels the attach; that is no leg fault and stays hidden. An attach that
+// times out on a live session remains a visible, counted event.
+func TestSecondaryAttachEndpointAttribution(t *testing.T) {
+	for _, endpoint := range []bool{true, false} {
+		core, appConn := newCore(context.Background(), testCoreConfig())
+		hello := make(chan struct{}, 4)
+		secondary := &tfoMatrixChild{
+			tag: "secondary",
+			dial: func(context.Context) (net.Conn, error) {
+				clientConn, serverConn := net.Pipe()
+				go func() {
+					defer serverConn.Close()
+					if _, err := readHello(serverConn); err == nil {
+						hello <- struct{}{}
+						_, _ = io.Copy(io.Discard, serverConn) // never answers
+					}
+				}()
+				return clientConn, nil
+			},
+		}
+		timeout := time.Minute
+		if !endpoint {
+			timeout = 50 * time.Millisecond
+		}
+		outbound := &Outbound{
+			ctx:              context.Background(),
+			logger:           L.NOP(),
+			tags:             []string{"primary", secondary.tag},
+			children:         []adapter.Outbound{nil, secondary},
+			handshakeTimeout: timeout,
+			cfg:              testCoreConfig(),
+		}
+		status := newOutboundStatus("", outboundStatusConfig{})
+		session := status.addSession([16]byte{1}, "example.com:443", core, leg1PhaseConnecting)
+		var confirmed atomic.Bool
+		confirmed.Store(true)
+		done := make(chan struct{})
+		go func() {
+			outbound.maintainLeg(core, [16]byte{1}, 1, "example.com:443", &confirmed, time.Now().Add(time.Minute), session)
+			close(done)
+		}()
+		legEvent := func() statusErrorEvent {
+			status.access.Lock()
+			defer status.access.Unlock()
+			return status.legErrors[1]
+		}
+		if endpoint {
+			select {
+			case <-hello:
+			case <-time.After(2 * time.Second):
+				t.Fatal("secondary hello was not sent")
+			}
+			core.noteCloseSource(closeSourceLocalEndpoint)
+			core.Close()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("leg manager outlived the session")
+			}
+			if event := legEvent(); event.stage != "secondary_handshake" || event.source != "local_endpoint" || event.count != 0 {
+				t.Fatalf("endpoint-ended attach: stage=%q source=%q count=%d (%s)", event.stage, event.source, event.count, event.message)
+			}
+		} else {
+			deadline := time.Now().Add(2 * time.Second)
+			for legEvent().count == 0 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if event := legEvent(); event.stage != "secondary_handshake" || event.source != "unknown" || event.count != 1 {
+				t.Fatalf("timed-out attach: stage=%q source=%q count=%d (%s)", event.stage, event.source, event.count, event.message)
+			}
+			core.Close()
+			<-done
+		}
+		appConn.Close()
+		waitCoreRelease(t, core)
+	}
+}
+
 func TestLegBackoff(t *testing.T) {
 	backoff := time.Duration(0)
 	var got []time.Duration

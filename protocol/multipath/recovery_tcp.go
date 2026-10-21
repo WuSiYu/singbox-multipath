@@ -267,7 +267,10 @@ func (o *Outbound) maintainLeg(core *mpCore, session [16]byte, id byte, destinat
 			status.setLeg1Phase(leg1PhaseRetrying)
 		}
 		if !rejected || reason != helloRejectLegUnavailable {
-			status.recordLegError(id, "secondary_"+stage, err)
+			// A session that ends cancels its context, interrupting an attach
+			// in progress. Like other leg close errors, that is attributed to
+			// what ended the session, so an endpoint close stays hidden.
+			status.recordLegError(id, "secondary_"+stage, core.sourcedLegError(err))
 			o.logger.DebugContext(core.ctx, "multipath leg", id, " attach failed: ", err)
 		}
 		backoff = nextLegBackoff(backoff, o.recovery != nil)
