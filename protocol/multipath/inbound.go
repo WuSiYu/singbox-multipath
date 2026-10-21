@@ -134,13 +134,14 @@ func endpointClosedNormally(err error) bool {
 	return err == nil || E.IsClosedOrCanceled(err)
 }
 
-func (i *Inbound) Start(stage adapter.StartStage) error {
+func (i *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
 	if err := i.listener.Start(); err != nil {
 		return err
 	}
+	scope.Add(i.Close)
 	ctx, cancel := context.WithCancel(i.ctx)
 	i.recoveryCancel = cancel
 	i.cfg.Memory.startLogging(ctx, i.logger, "server")

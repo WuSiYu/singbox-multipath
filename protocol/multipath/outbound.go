@@ -140,7 +140,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		policy:           policy}, nil
 }
 
-func (o *Outbound) Start() error {
+func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage != adapter.StartStateStart {
+		return nil
+	}
 	o.children = make([]adapter.Outbound, len(o.tags))
 	for index, tag := range o.tags {
 		child, loaded := o.manager.Outbound(tag)
@@ -163,6 +166,7 @@ func (o *Outbound) Start() error {
 		return E.New("multipath UDP outbound does not support UDP: ", o.udpTag)
 	}
 	o.udpOutbound = udpOutbound
+	scope.Add(o.Close)
 	if o.failoverEnabled {
 		var err error
 		o.recovery, err = newRecoveryClient(o)
