@@ -19,7 +19,7 @@ func (c *halfCloseTestConn) CloseWrite() error { c.writeCloses++; return nil }
 func (c *halfCloseTestConn) Close() error      { c.fullCloses++; return c.Conn.Close() }
 
 func TestConnectionCopyUnwrapsHalfClose(t *testing.T) {
-	manager := NewConnectionManager(L.NOP())
+	manager := NewConnectionManager(context.Background(), L.NOP())
 	source, sourcePeer := net.Pipe()
 	defer source.Close()
 	sourcePeer.Close()
